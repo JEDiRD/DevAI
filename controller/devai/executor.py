@@ -1,4 +1,5 @@
 from .gateway import GatewayClient
+from .observer import ExecutionObserver, NullExecutionObserver
 from .types import ExecutionAttempt, ExecutionResult, ModelCandidate
 
 
@@ -13,17 +14,30 @@ def execute_with_fallback(
     prompt: str,
     routes: list[ModelCandidate],
     gateway: GatewayClient,
+    observer: ExecutionObserver | None = None,
 ) -> ExecutionResult:
     """
-    Execute each approved route at most once.
+    Execute every approved route at most once.
 
-    This Controller owns fallback authority.
-    It never retries the same route automatically.
+    The Controller is the single fallback authority.
+
+    Attempt state is persisted before the provider call when an observer
+    is supplied.
     """
+    observer = observer or NullExecutionObserver()
+
     attempts: list[ExecutionAttempt] = []
 
-    for route in routes:
+    for number, route in enumerate(routes, 1):
         gateway_model = route.gateway_model or route.key
+
+        # This occurs BEFORE the provider call.
+        # If ledger persistence fails, provider execution never begins.
+        observer.attempt_started(
+            number,
+            route,
+            gateway_model,
+        )
 
         try:
             content = gateway.complete(
@@ -31,13 +45,18 @@ def execute_with_fallback(
                 prompt=prompt,
             )
 
-            attempts.append(
-                ExecutionAttempt(
-                    route_key=route.key,
-                    provider=route.provider,
-                    gateway_model=gateway_model,
-                    success=True,
-                )
+            attempt = ExecutionAttempt(
+                route_key=route.key,
+                provider=route.provider,
+                gateway_model=gateway_model,
+                success=True,
+            )
+
+            attempts.append(attempt)
+
+            observer.attempt_finished(
+                number,
+                attempt,
             )
 
             return ExecutionResult(
@@ -49,14 +68,19 @@ def execute_with_fallback(
             )
 
         except Exception as exc:
-            attempts.append(
-                ExecutionAttempt(
-                    route_key=route.key,
-                    provider=route.provider,
-                    gateway_model=gateway_model,
-                    success=False,
-                    error=str(exc),
-                )
+            attempt = ExecutionAttempt(
+                route_key=route.key,
+                provider=route.provider,
+                gateway_model=gateway_model,
+                success=False,
+                error=str(exc),
+            )
+
+            attempts.append(attempt)
+
+            observer.attempt_finished(
+                number,
+                attempt,
             )
 
     raise AllRoutesFailed(attempts)

@@ -152,3 +152,80 @@ def complete_job(job_id: UUID) -> None:
                 """,
                 (job_id,),
             )
+
+
+def start_attempt(
+    job_id: UUID,
+    task_id: UUID,
+    attempt_number: int,
+    route_key: str,
+    provider: str,
+    gateway_model: str,
+) -> UUID:
+    attempt_id = uuid4()
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO execution_attempts (
+                    id,
+                    job_id,
+                    task_id,
+                    attempt_number,
+                    route_key,
+                    provider,
+                    gateway_model,
+                    status,
+                    started_at
+                )
+                VALUES (
+                    %s, %s, %s, %s,
+                    %s, %s, %s,
+                    'running',
+                    now()
+                )
+                """,
+                (
+                    attempt_id,
+                    job_id,
+                    task_id,
+                    attempt_number,
+                    route_key,
+                    provider,
+                    gateway_model,
+                ),
+            )
+
+    return attempt_id
+
+
+def finish_attempt(
+    attempt_id: UUID,
+    success: bool,
+    error: str | None = None,
+) -> None:
+    status = "succeeded" if success else "failed"
+
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE execution_attempts
+                SET status = %s,
+                    error_message = %s,
+                    finished_at = now()
+                WHERE id = %s
+                  AND status = 'running'
+                """,
+                (
+                    status,
+                    error,
+                    attempt_id,
+                ),
+            )
+
+            if cur.rowcount != 1:
+                raise RuntimeError(
+                    f"Attempt {attempt_id} is not in running state"
+                )
