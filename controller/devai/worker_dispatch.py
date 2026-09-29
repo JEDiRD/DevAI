@@ -139,6 +139,7 @@ def claim_next_dispatch(
 
 def complete_dispatch(
     *,
+    tenant_id: UUID,
     dispatch_id: UUID,
     worker_node_id: UUID,
     claim_version: int,
@@ -161,6 +162,7 @@ def complete_dispatch(
                     completed_at = now(),
                     lease_expires_at = NULL
                 WHERE id = %s
+                  AND tenant_id = %s
                   AND worker_node_id = %s
                   AND claim_version = %s
                   AND status = 'claimed'
@@ -172,6 +174,7 @@ def complete_dispatch(
                     completion_tokens,
                     provider_request_id,
                     dispatch_id,
+                    tenant_id,
                     worker_node_id,
                     claim_version,
                 ),
@@ -185,6 +188,7 @@ def complete_dispatch(
 
 def fail_dispatch(
     *,
+    tenant_id: UUID,
     dispatch_id: UUID,
     worker_node_id: UUID,
     claim_version: int,
@@ -201,6 +205,7 @@ def fail_dispatch(
                     completed_at = now(),
                     lease_expires_at = NULL
                 WHERE id = %s
+                  AND tenant_id = %s
                   AND worker_node_id = %s
                   AND claim_version = %s
                   AND status = 'claimed'
@@ -209,6 +214,7 @@ def fail_dispatch(
                 (
                     error[:2000],
                     dispatch_id,
+                    tenant_id,
                     worker_node_id,
                     claim_version,
                 ),

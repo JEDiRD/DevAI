@@ -22,3 +22,6 @@ Initial goals:
 - Human approval gates
 - Isolated execution
 - Zero idle LLM consumption
+
+Worker Control API setup and credential lifecycle:
+[docs/WORKER_CONTROL_API.md](docs/WORKER_CONTROL_API.md).
