@@ -1,40 +1,48 @@
 from decimal import Decimal
 from uuid import UUID
 
-from .budget import release_budget, reserve_budget
-from .ledger_observer import LedgerExecutionObserver
-from .types import ExecutionAttempt, ModelCandidate
+from .accounting import (
+    finalize_attempt_and_budget,
+)
+from .budget import (
+    release_budget,
+    reserve_budget,
+)
+from .ledger import start_attempt
+from .pricing import (
+    calculate_cost,
+    get_active_price,
+)
+from .types import (
+    ExecutionAttempt,
+    ModelCandidate,
+)
 
 
 class BudgetPolicyMissing(RuntimeError):
     pass
 
 
+class UsageMissing(RuntimeError):
+    pass
+
+
 class BudgetedLedgerObserver:
-    """
-    Budget reservation happens before ledger start and before provider call.
-
-    Current phase:
-    - reserve maximum allowed amount
-    - execute
-    - release reservation when attempt finishes
-
-    Actual provider cost settlement is added in the next phase.
-    """
 
     def __init__(
         self,
         job_id: UUID,
         task_id: UUID,
-        reservation_by_cost_class: dict[str, Decimal],
+        reservation_by_cost_class:
+            dict[str, Decimal],
     ):
         self.job_id = job_id
-        self.ledger = LedgerExecutionObserver(
-            job_id=job_id,
-            task_id=task_id,
+        self.task_id = task_id
+        self.reservation_by_cost_class = (
+            reservation_by_cost_class
         )
-        self.reservation_by_cost_class = reservation_by_cost_class
-        self._reservations: dict[int, Decimal] = {}
+
+        self._state = {}
 
     def attempt_started(
         self,
@@ -42,53 +50,94 @@ class BudgetedLedgerObserver:
         route: ModelCandidate,
         gateway_model: str,
     ) -> None:
-        amount = self.reservation_by_cost_class.get(
-            route.cost_class
+
+        reservation = (
+            self.reservation_by_cost_class.get(
+                route.cost_class
+            )
         )
 
-        if amount is None:
+        if reservation is None:
             raise BudgetPolicyMissing(
-                f"No reservation policy for cost class {route.cost_class}"
+                f"No reservation for "
+                f"{route.cost_class}"
             )
 
-        # Atomic PostgreSQL gate.
-        # If this raises, provider execution never begins.
+        pricing_key = (
+            route.pricing_key
+            or route.key
+        )
+
+        price = get_active_price(
+            pricing_key
+        )
+
         reserve_budget(
             self.job_id,
-            amount,
+            reservation,
         )
 
         try:
-            self.ledger.attempt_started(
-                number,
-                route,
-                gateway_model,
+            attempt_id = start_attempt(
+                job_id=self.job_id,
+                task_id=self.task_id,
+                attempt_number=number,
+                route_key=route.key,
+                provider=route.provider,
+                gateway_model=gateway_model,
             )
         except Exception:
             release_budget(
                 self.job_id,
-                amount,
+                reservation,
             )
             raise
 
-        self._reservations[number] = amount
+        self._state[number] = (
+            attempt_id,
+            reservation,
+            price,
+            route.cost_class,
+        )
 
     def attempt_finished(
         self,
         number: int,
         attempt: ExecutionAttempt,
     ) -> None:
-        amount = self._reservations[number]
 
-        # Persist provider outcome first.
-        self.ledger.attempt_finished(
-            number,
-            attempt,
-        )
+        (
+            attempt_id,
+            reservation,
+            price,
+            cost_class,
+        ) = self._state[number]
 
-        # Reservation-only phase.
-        # Real cost reconciliation comes next.
-        release_budget(
-            self.job_id,
-            amount,
+        if (
+            attempt.prompt_tokens is None
+            or attempt.completion_tokens is None
+        ):
+            if attempt.success and cost_class != "free":
+                raise UsageMissing(
+                    "Paid successful call returned "
+                    "without token usage"
+                )
+
+            actual = Decimal("0")
+
+        else:
+            actual = calculate_cost(
+                price,
+                attempt.prompt_tokens,
+                attempt.completion_tokens,
+            )
+
+        finalize_attempt_and_budget(
+            job_id=self.job_id,
+            attempt_id=attempt_id,
+            attempt=attempt,
+            reserved_usd=reservation,
+            actual_usd=actual,
+            pricing_key=price.pricing_key,
+            pricing_version=price.version,
         )

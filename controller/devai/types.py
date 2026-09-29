@@ -57,6 +57,10 @@ class ExecutionAttempt:
     completion_tokens: int | None = None
     provider_request_id: str | None = None
     reconciled_cost_usd: Decimal | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    provider_request_id: str | None = None
+    reconciled_cost_usd: Decimal | None = None
 
 
 @dataclass(frozen=True)
