@@ -247,6 +247,7 @@ def release_task(
                 WHERE id = %s
                   AND lease_owner = %s
                   AND lease_version = %s
+                  AND lease_expires_at > now()
                 """,
                 (
                     final_status,
