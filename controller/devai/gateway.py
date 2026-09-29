@@ -9,6 +9,29 @@ class GatewayError(RuntimeError):
     pass
 
 
+class GatewayConfigurationError(GatewayError):
+    """Local configuration/auth/transport problem."""
+
+
+class GatewayConnectionError(GatewayError):
+    """Network or transport connectivity problem."""
+
+
+class GatewayHTTPError(GatewayError):
+
+    def __init__(
+        self,
+        status_code: int,
+        detail: str,
+    ):
+        self.status_code = status_code
+        self.detail = detail
+
+        super().__init__(
+            f"Gateway HTTP {status_code}: {detail}"
+        )
+
+
 @dataclass(frozen=True)
 class GatewayResult:
     content: str
@@ -109,12 +132,13 @@ class LiteLLMGateway:
                 errors="replace",
             )[:500]
 
-            raise GatewayError(
-                f"LiteLLM HTTP {exc.code}: {detail}"
+            raise GatewayHTTPError(
+                exc.code,
+                detail,
             ) from exc
 
         except urllib.error.URLError as exc:
-            raise GatewayError(
+            raise GatewayConnectionError(
                 f"LiteLLM connection failed: {exc.reason}"
             ) from exc
 
