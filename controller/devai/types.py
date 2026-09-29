@@ -24,3 +24,20 @@ class ModelCandidate:
     cost_class: str
     priority: int
     available: bool = True
+
+
+@dataclass(frozen=True)
+class PlannedTask:
+    id: str
+    title: str
+    description: str
+    capability: Capability
+    risk: str
+    needs_review: bool
+    depends_on: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ExecutionPlan:
+    objective: str
+    tasks: tuple[PlannedTask, ...]
