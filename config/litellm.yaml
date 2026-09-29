@@ -1,0 +1,22 @@
+model_list:
+  - model_name: planner
+    litellm_params:
+      model: gemini/gemini-3.8-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+  - model_name: worker-free
+    litellm_params:
+      model: openrouter/free
+      custom_llm_provider: openrouter
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: worker-standard
+    litellm_params:
+      model: gemini/gemini-3.8-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+general_settings:
+  master_key: os.environ/DEVAI_LITELLM_MASTER_KEY
+
+router_settings:
+  num_retries: 0
