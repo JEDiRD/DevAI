@@ -85,21 +85,37 @@ def list_available_routes(
             cur.execute(
                 """
                 SELECT
-                    route_key,
-                    provider,
-                    gateway_model,
-                    capability,
-                    cost_class,
-                    priority,
-                    pricing_key
-                FROM provider_routes
-                WHERE tenant_id = %s
-                  AND enabled = TRUE
+                    r.route_key,
+                    r.provider,
+                    r.gateway_model,
+                    r.capability,
+                    r.cost_class,
+                    r.priority,
+                    r.pricing_key
+                FROM provider_routes r
+                JOIN provider_connections c
+                  ON c.tenant_id = r.tenant_id
+                 AND c.id = r.connection_id
+                LEFT JOIN worker_nodes n
+                  ON n.tenant_id = c.tenant_id
+                 AND n.id = c.worker_node_id
+                WHERE r.tenant_id = %s
+                  AND r.enabled = TRUE
+                  AND c.enabled = TRUE
                   AND (
-                      cooldown_until IS NULL
-                      OR cooldown_until <= now()
+                      r.cooldown_until IS NULL
+                      OR r.cooldown_until <= now()
                   )
-                ORDER BY priority, route_key
+                  AND (
+                      c.worker_node_id IS NULL
+                      OR (
+                          n.status = 'online'
+                          AND n.last_seen_at IS NOT NULL
+                          AND n.last_seen_at >
+                              now() - interval '90 seconds'
+                      )
+                  )
+                ORDER BY r.priority, r.route_key
                 """,
                 (tenant_id,),
             )
