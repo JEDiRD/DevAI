@@ -8,6 +8,7 @@ from .types import ExecutionAttempt
 
 def create_job(
     objective: str,
+    tenant_id: UUID,
     status: str = "running",
 ) -> UUID:
     job_id = uuid4()
@@ -18,12 +19,18 @@ def create_job(
                 """
                 INSERT INTO jobs (
                     id,
+                    tenant_id,
                     objective,
                     status
                 )
-                VALUES (%s, %s, %s)
+                VALUES (%s, %s, %s, %s)
                 """,
-                (job_id, objective, status),
+                (
+                    job_id,
+                    tenant_id,
+                    objective,
+                    status,
+                ),
             )
 
     return job_id

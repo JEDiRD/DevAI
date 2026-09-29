@@ -23,6 +23,7 @@ from .types import Capability, TaskAssessment
 class RuntimeTask:
     id: UUID
     job_id: UUID
+    tenant_id: UUID
     external_id: str
     title: str
     description: str
@@ -37,16 +38,19 @@ def load_runtime_task(task_id: UUID) -> RuntimeTask:
             cur.execute(
                 """
                 SELECT
-                    id,
-                    job_id,
-                    external_id,
-                    title,
-                    description,
-                    capability,
-                    risk,
-                    needs_review
-                FROM tasks
-                WHERE id = %s
+                    t.id,
+                    t.job_id,
+                    j.tenant_id,
+                    t.external_id,
+                    t.title,
+                    t.description,
+                    t.capability,
+                    t.risk,
+                    t.needs_review
+                FROM tasks t
+                JOIN jobs j
+                  ON j.id = t.job_id
+                WHERE t.id = %s
                 """,
                 (task_id,),
             )
@@ -58,12 +62,13 @@ def load_runtime_task(task_id: UUID) -> RuntimeTask:
     return RuntimeTask(
         id=row[0],
         job_id=row[1],
-        external_id=row[2],
-        title=row[3],
-        description=row[4],
-        capability=Capability[row[5].upper()],
-        risk=row[6],
-        needs_review=row[7],
+        tenant_id=row[2],
+        external_id=row[3],
+        title=row[4],
+        description=row[5],
+        capability=Capability[row[6].upper()],
+        risk=row[7],
+        needs_review=row[8],
     )
 
 
@@ -93,7 +98,9 @@ def run_claimed_task(
         reason="Capability assigned by validated execution plan.",
     )
 
-    candidates = list_available_routes()
+    candidates = list_available_routes(
+        task.tenant_id
+    )
 
     routes = plan_routes(
         assessment,
@@ -105,7 +112,8 @@ def run_claimed_task(
             job_id=task.job_id,
             task_id=task.id,
             reservation_by_cost_class=reservation_by_cost_class,
-        )
+        ),
+        tenant_id=task.tenant_id,
     )
 
     try:

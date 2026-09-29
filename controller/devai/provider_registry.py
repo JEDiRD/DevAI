@@ -1,3 +1,5 @@
+from uuid import UUID
+
 from .db import connect
 from .types import Capability, ModelCandidate
 
@@ -11,6 +13,7 @@ CAPABILITY_MAP = {
 
 def upsert_route(
     *,
+    tenant_id: UUID,
     route_key: str,
     provider: str,
     gateway_model: str,
@@ -28,6 +31,7 @@ def upsert_route(
             cur.execute(
                 """
                 INSERT INTO provider_routes (
+                    tenant_id,
                     route_key,
                     provider,
                     gateway_model,
@@ -41,9 +45,9 @@ def upsert_route(
                 )
                 VALUES (
                     %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s
                 )
-                ON CONFLICT (route_key)
+                ON CONFLICT (tenant_id, route_key)
                 DO UPDATE SET
                     provider = EXCLUDED.provider,
                     gateway_model = EXCLUDED.gateway_model,
@@ -57,6 +61,7 @@ def upsert_route(
                     updated_at = now()
                 """,
                 (
+                    tenant_id,
                     route_key,
                     provider,
                     gateway_model,
@@ -71,7 +76,10 @@ def upsert_route(
             )
 
 
-def list_available_routes() -> list[ModelCandidate]:
+def list_available_routes(
+    tenant_id: UUID,
+) -> list[ModelCandidate]:
+
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -85,13 +93,15 @@ def list_available_routes() -> list[ModelCandidate]:
                     priority,
                     pricing_key
                 FROM provider_routes
-                WHERE enabled = TRUE
+                WHERE tenant_id = %s
+                  AND enabled = TRUE
                   AND (
                       cooldown_until IS NULL
                       OR cooldown_until <= now()
                   )
                 ORDER BY priority, route_key
-                """
+                """,
+                (tenant_id,),
             )
 
             rows = cur.fetchall()
@@ -111,6 +121,7 @@ def list_available_routes() -> list[ModelCandidate]:
 
 
 def record_route_failure(
+    tenant_id: UUID,
     route_key: str,
     error: str,
 ) -> None:
@@ -139,21 +150,24 @@ def record_route_failure(
                     last_failure_at = now(),
                     updated_at = now()
 
-                WHERE route_key = %s
+                WHERE tenant_id = %s
+                  AND route_key = %s
                 """,
                 (
                     error[:1000],
+                    tenant_id,
                     route_key,
                 ),
             )
 
             if cur.rowcount != 1:
                 raise RuntimeError(
-                    f"Unknown route: {route_key}"
+                    f"Unknown route for tenant: {route_key}"
                 )
 
 
 def record_route_success(
+    tenant_id: UUID,
     route_key: str,
 ) -> None:
 
@@ -167,18 +181,23 @@ def record_route_success(
                     last_error = NULL,
                     last_success_at = now(),
                     updated_at = now()
-                WHERE route_key = %s
+                WHERE tenant_id = %s
+                  AND route_key = %s
                 """,
-                (route_key,),
+                (
+                    tenant_id,
+                    route_key,
+                ),
             )
 
             if cur.rowcount != 1:
                 raise RuntimeError(
-                    f"Unknown route: {route_key}"
+                    f"Unknown route for tenant: {route_key}"
                 )
 
 
 def set_route_enabled(
+    tenant_id: UUID,
     route_key: str,
     enabled: bool,
 ) -> None:
@@ -190,15 +209,17 @@ def set_route_enabled(
                 UPDATE provider_routes
                 SET enabled = %s,
                     updated_at = now()
-                WHERE route_key = %s
+                WHERE tenant_id = %s
+                  AND route_key = %s
                 """,
                 (
                     enabled,
+                    tenant_id,
                     route_key,
                 ),
             )
 
             if cur.rowcount != 1:
                 raise RuntimeError(
-                    f"Unknown route: {route_key}"
+                    f"Unknown route for tenant: {route_key}"
                 )
