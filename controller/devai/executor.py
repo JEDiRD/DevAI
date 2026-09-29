@@ -1,3 +1,5 @@
+from typing import Callable
+
 from .gateway import GatewayClient, GatewayResult
 from .observer import (
     ExecutionObserver,
@@ -22,12 +24,29 @@ class AllRoutesFailed(RuntimeError):
         )
 
 
+GatewayResolver = Callable[
+    [ModelCandidate],
+    GatewayClient,
+]
+
+
 def execute_with_fallback(
     prompt: str,
     routes: list[ModelCandidate],
-    gateway: GatewayClient,
+    gateway: GatewayClient | None = None,
+    gateway_resolver: GatewayResolver | None = None,
     observer: ExecutionObserver | None = None,
 ) -> ExecutionResult:
+
+    if gateway is None and gateway_resolver is None:
+        raise ValueError(
+            "A gateway or gateway_resolver is required"
+        )
+
+    if gateway is not None and gateway_resolver is not None:
+        raise ValueError(
+            "Use gateway or gateway_resolver, not both"
+        )
 
     observer = observer or NullExecutionObserver()
     attempts: list[ExecutionAttempt] = []
@@ -37,6 +56,33 @@ def execute_with_fallback(
             route.gateway_model or route.key
         )
 
+        # Resolve the transport independently for this route.
+        #
+        # A resolver/configuration failure happens before the
+        # provider attempt starts, so it must not consume budget
+        # or affect provider health.
+        try:
+            route_gateway = (
+                gateway
+                if gateway is not None
+                else gateway_resolver(route)
+            )
+
+        except Exception as exc:
+            attempts.append(
+                ExecutionAttempt(
+                    route_key=route.key,
+                    provider=route.provider,
+                    gateway_model=gateway_model,
+                    success=False,
+                    error=str(exc),
+                )
+            )
+
+            continue
+
+        # Budget reservation + ledger entry happen here,
+        # before the provider can be called.
         observer.attempt_started(
             number,
             route,
@@ -44,7 +90,7 @@ def execute_with_fallback(
         )
 
         try:
-            raw = gateway.complete(
+            raw = route_gateway.complete(
                 model=gateway_model,
                 prompt=prompt,
             )

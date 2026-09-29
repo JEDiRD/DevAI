@@ -12,6 +12,7 @@ from .checkpoint import (
 from .db import connect
 from .executor import AllRoutesFailed, execute_with_fallback
 from .gateway import GatewayClient
+from .transport import build_gateway_for_route
 from .router import plan_routes
 from .provider_registry import list_available_routes
 from .route_health_observer import RouteHealthObserver
@@ -74,8 +75,8 @@ def load_runtime_task(task_id: UUID) -> RuntimeTask:
 
 def run_claimed_task(
     lease: TaskLease,
-    gateway: GatewayClient,
     reservation_by_cost_class: dict[str, Decimal],
+    gateway: GatewayClient | None = None,
 ):
     task = load_runtime_task(lease.task_id)
 
@@ -117,12 +118,27 @@ def run_claimed_task(
     )
 
     try:
-        result = execute_with_fallback(
-            prompt=task.description,
-            routes=routes,
-            gateway=gateway,
-            observer=observer,
-        )
+        if gateway is not None:
+            # Compatibility path for tests/injected gateways.
+            result = execute_with_fallback(
+                prompt=task.description,
+                routes=routes,
+                gateway=gateway,
+                observer=observer,
+            )
+        else:
+            # Normal runtime path: every route resolves its own
+            # tenant-scoped connection and transport.
+            result = execute_with_fallback(
+                prompt=task.description,
+                routes=routes,
+                gateway_resolver=lambda route:
+                    build_gateway_for_route(
+                        task.tenant_id,
+                        route.key,
+                    ),
+                observer=observer,
+            )
 
     except AllRoutesFailed as exc:
         save_checkpoint(
@@ -177,8 +193,8 @@ def run_claimed_task(
 def worker_once(
     job_id: UUID,
     owner_id: UUID,
-    gateway: GatewayClient,
     reservation_by_cost_class: dict[str, Decimal],
+    gateway: GatewayClient | None = None,
 ):
     lease = claim_next_ready_task(
         job_id=job_id,
@@ -191,6 +207,6 @@ def worker_once(
 
     return run_claimed_task(
         lease=lease,
-        gateway=gateway,
         reservation_by_cost_class=reservation_by_cost_class,
+        gateway=gateway,
     )
