@@ -14,6 +14,7 @@ CAPABILITY_MAP = {
 def upsert_route(
     *,
     tenant_id: UUID,
+    connection_id: UUID,
     route_key: str,
     provider: str,
     gateway_model: str,
@@ -32,6 +33,7 @@ def upsert_route(
                 """
                 INSERT INTO provider_routes (
                     tenant_id,
+                    connection_id,
                     route_key,
                     provider,
                     gateway_model,
@@ -44,11 +46,12 @@ def upsert_route(
                     cooldown_seconds
                 )
                 VALUES (
-                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s
                 )
                 ON CONFLICT (tenant_id, route_key)
                 DO UPDATE SET
+                    connection_id = EXCLUDED.connection_id,
                     provider = EXCLUDED.provider,
                     gateway_model = EXCLUDED.gateway_model,
                     capability = EXCLUDED.capability,
@@ -62,6 +65,7 @@ def upsert_route(
                 """,
                 (
                     tenant_id,
+                    connection_id,
                     route_key,
                     provider,
                     gateway_model,

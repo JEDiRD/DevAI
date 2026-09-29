@@ -5,6 +5,7 @@ from uuid import UUID
 from .budgeted_observer import BudgetedLedgerObserver
 from .checkpoint import (
     TaskLease,
+    defer_task_for_route,
     load_latest_checkpoint,
     release_task,
     save_checkpoint,
@@ -13,7 +14,7 @@ from .db import connect
 from .executor import AllRoutesFailed, execute_with_fallback
 from .gateway import GatewayClient
 from .transport import build_gateway_for_route
-from .router import plan_routes
+from .router import NoRouteAvailable, plan_routes
 from .provider_registry import list_available_routes
 from .route_health_observer import RouteHealthObserver
 from .scheduler import claim_next_ready_task
@@ -103,10 +104,14 @@ def run_claimed_task(
         task.tenant_id
     )
 
-    routes = plan_routes(
-        assessment,
-        candidates,
-    )
+    try:
+        routes = plan_routes(
+            assessment,
+            candidates,
+        )
+    except NoRouteAvailable:
+        defer_task_for_route(lease)
+        return None
 
     observer = RouteHealthObserver(
         BudgetedLedgerObserver(

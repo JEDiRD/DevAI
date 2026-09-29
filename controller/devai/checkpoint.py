@@ -48,10 +48,16 @@ def claim_task(
                     lease_version = lease_version + 1,
                     lease_expires_at =
                         now() + (%s * interval '1 second'),
+                    next_attempt_at = NULL,
                     status = 'running',
                     updated_at = now()
                 WHERE id = %s
                   AND status IN ('pending', 'running')
+                  AND (
+                      status <> 'pending'
+                      OR next_attempt_at IS NULL
+                      OR next_attempt_at <= now()
+                  )
                   AND (
                       lease_expires_at IS NULL
                       OR lease_expires_at <= now()
@@ -261,3 +267,75 @@ def release_task(
                 raise LeaseLost(
                     "Cannot release stale task lease"
                 )
+
+
+def defer_task_for_route(
+    lease: TaskLease,
+    retry_seconds: int = 60,
+) -> Checkpoint:
+    if retry_seconds <= 0:
+        raise ValueError("retry_seconds must be positive")
+
+    payload = {
+        "phase": "waiting_for_route",
+        "retry_seconds": retry_seconds,
+    }
+
+    # The checkpoint and lease release must commit together. A stale owner
+    # cannot defer a task claimed by somebody else.
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE tasks
+                SET checkpoint_seq = checkpoint_seq + 1,
+                    status = 'pending',
+                    next_attempt_at =
+                        now() + (%s * interval '1 second'),
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = now()
+                WHERE id = %s
+                  AND lease_owner = %s
+                  AND lease_version = %s
+                  AND lease_expires_at > now()
+                  AND status = 'running'
+                RETURNING checkpoint_seq
+                """,
+                (
+                    retry_seconds,
+                    lease.task_id,
+                    lease.owner_id,
+                    lease.version,
+                ),
+            )
+
+            row = cur.fetchone()
+            if row is None:
+                raise LeaseLost("Cannot defer with a stale lease")
+
+            sequence = row[0]
+            cur.execute(
+                """
+                INSERT INTO task_checkpoints (
+                    id, task_id, sequence, lease_version, payload
+                )
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING created_at
+                """,
+                (
+                    uuid4(),
+                    lease.task_id,
+                    sequence,
+                    lease.version,
+                    Jsonb(payload),
+                ),
+            )
+            created_at = cur.fetchone()[0]
+
+    return Checkpoint(
+        sequence=sequence,
+        lease_version=lease.version,
+        payload=payload,
+        created_at=created_at,
+    )

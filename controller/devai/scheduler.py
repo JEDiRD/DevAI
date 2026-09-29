@@ -45,6 +45,10 @@ def list_ready_tasks(
                 FROM tasks t
                 WHERE t.job_id = %s
                   AND t.status = 'pending'
+                  AND (
+                      t.next_attempt_at IS NULL
+                      OR t.next_attempt_at <= now()
+                  )
 
                   AND NOT EXISTS (
                       SELECT 1
@@ -116,6 +120,10 @@ def claim_next_ready_task(
                     FROM tasks t
                     WHERE t.job_id = %s
                       AND t.status = 'pending'
+                      AND (
+                          t.next_attempt_at IS NULL
+                          OR t.next_attempt_at <= now()
+                      )
 
                       AND NOT EXISTS (
                           SELECT 1
@@ -136,6 +144,7 @@ def claim_next_ready_task(
                     lease_version = t.lease_version + 1,
                     lease_expires_at =
                         now() + (%s * interval '1 second'),
+                    next_attempt_at = NULL,
                     status = 'running',
                     updated_at = now()
                 FROM candidate c

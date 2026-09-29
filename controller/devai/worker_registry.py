@@ -20,7 +20,10 @@ def heartbeat_worker(
             cur.execute(
                 """
                 UPDATE worker_nodes
-                SET status = 'online',
+                SET status = CASE
+                        WHEN status = 'offline' THEN 'online'
+                        ELSE status
+                    END,
                     last_seen_at = now(),
                     platform = COALESCE(
                         %s,
