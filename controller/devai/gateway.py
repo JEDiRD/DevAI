@@ -1,44 +1,62 @@
+from dataclasses import dataclass
 from typing import Protocol
+import json
+import urllib.error
+import urllib.request
 
 
 class GatewayError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class GatewayResult:
+    content: str
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    provider_request_id: str | None = None
+
+
 class GatewayClient(Protocol):
-    def complete(self, model: str, prompt: str) -> str:
+    def complete(
+        self,
+        model: str,
+        prompt: str,
+    ) -> str | GatewayResult:
         ...
 
 
 class StaticGateway:
-    """
-    Deterministic gateway used by tests.
-    Values may be strings or Exceptions.
-    """
 
-    def __init__(self, responses: dict[str, str | Exception]):
+    def __init__(
+        self,
+        responses: dict[str, str | GatewayResult | Exception],
+    ):
         self.responses = responses
         self.calls: list[str] = []
 
-    def complete(self, model: str, prompt: str) -> str:
-        self.calls.append(model)
+    def complete(
+        self,
+        model: str,
+        prompt: str,
+    ) -> str | GatewayResult:
 
+        self.calls.append(model)
         response = self.responses.get(model)
 
         if isinstance(response, Exception):
             raise response
 
         if response is None:
-            raise GatewayError(f"No response configured for {model}")
+            raise GatewayError(
+                f"No response configured for {model}"
+            )
 
         return response
 
-import json
-import urllib.error
-import urllib.request
-
 
 class LiteLLMGateway:
+
     def __init__(
         self,
         base_url: str,
@@ -49,11 +67,19 @@ class LiteLLMGateway:
         self.api_key = api_key
         self.timeout = timeout
 
-    def complete(self, model: str, prompt: str) -> str:
+    def complete(
+        self,
+        model: str,
+        prompt: str,
+    ) -> GatewayResult:
+
         payload = json.dumps({
             "model": model,
             "messages": [
-                {"role": "user", "content": prompt}
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
             ],
             "temperature": 0,
         }).encode("utf-8")
@@ -62,8 +88,10 @@ class LiteLLMGateway:
             f"{self.base_url}/v1/chat/completions",
             data=payload,
             headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
+                "Authorization":
+                    f"Bearer {self.api_key}",
+                "Content-Type":
+                    "application/json",
             },
             method="POST",
         )
@@ -94,8 +122,19 @@ class LiteLLMGateway:
             raise GatewayError(str(data["error"]))
 
         try:
-            return data["choices"][0]["message"]["content"]
+            content = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise GatewayError(
-                "LiteLLM returned an invalid completion response"
+                "LiteLLM returned invalid completion data"
             ) from exc
+
+        usage = data.get("usage") or {}
+
+        return GatewayResult(
+            content=content,
+            prompt_tokens=usage.get("prompt_tokens"),
+            completion_tokens=usage.get(
+                "completion_tokens"
+            ),
+            provider_request_id=data.get("id"),
+        )

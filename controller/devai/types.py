@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import IntEnum
 
 
@@ -24,6 +25,7 @@ class ModelCandidate:
     cost_class: str
     priority: int
     gateway_model: str | None = None
+    pricing_key: str | None = None
     available: bool = True
 
 
@@ -51,6 +53,10 @@ class ExecutionAttempt:
     gateway_model: str
     success: bool
     error: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    provider_request_id: str | None = None
+    reconciled_cost_usd: Decimal | None = None
 
 
 @dataclass(frozen=True)
