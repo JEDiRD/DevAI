@@ -5,11 +5,13 @@ not routes exposed to Workers.
 """
 
 from typing import Annotated
+from datetime import datetime
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field
 
+from .db import connect
 from .worker_dispatch import (
     DispatchLeaseLost,
     claim_next_dispatch,
@@ -34,6 +36,7 @@ app = FastAPI(
 
 def require_worker(
     authorization: Annotated[str | None, Header()] = None,
+    x_worker_id: Annotated[UUID | None, Header()] = None,
 ) -> WorkerPrincipal:
     scheme, separator, token = (authorization or "").partition(" ")
     if separator != " " or scheme.lower() != "bearer" or not token:
@@ -43,13 +46,16 @@ def require_worker(
             headers={"WWW-Authenticate": "Bearer"},
         )
     try:
-        return authenticate_worker_token(token)
+        principal = authenticate_worker_token(token)
     except WorkerAuthenticationError:
         raise HTTPException(
             status_code=401,
             detail="Invalid Worker credential",
             headers={"WWW-Authenticate": "Bearer"},
         ) from None
+    if x_worker_id is not None and x_worker_id != principal.worker_node_id:
+        raise HTTPException(status_code=403, detail="Worker identity mismatch")
+    return principal
 
 
 Principal = Annotated[WorkerPrincipal, Depends(require_worker)]
@@ -67,6 +73,7 @@ class DispatchResponse(BaseModel):
     gateway_model: str
     prompt: str
     claim_version: int
+    lease_expires_at: datetime
 
 
 class CompleteRequest(BaseModel):
@@ -97,6 +104,18 @@ def heartbeat(body: HeartbeatRequest, principal: Principal) -> None:
         raise HTTPException(status_code=403, detail="Worker unavailable") from None
 
 
+@app.get("/healthz")
+def health() -> dict[str, str]:
+    try:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+    except Exception:
+        raise HTTPException(status_code=503, detail="unavailable") from None
+    return {"status": "ok"}
+
+
 @app.post("/v1/worker/claim", response_model=DispatchResponse)
 def claim(principal: Principal) -> DispatchResponse | Response:
     dispatch = claim_next_dispatch(
@@ -111,6 +130,7 @@ def claim(principal: Principal) -> DispatchResponse | Response:
         gateway_model=dispatch.gateway_model,
         prompt=dispatch.prompt,
         claim_version=dispatch.claim_version,
+        lease_expires_at=dispatch.lease_expires_at,
     )
 
 

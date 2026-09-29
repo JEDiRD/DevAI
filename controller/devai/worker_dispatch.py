@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import datetime
 from uuid import UUID, uuid4
 
 from .db import connect
@@ -21,6 +22,7 @@ class WorkerDispatch:
     gateway_model: str
     prompt: str
     claim_version: int
+    lease_expires_at: datetime
 
 
 def create_dispatch(
@@ -112,7 +114,8 @@ def claim_next_dispatch(
                     d.route_key,
                     d.gateway_model,
                     d.prompt,
-                    d.claim_version
+                    d.claim_version,
+                    d.lease_expires_at
                 """,
                 (
                     tenant_id,
@@ -134,6 +137,7 @@ def claim_next_dispatch(
         gateway_model=row[4],
         prompt=row[5],
         claim_version=row[6],
+        lease_expires_at=row[7],
     )
 
 

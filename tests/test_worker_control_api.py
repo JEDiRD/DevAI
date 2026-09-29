@@ -9,11 +9,22 @@ from uuid import uuid4
 import psycopg
 import httpx
 
-from devai import worker_dispatch, worker_identity, worker_registry
+from devai import worker_api, worker_dispatch, worker_identity, worker_registry
 from devai.worker_api import app
 
 
 class ApiClient:
+    def get(self, path, **kwargs):
+        async def send():
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://worker-api.test",
+            ) as client:
+                return await client.get(path, **kwargs)
+
+        return asyncio.run(send())
+
     def post(self, path, **kwargs):
         async def send():
             transport = httpx.ASGITransport(app=app)
@@ -49,7 +60,12 @@ class WorkerControlApiTests(unittest.TestCase):
         self.addCleanup(self.connection.close)
         self.addCleanup(self.connection.rollback)
         shared = SharedTransaction(self.connection)
-        for module in (worker_identity, worker_registry, worker_dispatch):
+        for module in (
+            worker_api,
+            worker_identity,
+            worker_registry,
+            worker_dispatch,
+        ):
             patcher = patch.object(module, "connect", return_value=shared)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -120,6 +136,9 @@ class WorkerControlApiTests(unittest.TestCase):
             )
 
         path = "/v1/worker/heartbeat"
+        self.assertEqual(
+            self.client.get("/healthz").json(), {"status": "ok"}
+        )
         self.assertEqual(self.client.post(path, json={}).status_code, 401)
         self.assertEqual(
             self.client.post(path, headers=self.auth("invalid"), json={}).status_code,
@@ -132,6 +151,17 @@ class WorkerControlApiTests(unittest.TestCase):
                 json={"platform": "windows", "architecture": "x64"},
             ).status_code,
             204,
+        )
+        self.assertEqual(
+            self.client.post(
+                path,
+                headers={
+                    **self.auth(issued.token),
+                    "X-Worker-Id": str(self.worker_a2),
+                },
+                json={},
+            ).status_code,
+            403,
         )
         with self.connection.cursor() as cur:
             cur.execute(
@@ -300,6 +330,18 @@ class WorkerControlApiTests(unittest.TestCase):
                 json={"claim_version": claims[foreign], "content": "wrong"},
             )
             self.assertEqual(response.status_code, 409)
+
+        self.assertEqual(
+            self.client.post(
+                f"/v1/worker/dispatches/{a1}/complete",
+                headers=self.auth(token_a1),
+                json={
+                    "claim_version": claims[a1] + 1,
+                    "content": "wrong version",
+                },
+            ).status_code,
+            409,
+        )
 
         self.assertEqual(
             self.client.post(

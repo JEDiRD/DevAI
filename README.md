@@ -25,3 +25,6 @@ Initial goals:
 
 Worker Control API setup and credential lifecycle:
 [docs/WORKER_CONTROL_API.md](docs/WORKER_CONTROL_API.md).
+
+Private API service and Windows Worker agent:
+[docs/NETWORK_WORKER.md](docs/NETWORK_WORKER.md).
