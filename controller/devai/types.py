@@ -23,6 +23,7 @@ class ModelCandidate:
     capability: Capability
     cost_class: str
     priority: int
+    gateway_model: str | None = None
     available: bool = True
 
 
@@ -41,3 +42,21 @@ class PlannedTask:
 class ExecutionPlan:
     objective: str
     tasks: tuple[PlannedTask, ...]
+
+
+@dataclass(frozen=True)
+class ExecutionAttempt:
+    route_key: str
+    provider: str
+    gateway_model: str
+    success: bool
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class ExecutionResult:
+    content: str
+    route_key: str
+    provider: str
+    gateway_model: str
+    attempts: tuple[ExecutionAttempt, ...]

@@ -15,6 +15,7 @@ DEFAULT_MODELS = (
         capability=Capability.BASIC,
         cost_class="free",
         priority=10,
+        gateway_model="worker-free",
     ),
     ModelCandidate(
         key="gemini/standard",
@@ -22,6 +23,7 @@ DEFAULT_MODELS = (
         capability=Capability.STRONG,
         cost_class="standard",
         priority=20,
+        gateway_model="worker-standard",
     ),
     ModelCandidate(
         key="codex/local",
@@ -29,6 +31,7 @@ DEFAULT_MODELS = (
         capability=Capability.FRONTIER,
         cost_class="premium",
         priority=30,
+        gateway_model="worker-frontier",
     ),
 )
 
