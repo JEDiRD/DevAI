@@ -13,11 +13,8 @@ from .db import connect
 from .executor import AllRoutesFailed, execute_with_fallback
 from .gateway import GatewayClient
 from .router import plan_routes
-from .provider_registry import (
-    list_available_routes,
-    record_route_failure,
-    record_route_success,
-)
+from .provider_registry import list_available_routes
+from .route_health_observer import RouteHealthObserver
 from .scheduler import claim_next_ready_task
 from .types import Capability, TaskAssessment
 
@@ -103,10 +100,12 @@ def run_claimed_task(
         candidates,
     )
 
-    observer = BudgetedLedgerObserver(
-        job_id=task.job_id,
-        task_id=task.id,
-        reservation_by_cost_class=reservation_by_cost_class,
+    observer = RouteHealthObserver(
+        BudgetedLedgerObserver(
+            job_id=task.job_id,
+            task_id=task.id,
+            reservation_by_cost_class=reservation_by_cost_class,
+        )
     )
 
     try:
@@ -118,13 +117,6 @@ def run_claimed_task(
         )
 
     except AllRoutesFailed as exc:
-        for attempt in exc.attempts:
-            if not attempt.success:
-                record_route_failure(
-                    attempt.route_key,
-                    attempt.error or "provider execution failed",
-                )
-
         save_checkpoint(
             lease,
             {
@@ -155,17 +147,6 @@ def run_claimed_task(
             "failed",
         )
         raise
-
-    for attempt in result.attempts:
-        if attempt.success:
-            record_route_success(
-                attempt.route_key,
-            )
-        else:
-            record_route_failure(
-                attempt.route_key,
-                attempt.error or "provider execution failed",
-            )
 
     save_checkpoint(
         lease,
