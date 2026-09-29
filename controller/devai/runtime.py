@@ -10,9 +10,14 @@ from .checkpoint import (
     save_checkpoint,
 )
 from .db import connect
-from .executor import execute_with_fallback
+from .executor import AllRoutesFailed, execute_with_fallback
 from .gateway import GatewayClient
 from .router import plan_routes
+from .provider_registry import (
+    list_available_routes,
+    record_route_failure,
+    record_route_success,
+)
 from .scheduler import claim_next_ready_task
 from .types import Capability, TaskAssessment
 
@@ -91,7 +96,12 @@ def run_claimed_task(
         reason="Capability assigned by validated execution plan.",
     )
 
-    routes = plan_routes(assessment)
+    candidates = list_available_routes()
+
+    routes = plan_routes(
+        assessment,
+        candidates,
+    )
 
     observer = BudgetedLedgerObserver(
         job_id=task.job_id,
@@ -106,6 +116,29 @@ def run_claimed_task(
             gateway=gateway,
             observer=observer,
         )
+
+    except AllRoutesFailed as exc:
+        for attempt in exc.attempts:
+            if not attempt.success:
+                record_route_failure(
+                    attempt.route_key,
+                    attempt.error or "provider execution failed",
+                )
+
+        save_checkpoint(
+            lease,
+            {
+                "phase": "execution_failed",
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:500],
+            },
+        )
+
+        release_task(
+            lease,
+            "failed",
+        )
+        raise
 
     except Exception as exc:
         save_checkpoint(
@@ -122,6 +155,17 @@ def run_claimed_task(
             "failed",
         )
         raise
+
+    for attempt in result.attempts:
+        if attempt.success:
+            record_route_success(
+                attempt.route_key,
+            )
+        else:
+            record_route_failure(
+                attempt.route_key,
+                attempt.error or "provider execution failed",
+            )
 
     save_checkpoint(
         lease,
