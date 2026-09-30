@@ -7,6 +7,8 @@ not routes exposed to Workers.
 from typing import Annotated
 from datetime import datetime
 from uuid import UUID
+import json
+import logging
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field
@@ -34,12 +36,21 @@ app = FastAPI(
 )
 
 
+def auth_failure(status: int) -> None:
+    # Fixed schema only: never include token, headers, body or exception text.
+    logging.getLogger('devai.security').warning(
+        'DEVAI_SECURITY %s',
+        json.dumps({'kind': 'worker_auth_failure', 'status': status}),
+    )
+
+
 def require_worker(
     authorization: Annotated[str | None, Header()] = None,
     x_worker_id: Annotated[UUID | None, Header()] = None,
 ) -> WorkerPrincipal:
     scheme, separator, token = (authorization or "").partition(" ")
     if separator != " " or scheme.lower() != "bearer" or not token:
+        auth_failure(401)
         raise HTTPException(
             status_code=401,
             detail="Worker authentication required",
@@ -48,12 +59,14 @@ def require_worker(
     try:
         principal = authenticate_worker_token(token)
     except WorkerAuthenticationError:
+        auth_failure(401)
         raise HTTPException(
             status_code=401,
             detail="Invalid Worker credential",
             headers={"WWW-Authenticate": "Bearer"},
         ) from None
     if x_worker_id is not None and x_worker_id != principal.worker_node_id:
+        auth_failure(403)
         raise HTTPException(status_code=403, detail="Worker identity mismatch")
     return principal
 
