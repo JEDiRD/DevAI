@@ -27,6 +27,7 @@ class ModelCandidate:
     gateway_model: str | None = None
     pricing_key: str | None = None
     available: bool = True
+    billing_mode: str = 'metered'
 
 
 @dataclass(frozen=True)

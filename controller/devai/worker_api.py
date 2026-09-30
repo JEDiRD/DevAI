@@ -5,7 +5,7 @@ not routes exposed to Workers.
 """
 
 from typing import Annotated
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import UUID
 import json
 import logging
@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .db import connect
 from .worker_dispatch import (
     DispatchLeaseLost,
+    DispatchUnavailable,
     claim_next_dispatch,
     complete_dispatch,
     fail_dispatch,
@@ -78,6 +79,7 @@ class HeartbeatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     platform: str | None = Field(default=None, max_length=80)
     architecture: str | None = Field(default=None, max_length=80)
+    capabilities: list[str] | None = Field(default=None,max_length=32)
 
 
 class DispatchResponse(BaseModel):
@@ -87,6 +89,14 @@ class DispatchResponse(BaseModel):
     prompt: str
     claim_version: int
     lease_expires_at: datetime
+    connection_id: UUID
+    adapter_key: str
+    execution_timeout_seconds: int
+    spec_version: int
+    adapter_version: str
+    deadline_at: datetime
+    idempotency_key: UUID
+    server_time: datetime
 
 
 class CompleteRequest(BaseModel):
@@ -112,9 +122,12 @@ def heartbeat(body: HeartbeatRequest, principal: Principal) -> None:
             principal.worker_node_id,
             platform=body.platform,
             architecture=body.architecture,
+            capabilities=body.capabilities,
         )
     except WorkerNotFound:
         raise HTTPException(status_code=403, detail="Worker unavailable") from None
+    except ValueError:
+        raise HTTPException(status_code=422,detail='Invalid capabilities') from None
 
 
 @app.get("/healthz")
@@ -144,6 +157,14 @@ def claim(principal: Principal) -> DispatchResponse | Response:
         prompt=dispatch.prompt,
         claim_version=dispatch.claim_version,
         lease_expires_at=dispatch.lease_expires_at,
+        connection_id=dispatch.connection_id,
+        adapter_key=dispatch.adapter_key,
+        execution_timeout_seconds=dispatch.execution_timeout_seconds,
+        spec_version=dispatch.spec_version,
+        adapter_version=dispatch.adapter_version,
+        deadline_at=dispatch.deadline_at,
+        idempotency_key=dispatch.idempotency_key,
+        server_time=datetime.now(timezone.utc),
     )
 
 
@@ -169,6 +190,8 @@ def complete(
             status_code=409,
             detail="Dispatch lease unavailable",
         ) from None
+    except DispatchUnavailable:
+        raise HTTPException(status_code=422,detail='Invalid result') from None
 
 
 @app.post("/v1/worker/dispatches/{dispatch_id}/fail", status_code=204)

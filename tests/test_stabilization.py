@@ -84,6 +84,7 @@ class StabilizationTests(unittest.TestCase):
             cost_class="free",
             priority=10,
             pricing_key="test-price",
+            billing_mode='free',
         )
 
     def worker(self, status="offline"):
@@ -210,6 +211,9 @@ class StabilizationTests(unittest.TestCase):
         connection_id = self.connection_id()
         self.route(connection_id)
         worker_id = self.worker()
+        with self.connection.cursor() as cur:
+            cur.execute("UPDATE worker_nodes SET status='online',last_seen_at=now(),capabilities='[\"synthetic_test\"]' WHERE id=%s",(worker_id,))
+            cur.execute("UPDATE provider_connections SET worker_node_id=%s,adapter_key='synthetic_test' WHERE id=%s",(worker_id,connection_id))
         dispatch_id = worker_dispatch.create_dispatch(
             tenant_id=self.tenant_id,
             worker_node_id=worker_id,

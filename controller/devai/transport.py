@@ -22,6 +22,9 @@ class ConnectionSpec:
     credential_ref: str | None
     endpoint: str | None
     config: dict
+    adapter_key: str | None = None
+    worker_node_id: UUID | None = None
+    route_key: str | None = None
 
 
 def get_route_connection(
@@ -41,7 +44,9 @@ def get_route_connection(
                     c.auth_type,
                     c.credential_ref,
                     c.endpoint,
-                    c.config
+                    c.config,
+                    c.adapter_key,
+                    c.worker_node_id
                 FROM provider_routes r
                 JOIN provider_connections c
                   ON c.tenant_id = r.tenant_id
@@ -78,6 +83,9 @@ def get_route_connection(
         credential_ref=row[5],
         endpoint=row[6],
         config=config or {},
+        adapter_key=row[8],
+        worker_node_id=row[9],
+        route_key=route_key,
     )
 
 
@@ -203,8 +211,19 @@ def default_transport_registry() -> TransportRegistry:
         "litellm",
         build_litellm_gateway,
     )
+    registry.register('local_cli', build_remote_worker_gateway)
 
     return registry
+
+
+def build_remote_worker_gateway(connection, resolver):
+    from .remote_worker_gateway import RemoteWorkerGateway
+    if not connection.worker_node_id or not connection.adapter_key or not connection.route_key:
+        raise GatewayConfigurationError('REMOTE_WORKER_CONNECTION_INCOMPLETE')
+    # Worker credentials/session refs are never resolved in the Controller.
+    return RemoteWorkerGateway(tenant_id=connection.tenant_id,
+        worker_node_id=connection.worker_node_id, connection_id=connection.id,
+        route_key=connection.route_key)
 
 
 def build_gateway_for_route(

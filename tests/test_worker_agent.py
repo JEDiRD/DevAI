@@ -16,6 +16,15 @@ from worker_agent.client import (
     validate_private_base_url,
 )
 from worker_agent.credential_store import WindowsDpapiCredentialStore
+from worker_agent.adapters import AdapterResult
+from worker_agent.execution_journal import ExecutionJournal
+
+
+def sample_dispatch(**kwargs):
+    return Dispatch(connection_id=uuid4(),adapter_key=kwargs.pop('adapter_key','synthetic_test'),
+        execution_timeout_seconds=30,spec_version=1,adapter_version='1.0',
+        deadline_at=datetime.now(timezone.utc)+timedelta(seconds=30),
+        idempotency_key=uuid4(),**kwargs)
 
 
 class FakeResponse:
@@ -29,7 +38,7 @@ class FakeResponse:
     def __exit__(self, *_):
         return False
 
-    def read(self):
+    def read(self, limit=-1):
         return self.payload
 
 
@@ -59,7 +68,7 @@ class FakeClient:
     def replace_token(self, token):
         pass
 
-    def complete(self, dispatch, content):
+    def complete(self, dispatch, content, **usage):
         self.completed.append((dispatch.id, dispatch.claim_version, content))
 
     def fail(self, dispatch, error_message):
@@ -94,6 +103,10 @@ class WorkerAgentTests(unittest.TestCase):
                 "prompt": "sample",
                 "claim_version": 4,
                 "lease_expires_at": expires.isoformat(),
+                'connection_id':str(uuid4()),'adapter_key':'synthetic_test',
+                'execution_timeout_seconds':30,'spec_version':1,'adapter_version':'1.0',
+                'deadline_at':expires.isoformat(),'idempotency_key':str(uuid4()),
+                'server_time':datetime.now(timezone.utc).isoformat(),
             }).encode()),
         ])
         client = WorkerApiClient(
@@ -121,8 +134,8 @@ class WorkerAgentTests(unittest.TestCase):
             credential_path=Path("unused"),
         )
         client = FakeClient()
-        agent = WorkerAgent(config, FakeStore("devai_wkr_test"), client=client)
-        dispatch = Dispatch(
+        agent = WorkerAgent(config, FakeStore("devai_wkr_test"), client=client,journal=ExecutionJournal(':memory:'))
+        dispatch = sample_dispatch(
             id=uuid4(),
             route_key="synthetic/windows",
             gateway_model="synthetic",
@@ -133,14 +146,15 @@ class WorkerAgentTests(unittest.TestCase):
         agent._process(dispatch)
         self.assertEqual(
             client.completed,
-            [(dispatch.id, 7, "WINDOWS_WORKER_OK")],
+            [(dispatch.id, 7, "REMOTE_ADAPTER_OK")],
         )
         self.assertEqual(client.failed, [])
 
-        unsupported = Dispatch(
+        unsupported = sample_dispatch(
             id=uuid4(),
             route_key="unknown/route",
             gateway_model="other",
+            adapter_key='unknown',
             prompt="sample",
             claim_version=8,
             lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=2),
@@ -148,7 +162,7 @@ class WorkerAgentTests(unittest.TestCase):
         agent._process(unsupported)
         self.assertEqual(
             client.failed,
-            [(unsupported.id, 8, "handler_error:ValueError")],
+            [(unsupported.id, 8, "UNSUPPORTED_ADAPTER")],
         )
 
     def test_connectivity_backoff_is_bounded(self):
@@ -164,7 +178,7 @@ class WorkerAgentTests(unittest.TestCase):
                 super().__init__()
                 self.calls = 0
 
-            def heartbeat(self, platform, architecture):
+            def heartbeat(self, platform, architecture, capabilities):
                 self.calls += 1
                 if self.calls == 1:
                     raise ConnectivityError("offline")
@@ -176,7 +190,7 @@ class WorkerAgentTests(unittest.TestCase):
             credential_path=Path("unused"),
             heartbeat_seconds=1,
         )
-        agent = WorkerAgent(config, FakeStore("devai_wkr_test"), client=client)
+        agent = WorkerAgent(config, FakeStore("devai_wkr_test"), client=client,journal=ExecutionJournal(':memory:'))
         with patch.object(Backoff, "next_delay", return_value=0):
             thread = threading.Thread(target=agent._heartbeat_loop)
             thread.start()
@@ -193,18 +207,18 @@ class WorkerAgentTests(unittest.TestCase):
             def __init__(self):
                 self.calls = 0
 
-            def execute(self, dispatch):
+            def execute(self, dispatch, context):
                 self.calls += 1
-                return "WINDOWS_WORKER_OK"
+                return AdapterResult("REMOTE_ADAPTER_OK")
 
         class FlakyClient(FakeClient):
-            def complete(self, dispatch, content):
+            def complete(self, dispatch, content, **usage):
                 super().complete(dispatch, content)
                 if len(self.completed) == 1:
                     raise ConnectivityError("offline")
 
         handler = CountingHandler()
-        handlers = type("Handlers", (), {"execute": lambda _, d: handler.execute(d)})()
+        adapters = type("Adapters", (), {"execute": lambda _, d, c: handler.execute(d,c)})()
         client = FlakyClient()
         config = AgentConfig(
             worker_id=uuid4(),
@@ -213,9 +227,9 @@ class WorkerAgentTests(unittest.TestCase):
         )
         agent = WorkerAgent(
             config, FakeStore("devai_wkr_test"),
-            client=client, handlers=handlers,
+            client=client, adapters=adapters,journal=ExecutionJournal(':memory:'),
         )
-        dispatch = Dispatch(
+        dispatch = sample_dispatch(
             id=uuid4(),
             route_key="synthetic/windows",
             gateway_model="synthetic",
@@ -230,8 +244,8 @@ class WorkerAgentTests(unittest.TestCase):
         self.assertEqual(
             client.completed,
             [
-                (dispatch.id, 3, "WINDOWS_WORKER_OK"),
-                (dispatch.id, 3, "WINDOWS_WORKER_OK"),
+                (dispatch.id, 3, "REMOTE_ADAPTER_OK"),
+                (dispatch.id, 3, "REMOTE_ADAPTER_OK"),
             ],
         )
 

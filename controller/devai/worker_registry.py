@@ -13,8 +13,12 @@ def heartbeat_worker(
     *,
     platform: str | None = None,
     architecture: str | None = None,
+    capabilities: list[str] | None = None,
 ) -> None:
 
+    import json,re
+    if capabilities is not None and (len(capabilities)>32 or any(not isinstance(k,str) or not re.fullmatch(r'[a-z][a-z0-9_]{0,63}',k) for k in capabilities)):
+        raise ValueError('INVALID_WORKER_CAPABILITIES')
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -34,6 +38,7 @@ def heartbeat_worker(
                         architecture
                     ),
                     updated_at = now()
+                    ,capabilities=COALESCE(%s::jsonb,capabilities)
                 WHERE tenant_id = %s
                   AND id = %s
                   AND status <> 'disabled'
@@ -41,6 +46,7 @@ def heartbeat_worker(
                 (
                     platform,
                     architecture,
+                    json.dumps(capabilities) if capabilities is not None else None,
                     tenant_id,
                     worker_id,
                 ),

@@ -28,3 +28,6 @@ Worker Control API setup and credential lifecycle:
 
 Private API service and Windows Worker agent:
 [docs/NETWORK_WORKER.md](docs/NETWORK_WORKER.md).
+
+Immutable remote execution specs, synthetic adapter, billing and security limits:
+[docs/EXECUTION_ADAPTER_FOUNDATION.md](docs/EXECUTION_ADAPTER_FOUNDATION.md).

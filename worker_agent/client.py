@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import time
 import ipaddress
 import json
 from urllib import error, request
@@ -33,6 +34,14 @@ class Dispatch:
     prompt: str = field(repr=False)
     claim_version: int
     lease_expires_at: datetime
+    connection_id: UUID
+    adapter_key: str
+    execution_timeout_seconds: int
+    spec_version: int
+    adapter_version: str
+    deadline_at: datetime
+    idempotency_key: UUID
+    local_deadline_monotonic: float | None = field(default=None,repr=False)
 
 
 class _NoRedirect(request.HTTPRedirectHandler):
@@ -101,7 +110,9 @@ class WorkerApiClient:
         try:
             with self._opener.open(outgoing, timeout=self.timeout) as incoming:
                 status = incoming.status
-                raw = incoming.read()
+                raw = incoming.read(1_000_001)
+                if len(raw)>1_000_000:
+                    raise ProtocolError('Controller response exceeds local limit')
         except error.HTTPError as exc:
             if exc.code == 401 or exc.code == 403:
                 raise AuthenticationError("Worker authentication rejected") from None
@@ -122,19 +133,25 @@ class WorkerApiClient:
         except (ValueError, UnicodeDecodeError):
             raise ProtocolError("Controller returned invalid JSON") from None
 
-    def heartbeat(self, platform: str, architecture: str) -> None:
+    def heartbeat(self, platform: str, architecture: str, capabilities=None) -> None:
         result = self._post(
             "/v1/worker/heartbeat",
-            {"platform": platform, "architecture": architecture},
+            {"platform": platform, "architecture": architecture, "capabilities": capabilities},
         )
         if result is not None:
             raise ProtocolError("Unexpected heartbeat response")
 
     def claim(self) -> Dispatch | None:
+        started=time.monotonic()
         data = self._post("/v1/worker/claim")
         if data is None:
             return None
         try:
+            expected={'id','route_key','gateway_model','prompt','claim_version','lease_expires_at',
+                'connection_id','adapter_key','execution_timeout_seconds','spec_version',
+                'adapter_version','deadline_at','idempotency_key','server_time'}
+            if set(data)!=expected:
+                raise ValueError('unexpected execution fields')
             expires_at = datetime.fromisoformat(
                 data["lease_expires_at"].replace("Z", "+00:00")
             )
@@ -143,6 +160,10 @@ class WorkerApiClient:
             version = int(data["claim_version"])
             if version < 1:
                 raise ValueError("invalid claim version")
+            deadline=datetime.fromisoformat(data['deadline_at'].replace('Z','+00:00'))
+            server_time=datetime.fromisoformat(data['server_time'].replace('Z','+00:00'))
+            if deadline.tzinfo is None or server_time.tzinfo is None:
+                raise ValueError('naive deadline')
             return Dispatch(
                 id=UUID(data["id"]),
                 route_key=data["route_key"],
@@ -150,14 +171,20 @@ class WorkerApiClient:
                 prompt=data["prompt"],
                 claim_version=version,
                 lease_expires_at=expires_at,
+                connection_id=UUID(data['connection_id']),adapter_key=data['adapter_key'],
+                execution_timeout_seconds=data['execution_timeout_seconds'],
+                spec_version=data['spec_version'],adapter_version=data['adapter_version'],
+                deadline_at=deadline,idempotency_key=UUID(data['idempotency_key']),
+                local_deadline_monotonic=started+max(0,(min(deadline,expires_at)-server_time).total_seconds()),
             )
         except (KeyError, TypeError, ValueError, AttributeError):
             raise ProtocolError("Controller returned invalid dispatch") from None
 
-    def complete(self, dispatch: Dispatch, content: str) -> None:
+    def complete(self, dispatch: Dispatch, content: str, *, prompt_tokens=None,completion_tokens=None) -> None:
         result = self._post(
             f"/v1/worker/dispatches/{dispatch.id}/complete",
-            {"claim_version": dispatch.claim_version, "content": content},
+            {"claim_version": dispatch.claim_version, "content": content,
+             "prompt_tokens":prompt_tokens,"completion_tokens":completion_tokens},
         )
         if result is not None:
             raise ProtocolError("Unexpected completion response")

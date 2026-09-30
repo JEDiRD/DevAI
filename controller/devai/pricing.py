@@ -57,6 +57,8 @@ def calculate_cost(
 ) -> Decimal:
 
     million = Decimal("1000000")
+    if any(type(value) is not int or value < 0 for value in (prompt_tokens,completion_tokens)):
+        raise ValueError('INVALID_TOKEN_USAGE')
 
     return (
         Decimal(prompt_tokens)

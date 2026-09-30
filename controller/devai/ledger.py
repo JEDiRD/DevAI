@@ -168,6 +168,7 @@ def start_attempt(
     route_key: str,
     provider: str,
     gateway_model: str,
+    billing_mode: str = 'metered',
 ) -> UUID:
     attempt_id = uuid4()
 
@@ -183,12 +184,13 @@ def start_attempt(
                     route_key,
                     provider,
                     gateway_model,
+                    billing_mode,
                     status,
                     started_at
                 )
                 VALUES (
                     %s, %s, %s, %s,
-                    %s, %s, %s,
+                    %s, %s, %s, %s,
                     'running',
                     now()
                 )
@@ -201,6 +203,7 @@ def start_attempt(
                     route_key,
                     provider,
                     gateway_model,
+                    billing_mode,
                 ),
             )
 

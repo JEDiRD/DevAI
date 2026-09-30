@@ -8,6 +8,8 @@ from pathlib import Path
 import platform as host_platform
 import random
 import threading
+import os
+import time
 from uuid import UUID
 
 from .client import (
@@ -22,7 +24,8 @@ from .credential_store import (
     WindowsDpapiCredentialStore,
     default_credential_path,
 )
-from .handlers import HandlerRegistry
+from .adapters import AdapterRegistry, AdapterError, ExecutionContext, LIMITS
+from .execution_journal import ExecutionJournal
 
 
 log = logging.getLogger(__name__)
@@ -77,7 +80,8 @@ class WorkerAgent:
         credential_store: CredentialStore | None = None,
         *,
         client: WorkerApiClient | None = None,
-        handlers: HandlerRegistry | None = None,
+        adapters: AdapterRegistry | None = None,
+        journal: ExecutionJournal | None = None,
     ):
         self.config = config
         self.credential_store = credential_store or WindowsDpapiCredentialStore(
@@ -87,7 +91,9 @@ class WorkerAgent:
         self.client = client or WorkerApiClient(
             config.api_base_url, config.worker_id, token
         )
-        self.handlers = handlers or HandlerRegistry()
+        self.adapters = adapters or AdapterRegistry()
+        journal_root=Path(os.environ.get('LOCALAPPDATA',str(config.credential_path.parent)))/'DevAI'
+        self.journal = journal or ExecutionJournal(journal_root/f'executions-{config.worker_id}.sqlite')
         self.stop_event = threading.Event()
         self.online = threading.Event()
 
@@ -108,6 +114,7 @@ class WorkerAgent:
                 self.client.heartbeat(
                     host_platform.system().lower(),
                     host_platform.machine().lower(),
+                    self.adapters.capabilities,
                 )
                 if not self.online.is_set():
                     log.info("Worker connected")
@@ -126,16 +133,17 @@ class WorkerAgent:
                 self.online.clear()
                 delay = backoff.next_delay()
 
-    def _submit(self, dispatch, *, content=None, error_message=None) -> None:
+    def _submit(self, dispatch, *, result=None, error_message=None) -> None:
         backoff = Backoff()
         while not self.stop_event.is_set():
-            if dispatch.lease_expires_at <= datetime.now(timezone.utc):
+            if min(dispatch.lease_expires_at,dispatch.deadline_at) <= datetime.now(timezone.utc) or (dispatch.local_deadline_monotonic is not None and time.monotonic()>=dispatch.local_deadline_monotonic):
                 log.warning("Dispatch lease expired before result acknowledgement")
                 return
             try:
                 self._refresh_token()
                 if error_message is None:
-                    self.client.complete(dispatch, content)
+                    self.client.complete(dispatch, result.content,
+                        prompt_tokens=result.prompt_tokens,completion_tokens=result.completion_tokens)
                 else:
                     self.client.fail(dispatch, error_message)
                 log.info("Dispatch result acknowledged")
@@ -156,15 +164,28 @@ class WorkerAgent:
                 self.stop_event.wait(backoff.next_delay())
 
     def _process(self, dispatch) -> None:
+        started = False
         try:
-            content = self.handlers.execute(dispatch)
+            result = self.journal.begin(dispatch)
+            if result is None:
+                started = True
+                remaining=min(LIMITS.max_timeout_seconds,dispatch.execution_timeout_seconds,
+                    (min(dispatch.lease_expires_at,dispatch.deadline_at)-datetime.now(timezone.utc)).total_seconds())
+                end=time.monotonic()+max(0,remaining)
+                if dispatch.local_deadline_monotonic is not None:
+                    end=min(end,dispatch.local_deadline_monotonic)
+                result = self.adapters.execute(dispatch,ExecutionContext(self.stop_event,end))
+                self.journal.finish(dispatch,result=result)
         except Exception as exc:
+            code=exc.code if isinstance(exc,AdapterError) else 'ADAPTER_INTERNAL_ERROR'
+            if started:
+                self.journal.finish(dispatch,error=code)
             self._submit(
                 dispatch,
-                error_message=f"handler_error:{type(exc).__name__}",
+                error_message=code,
             )
         else:
-            self._submit(dispatch, content=content)
+            self._submit(dispatch, result=result)
 
     def run_forever(self) -> None:
         heartbeat = threading.Thread(

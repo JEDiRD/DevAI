@@ -22,6 +22,7 @@ def upsert_route(
     cost_class: str,
     priority: int,
     pricing_key: str,
+    billing_mode: str,
     enabled: bool = True,
     failure_threshold: int = 2,
     cooldown_seconds: int = 300,
@@ -43,11 +44,12 @@ def upsert_route(
                     pricing_key,
                     enabled,
                     failure_threshold,
-                    cooldown_seconds
+                    cooldown_seconds,
+                    billing_mode
                 )
                 VALUES (
                     %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s
                 )
                 ON CONFLICT (tenant_id, route_key)
                 DO UPDATE SET
@@ -61,6 +63,7 @@ def upsert_route(
                     enabled = EXCLUDED.enabled,
                     failure_threshold = EXCLUDED.failure_threshold,
                     cooldown_seconds = EXCLUDED.cooldown_seconds,
+                    billing_mode = EXCLUDED.billing_mode,
                     updated_at = now()
                 """,
                 (
@@ -76,6 +79,7 @@ def upsert_route(
                     enabled,
                     failure_threshold,
                     cooldown_seconds,
+                    billing_mode,
                 ),
             )
 
@@ -95,7 +99,8 @@ def list_available_routes(
                     r.capability,
                     r.cost_class,
                     r.priority,
-                    r.pricing_key
+                    r.pricing_key,
+                    r.billing_mode
                 FROM provider_routes r
                 JOIN provider_connections c
                   ON c.tenant_id = r.tenant_id
@@ -106,6 +111,7 @@ def list_available_routes(
                 WHERE r.tenant_id = %s
                   AND r.enabled = TRUE
                   AND c.enabled = TRUE
+                  AND (c.transport <> 'local_cli' OR c.worker_node_id IS NOT NULL)
                   AND (
                       r.cooldown_until IS NULL
                       OR r.cooldown_until <= now()
@@ -117,6 +123,8 @@ def list_available_routes(
                           AND n.last_seen_at IS NOT NULL
                           AND n.last_seen_at >
                               now() - interval '90 seconds'
+                          AND c.adapter_key IS NOT NULL
+                          AND n.capabilities ? c.adapter_key
                       )
                   )
                 ORDER BY r.priority, r.route_key
@@ -135,6 +143,7 @@ def list_available_routes(
             cost_class=row[4],
             priority=row[5],
             pricing_key=row[6],
+            billing_mode=row[7],
         )
         for row in rows
     ]

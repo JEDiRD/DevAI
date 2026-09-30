@@ -31,10 +31,13 @@ an interactive prompt and does not echo the token. Then run
 The agent sends heartbeat on a separate thread, polls for its own dispatches,
 and retries connectivity with bounded backoff. It does not retry handler
 execution after a submission error; it resends only the same result with the
-same `claim_version` until the lease expires. Currently the only handler is
-`synthetic/windows`, which returns `WINDOWS_WORKER_OK`. Unknown routes are
-reported as failed dispatches. Provider and model adapters are separate future
-work.
+same `claim_version` until the lease or execution deadline expires. The local
+AdapterRegistry currently allowlists only `synthetic_test` version 1.0, returning
+`REMOTE_ADAPTER_OK`. Heartbeat advertises this capability. Unknown adapters and
+incompatible execution versions fail closed. A durable per-Worker execution
+journal prevents duplicate execution across submission retries and restarts.
+See [Execution Adapter Foundation](EXECUTION_ADAPTER_FOUNDATION.md) for the
+immutable spec, local limits and requirements for future process adapters.
 
 The Worker has no PostgreSQL connection string. PostgreSQL should remain bound
 to loopback on the Controller host. The API has no public listener and should

@@ -97,16 +97,16 @@ class WorkerControlApiTests(unittest.TestCase):
     def auth(self, token):
         return {"Authorization": f"Bearer {token}"}
 
-    def route(self, tenant_id, route_key):
+    def route(self, tenant_id, route_key, worker_id):
         connection_id = uuid4()
         with self.connection.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO provider_connections (
-                    id, tenant_id, name, transport, auth_type
-                ) VALUES (%s, %s, %s, 'local_cli', 'subscription_session')
+                    id, tenant_id, name, transport, auth_type,worker_node_id,adapter_key
+                ) VALUES (%s, %s, %s, 'local_cli', 'subscription_session',%s,'synthetic_test')
                 """,
-                (connection_id, tenant_id, str(connection_id)),
+                (connection_id, tenant_id, str(connection_id),worker_id),
             )
             cur.execute(
                 """
@@ -119,6 +119,7 @@ class WorkerControlApiTests(unittest.TestCase):
                 """,
                 (tenant_id, connection_id, route_key),
             )
+            cur.execute("UPDATE worker_nodes SET capabilities='[\"synthetic_test\"]' WHERE id=%s",(worker_id,))
 
     def test_token_hash_authentication_and_revocation(self):
         issued = worker_identity.issue_worker_token(
@@ -282,8 +283,9 @@ class WorkerControlApiTests(unittest.TestCase):
                 204,
             )
 
-        self.route(self.tenant_a, "test/a")
-        self.route(self.tenant_b, "test/b")
+        self.route(self.tenant_a, "test/a",self.worker_a1)
+        self.route(self.tenant_a, "test/a2",self.worker_a2)
+        self.route(self.tenant_b, "test/b",self.worker_b)
         a1 = worker_dispatch.create_dispatch(
             tenant_id=self.tenant_a,
             worker_node_id=self.worker_a1,
@@ -294,7 +296,7 @@ class WorkerControlApiTests(unittest.TestCase):
         a2 = worker_dispatch.create_dispatch(
             tenant_id=self.tenant_a,
             worker_node_id=self.worker_a2,
-            route_key="test/a",
+            route_key="test/a2",
             gateway_model="model",
             prompt="a2 prompt",
         )

@@ -51,6 +51,15 @@ class BudgetedLedgerObserver:
         gateway_model: str,
     ) -> None:
 
+        mode = route.billing_mode
+        if mode not in ('free','metered','subscription','local'):
+            raise BudgetPolicyMissing('INVALID_BILLING_MODE')
+        if mode != 'metered':
+            attempt_id = start_attempt(job_id=self.job_id, task_id=self.task_id,
+                attempt_number=number, route_key=route.key, provider=route.provider,
+                gateway_model=gateway_model, billing_mode=mode)
+            self._state[number] = (attempt_id, Decimal(0), None, mode)
+            return
         reservation = (
             self.reservation_by_cost_class.get(
                 route.cost_class
@@ -85,6 +94,7 @@ class BudgetedLedgerObserver:
                 route_key=route.key,
                 provider=route.provider,
                 gateway_model=gateway_model,
+                billing_mode=mode,
             )
         except Exception:
             release_budget(
@@ -97,7 +107,7 @@ class BudgetedLedgerObserver:
             attempt_id,
             reservation,
             price,
-            route.cost_class,
+            mode,
         )
 
     def attempt_finished(
@@ -110,20 +120,16 @@ class BudgetedLedgerObserver:
             attempt_id,
             reservation,
             price,
-            cost_class,
+            billing_mode,
         ) = self._state[number]
 
-        if (
+        if billing_mode != 'metered':
+            actual = Decimal(0)
+        elif (
             attempt.prompt_tokens is None
             or attempt.completion_tokens is None
         ):
-            if attempt.success and cost_class != "free":
-                raise UsageMissing(
-                    "Paid successful call returned "
-                    "without token usage"
-                )
-
-            actual = Decimal("0")
+            raise UsageMissing('METERED_USAGE_REQUIRED')
 
         else:
             actual = calculate_cost(
@@ -138,6 +144,7 @@ class BudgetedLedgerObserver:
             attempt=attempt,
             reserved_usd=reservation,
             actual_usd=actual,
-            pricing_key=price.pricing_key,
-            pricing_version=price.version,
+            pricing_key=price.pricing_key if price else None,
+            pricing_version=price.version if price else None,
+            billing_mode=billing_mode,
         )
