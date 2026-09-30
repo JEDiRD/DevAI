@@ -2,8 +2,8 @@
 import random
 import time
 from uuid import uuid4
-from .gateway import GatewayError, GatewayResult, GatewayConnectionError
-from .worker_dispatch import (create_dispatch,get_dispatch_result,cancel_dispatch,
+from .gateway import GatewayError, GatewayResult, GatewayConnectionError, ExecutionSafetyError
+from .worker_dispatch import (create_dispatch,get_dispatch_result,cancel_dispatch,termination_confirmed,
                               DispatchUnavailable,MAX_TIMEOUT_SECONDS)
 
 
@@ -40,12 +40,20 @@ class RemoteWorkerGateway:
             try:
                 status,content,pt,ct,request_id,error = get_dispatch_result(dispatch_id,tenant_id=self.tenant_id)
             except DispatchUnavailable:
-                raise RemoteWorkerError('REMOTE_DISPATCH_UNAVAILABLE') from None
+                raise ExecutionSafetyError('REMOTE_TERMINATION_UNCONFIRMED') from None
             except Exception:
                 # Polling reconnect only: never create a second execution.
                 time.sleep(min(1.5,delay*random.uniform(.8,1.2),max(0,end-time.monotonic())))
                 delay=min(1.5,delay*1.5)
                 continue
+            if status in ('succeeded','failed','expired','cancelled'):
+                try:
+                    confirmed=termination_confirmed(tenant_id=self.tenant_id,dispatch_id=dispatch_id)
+                except Exception:
+                    confirmed=False  # Unknown containment never permits fallback.
+                if not confirmed:
+                    time.sleep(min(.2,max(0,end-time.monotonic())))
+                    continue
             if status=='succeeded':
                 return GatewayResult(content,pt,ct,request_id)
             if status in ('failed','expired','cancelled'):
@@ -57,4 +65,11 @@ class RemoteWorkerGateway:
             cancel_dispatch(tenant_id=self.tenant_id,dispatch_id=dispatch_id)
         except Exception:
             pass  # Absolute immutable deadline still fences execution/results.
-        raise RemoteWorkerError('REMOTE_WAIT_TIMEOUT')
+        try:
+            if termination_confirmed(tenant_id=self.tenant_id,dispatch_id=dispatch_id):
+                raise RemoteWorkerError('REMOTE_POLL_TIMEOUT')
+        except RemoteWorkerError:
+            raise
+        except Exception:
+            pass
+        raise ExecutionSafetyError('REMOTE_TERMINATION_UNCONFIRMED')

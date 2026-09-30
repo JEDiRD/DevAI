@@ -58,6 +58,8 @@ def reserve_budget(
                   AND (
                       reserved_usd +
                       spent_usd +
+                      recovery_exposure_usd +
+                      unpriced_exposure_usd +
                       %s
                   ) <= limit_usd
                 RETURNING job_id

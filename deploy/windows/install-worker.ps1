@@ -1,0 +1,138 @@
+param([Parameter(Mandatory=$true)][string]$PackageRoot)
+$ErrorActionPreference='Stop'
+$admin=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+if (!$admin.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'ADMINISTRATOR_INSTALL_REQUIRED' }
+$PackageRoot=(Resolve-Path -LiteralPath $PackageRoot).Path
+for ($parent=Get-Item -LiteralPath $PackageRoot; $null -ne $parent; $parent=$parent.Parent) {
+  if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'PACKAGE_ANCESTOR_REPARSE_POINT' }
+}
+$installRoot=Join-Path $env:ProgramFiles 'DevAIWorker'
+$stateRoot=Join-Path $env:ProgramData 'DevAIWorker'
+if (Get-Service -Name DevAIWorker -ErrorAction SilentlyContinue) { throw 'EXISTING_SERVICE_REQUIRES_REVIEWED_UPGRADE' }
+if ((Test-Path -LiteralPath $installRoot) -or (Test-Path -LiteralPath $stateRoot)) { throw 'EXISTING_INSTALLATION_PATH_REQUIRES_REVIEW' }
+$package=Get-Content -LiteralPath (Join-Path $PackageRoot 'package.json') -Raw | ConvertFrom-Json
+foreach ($entry in $package.files.PSObject.Properties) {
+  if ([IO.Path]::IsPathRooted($entry.Name) -or $entry.Name.Split('/','\') -contains '..') { throw 'UNSAFE_PACKAGE_PATH' }
+  $path=Join-Path $PackageRoot $entry.Name
+  for ($parent=(Get-Item -LiteralPath $path).Directory; $parent.FullName -ne $PackageRoot; $parent=$parent.Parent) {
+    if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'PACKAGE_ANCESTOR_REPARSE_POINT' }
+  }
+  if ((Get-Item -LiteralPath $path).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'PACKAGE_REPARSE_POINT' }
+  if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $entry.Value) { throw 'PACKAGE_INTEGRITY_FAILED' }
+}
+
+function Set-ManagedAcl([string]$Path,[string]$Sid,[string]$Rights,[bool]$Directory=$true,[bool]$PublicRead=$false) {
+  $acl=if ($Directory) {[Security.AccessControl.DirectorySecurity]::new()} else {[Security.AccessControl.FileSecurity]::new()}
+  $acl.SetAccessRuleProtection($true,$false)
+  $acl.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
+  $inherit=if ($Directory) {[Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'} else {[Security.AccessControl.InheritanceFlags]::None}
+  foreach ($identity in @('S-1-5-18','S-1-5-32-544')) {
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($identity),'FullControl',$inherit,'None','Allow'))
+  }
+  if ($Sid) { $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($Sid),$Rights,$inherit,'None','Allow')) }
+  if ($PublicRead) { $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-32-545'),'ReadAndExecute',$inherit,'None','Allow')) }
+  Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+foreach ($path in @($installRoot,$stateRoot)) {
+  New-Item -ItemType Directory -Path $path | Out-Null
+  Set-ManagedAcl $path '' ''
+}
+$sidOutput=& sc.exe showsid DevAIWorker
+$serviceSid=([regex]::Match(($sidOutput -join ' '),'S-1-5-80(?:-\d+){5}')).Value
+if (!$serviceSid) { throw 'SERVICE_SID_UNAVAILABLE' }
+Set-ManagedAcl $installRoot $serviceSid 'ReadAndExecute'
+Set-ManagedAcl $stateRoot $serviceSid 'ReadAndExecute'
+foreach ($directory in @('credentials','volumes','journal','logs','reports','workspace-volume')) {
+  $path=Join-Path $stateRoot $directory
+  New-Item -ItemType Directory -Path $path | Out-Null
+  $rights=if ($directory -in @('journal','logs','reports','workspace-volume')) {'Modify'} else {'ReadAndExecute'}
+  Set-ManagedAcl $path $serviceSid $rights $true ($directory -eq 'reports')
+}
+foreach ($directory in @('control','host-runtime','sandbox-runtime')) {
+  Copy-Item -LiteralPath (Join-Path $PackageRoot $directory) -Destination $installRoot -Recurse
+}
+Set-ManagedAcl (Join-Path $installRoot 'sandbox-runtime') $serviceSid 'ReadAndExecute'
+$sandboxAcl=Get-Acl -LiteralPath (Join-Path $installRoot 'sandbox-runtime')
+$sandboxAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-15-2-1'),'ReadAndExecute','ContainerInherit,ObjectInherit','None','Allow'))
+Set-Acl -LiteralPath (Join-Path $installRoot 'sandbox-runtime') -AclObject $sandboxAcl
+# Ensure copied objects inherit the new managed DACL and are owned by Administrators.
+foreach ($path in @('control','host-runtime','sandbox-runtime')) {
+  $absolute=Join-Path $installRoot $path
+  & icacls.exe $absolute /setowner '*S-1-5-32-544' /T /Q | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'RUNTIME_OWNER_FAILED' }
+  Get-ChildItem -LiteralPath $absolute -Recurse -Force | ForEach-Object {
+    $acl=Get-Acl -LiteralPath $_.FullName
+    $acl.SetAccessRuleProtection($false,$false)
+    foreach ($rule in @($acl.Access | Where-Object {!$_.IsInherited})) { $acl.RemoveAccessRuleSpecific($rule) }
+    Set-Acl -LiteralPath $_.FullName -AclObject $acl
+  }
+}
+
+$vhd=Join-Path $stateRoot 'volumes/workspace.vhdx'
+$mount=Join-Path $stateRoot 'workspace-volume'
+$createFile=Join-Path $stateRoot 'volumes/create.txt'
+$diskCommands=@("create vdisk file=`"$vhd`" maximum=128 type=fixed","select vdisk file=`"$vhd`"",'attach vdisk','create partition primary','format fs=ntfs label=DevAIWorkspace quick',"assign mount=`"$mount`"",'exit')
+[IO.File]::WriteAllText($createFile,($diskCommands -join "`r`n")+"`r`n")
+& "$env:SystemRoot/System32/diskpart.exe" /s $createFile | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'WORKSPACE_VOLUME_CREATION_FAILED' }
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class DevAIVolume {
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
+ public static extern bool GetVolumeNameForVolumeMountPoint(string path,StringBuilder name,uint size);
+}
+'@
+$volume=[Text.StringBuilder]::new(1024)
+if (![DevAIVolume]::GetVolumeNameForVolumeMountPoint($mount+'\',$volume,1024)) { throw 'WORKSPACE_MOUNT_NOT_VERIFIED' }
+Set-ManagedAcl $mount $serviceSid 'Modify'
+$attachFile=Join-Path $stateRoot 'volumes/attach.txt'
+[IO.File]::WriteAllText($attachFile,"select vdisk file=`"$vhd`"`nattach vdisk`nexit`n")
+Set-ManagedAcl $vhd '' '' $false
+Set-ManagedAcl $attachFile '' '' $false
+Remove-Item -LiteralPath $createFile
+
+$credential=Join-Path $stateRoot 'credentials/worker.dpapi'
+Copy-Item -LiteralPath (Join-Path $PackageRoot 'worker.dpapi') -Destination $credential
+Set-ManagedAcl $credential $serviceSid 'Read' $false
+$runtime=Join-Path $installRoot 'sandbox-runtime'
+$config=@{
+ worker_id=$package.worker_id;api_base_url=$package.api_base_url;heartbeat_seconds=20;poll_seconds=2;
+ credential_path=$credential;service_sid=$serviceSid;volume_guid=$volume.ToString();sandbox_runtime=$runtime;
+ sandbox_executable_sha256=(Get-FileHash -LiteralPath (Join-Path $runtime 'python.exe')).Hash.ToLowerInvariant();
+ sandbox_payload_sha256=(Get-FileHash -LiteralPath (Join-Path $runtime 'synthetic_process.py')).Hash.ToLowerInvariant()
+ personal_denial_fixture=$package.personal_denial_fixture
+}
+$configFile=Join-Path $stateRoot 'service.json'
+[IO.File]::WriteAllText($configFile,($config | ConvertTo-Json))
+Set-ManagedAcl $configFile $serviceSid 'Read' $false
+$manifest=@{}
+Get-ChildItem -LiteralPath $installRoot -Recurse -File | ForEach-Object {
+  $relative=$_.FullName.Substring($installRoot.Length+1).Replace('\','/')
+  $manifest[$relative]=(Get-FileHash -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+}
+$manifestFile=Join-Path $installRoot 'manifest.json'
+[IO.File]::WriteAllText($manifestFile,($manifest | ConvertTo-Json -Depth 3))
+
+$python=Join-Path $installRoot 'host-runtime/python.exe'
+$base='"'+$python+'" -I -S -B -m worker_agent.windows_service --config "'+$configFile+'"'
+New-Service -Name DevAIWorkerVolumes -BinaryPathName ($base+' --volume-host') -StartupType Automatic -DisplayName 'DevAI private workspace volume host' | Out-Null
+# Virtual account: unique local service identity, no password, no Administrators membership.
+& sc.exe create DevAIWorker binPath= $base start= delayed-auto obj= 'NT SERVICE\DevAIWorker' depend= DevAIWorkerVolumes DisplayName= 'DevAI isolated Windows Worker' | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'WORKER_SERVICE_CREATION_FAILED' }
+foreach ($name in @('DevAIWorkerVolumes','DevAIWorker')) {
+  & sc.exe failure $name reset= 86400 actions= restart/10000/restart/10000/restart/60000 | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'SERVICE_RECOVERY_CONFIG_FAILED' }
+  & sc.exe failureflag $name 1 | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'SERVICE_FAILURE_FLAG_FAILED' }
+}
+& sc.exe sidtype DevAIWorker unrestricted | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'SERVICE_SID_CONFIG_FAILED' }
+$actual=Get-CimInstance Win32_Service -Filter "Name='DevAIWorker'"
+if ($actual.PathName -ne $base -or $actual.StartName -ne 'NT SERVICE\DevAIWorker') { throw 'SERVICE_IDENTITY_OR_PATH_NOT_VERIFIED' }
+Start-Service -Name DevAIWorkerVolumes
+Start-Service -Name DevAIWorker
+[IO.File]::WriteAllText((Join-Path $stateRoot 'reports/install.json'),(@{installed=$true;identity='NT SERVICE\DevAIWorker';delayed_start=$true;recovery=$true;volume_guid=$volume.ToString();workspace_max_bytes=134217728} | ConvertTo-Json))
+Write-Output 'DEVAI_WORKER_INSTALL_FINISHED'

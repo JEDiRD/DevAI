@@ -204,3 +204,44 @@ def get_dispatch_result(dispatch_id: UUID, *, tenant_id: UUID):
     if row is None:
         raise DispatchUnavailable('DISPATCH_NOT_FOUND')
     return row
+
+
+def execution_status(*, tenant_id, worker_node_id, dispatch_id, claim_version):
+    with connect() as conn, conn.cursor() as cur:
+        _reap(cur, tenant_id, dispatch_id=dispatch_id)
+        cur.execute('''SELECT status FROM worker_dispatches WHERE tenant_id=%s AND worker_node_id=%s
+            AND id=%s AND claim_version=%s AND claim_version>=1''',
+            (tenant_id, worker_node_id, dispatch_id, claim_version))
+        row = cur.fetchone()
+        if row is None:
+            raise DispatchLeaseLost('DISPATCH_AUTHORITY_UNAVAILABLE')
+        return row[0]
+
+
+def acknowledge_termination(*, tenant_id, worker_node_id, dispatch_id, claim_version):
+    with connect() as conn, conn.cursor() as cur:
+        _reap(cur, tenant_id, dispatch_id=dispatch_id)
+        cur.execute('''INSERT INTO worker_dispatch_terminations(dispatch_id,tenant_id,worker_node_id,claim_version)
+            SELECT id,tenant_id,worker_node_id,claim_version FROM worker_dispatches
+            WHERE tenant_id=%s AND worker_node_id=%s AND id=%s AND claim_version=%s AND claim_version>=1
+            AND status IN ('succeeded','failed','expired','cancelled')
+            ON CONFLICT (dispatch_id) DO NOTHING RETURNING dispatch_id''',
+            (tenant_id, worker_node_id, dispatch_id, claim_version))
+        if cur.fetchone() is None:
+            cur.execute('''SELECT 1 FROM worker_dispatch_terminations WHERE dispatch_id=%s
+                AND tenant_id=%s AND worker_node_id=%s AND claim_version=%s''',
+                (dispatch_id, tenant_id, worker_node_id, claim_version))
+            if cur.fetchone() is None:
+                raise DispatchLeaseLost('TERMINATION_ACK_REJECTED')
+
+
+def termination_confirmed(*, tenant_id, dispatch_id):
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute('''SELECT d.claim_version,t.dispatch_id IS NOT NULL
+            FROM worker_dispatches d LEFT JOIN worker_dispatch_terminations t
+              ON t.dispatch_id=d.id AND t.tenant_id=d.tenant_id AND t.claim_version=d.claim_version
+            WHERE d.id=%s AND d.tenant_id=%s''', (dispatch_id, tenant_id))
+        row = cur.fetchone()
+        if row is None:
+            raise DispatchUnavailable('DISPATCH_NOT_FOUND')
+        return row[0] == 0 or row[1]

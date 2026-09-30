@@ -1,7 +1,7 @@
 import unittest
 
 from devai.executor import AllRoutesFailed, execute_with_fallback
-from devai.gateway import GatewayError, StaticGateway
+from devai.gateway import GatewayError, StaticGateway,ExecutionSafetyError
 from devai.orchestrator import assess_task
 from devai.router import plan_routes
 
@@ -82,6 +82,13 @@ class ExecutorTests(unittest.TestCase):
         )
 
         self.assertEqual(len(ctx.exception.attempts), 3)
+
+    def test_unknown_remote_termination_blocks_fallback(self):
+        routes=plan_routes(assess_task('Resume este documento'))
+        gateway=StaticGateway({'worker-free':ExecutionSafetyError('REMOTE_TERMINATION_UNCONFIRMED'),
+            'worker-standard':'MUST_NOT_RUN'})
+        with self.assertRaises(ExecutionSafetyError):execute_with_fallback('data',routes,gateway)
+        self.assertEqual(gateway.calls,['worker-free'])
 
 
 if __name__ == "__main__":

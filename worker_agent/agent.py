@@ -134,6 +134,14 @@ class WorkerAgent:
                 delay = backoff.next_delay()
 
     def _submit(self, dispatch, *, result=None, error_message=None) -> None:
+        if self.stop_event.is_set():
+            # Bounded graceful shutdown acknowledgement; connectivity is never
+            # retried indefinitely while SCM is waiting for STOPPED.
+            try:
+                self.client.fail(dispatch,'WORKER_SHUTDOWN')
+            except (AuthenticationError,ConnectivityError,LeaseConflict,ProtocolError,OSError,ValueError):
+                pass
+            return
         backoff = Backoff()
         while not self.stop_event.is_set():
             if min(dispatch.lease_expires_at,dispatch.deadline_at) <= datetime.now(timezone.utc) or (dispatch.local_deadline_monotonic is not None and time.monotonic()>=dispatch.local_deadline_monotonic):
@@ -165,7 +173,22 @@ class WorkerAgent:
 
     def _process(self, dispatch) -> None:
         started = False
+        finished = threading.Event()
+        cancellation = threading.Event()
+        unsafe = False
+        monitor = None
+        def authority():
+            while not finished.wait(.25):
+                try:
+                    if self.stop_event.is_set() or self.client.status(dispatch) != 'claimed':
+                        cancellation.set()
+                        return
+                except (AuthenticationError,ConnectivityError,LeaseConflict,ProtocolError,OSError,ValueError):
+                    cancellation.set()  # Uncertain authority: stop, never retry execution.
+                    return
         try:
+            if self.stop_event.is_set() or self.client.status(dispatch) != 'claimed':
+                raise AdapterError('EXECUTION_CANCELLED')
             result = self.journal.begin(dispatch)
             if result is None:
                 started = True
@@ -174,18 +197,51 @@ class WorkerAgent:
                 end=time.monotonic()+max(0,remaining)
                 if dispatch.local_deadline_monotonic is not None:
                     end=min(end,dispatch.local_deadline_monotonic)
-                result = self.adapters.execute(dispatch,ExecutionContext(self.stop_event,end))
+                monitor = threading.Thread(target=authority,name='execution-authority',daemon=True)
+                monitor.start()
+                result = self.adapters.execute(dispatch,ExecutionContext(cancellation,end))
                 self.journal.finish(dispatch,result=result)
         except Exception as exc:
             code=exc.code if isinstance(exc,AdapterError) else 'ADAPTER_INTERNAL_ERROR'
+            unsafe = code in ('PROCESS_TREE_TERMINATION_UNCONFIRMED','PROCESS_TREE_TERMINATION_FAILED',
+                'PROCESS_IO_TERMINATION_UNCONFIRMED','JOB_QUERY_FAILED')
+            if unsafe:
+                self.stop_event.set()
             if started:
-                self.journal.finish(dispatch,error=code)
-            self._submit(
-                dispatch,
-                error_message=code,
-            )
+                self.journal.finish(dispatch,error=code,termination_confirmed=not unsafe)
+            if not unsafe:
+                self._submit(dispatch,error_message=code)
         else:
             self._submit(dispatch, result=result)
+        finally:
+            finished.set()
+            if monitor:
+                monitor.join(timeout=2)
+            if not unsafe:
+                for _ in range(3):
+                    try:
+                        self.client.terminated(dispatch)
+                        self.journal.termination_reported(dispatch)
+                        break
+                    except LeaseConflict:
+                        break
+                    except (AuthenticationError,ConnectivityError,ProtocolError,OSError,ValueError):
+                        time.sleep(.1)
+
+    def _reconcile_terminations(self):
+        # Connectivity/accounting acknowledgement only: never rerun the adapter.
+        for receipt in self.journal.pending_terminations()[:5]:
+            if self.stop_event.is_set(): break
+            try:
+                if self.client.status(receipt)=='claimed':
+                    self.client.fail(receipt,'EXECUTION_OUTCOME_UNKNOWN')
+                self.client.terminated(receipt)
+                self.journal.termination_reported(receipt)
+            except LeaseConflict:
+                # Wrong version/tenant is retained for audit, never broaden scope.
+                continue
+            except (AuthenticationError,ConnectivityError,ProtocolError,OSError,ValueError):
+                break
 
     def run_forever(self) -> None:
         heartbeat = threading.Thread(
@@ -200,6 +256,7 @@ class WorkerAgent:
                 if not self.online.wait(timeout=1):
                     continue
                 try:
+                    self._reconcile_terminations()
                     dispatch = self.client.claim()
                     claim_backoff.reset()
                     if dispatch is None:

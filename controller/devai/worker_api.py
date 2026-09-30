@@ -20,6 +20,8 @@ from .worker_dispatch import (
     claim_next_dispatch,
     complete_dispatch,
     fail_dispatch,
+    execution_status,
+    acknowledge_termination,
 )
 from .worker_identity import (
     WorkerAuthenticationError,
@@ -112,6 +114,29 @@ class FailRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     claim_version: int = Field(ge=1)
     error: str = Field(min_length=1, max_length=2000)
+
+
+class AuthorityRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    claim_version: int = Field(ge=1)
+
+
+@app.post('/v1/worker/dispatches/{dispatch_id}/status')
+def status(dispatch_id: UUID, body: AuthorityRequest, principal: Principal):
+    try:
+        return {'state': execution_status(tenant_id=principal.tenant_id,
+            worker_node_id=principal.worker_node_id,dispatch_id=dispatch_id,claim_version=body.claim_version)}
+    except DispatchLeaseLost:
+        raise HTTPException(status_code=409,detail='Dispatch authority unavailable') from None
+
+
+@app.post('/v1/worker/dispatches/{dispatch_id}/terminated', status_code=204)
+def terminated(dispatch_id: UUID, body: AuthorityRequest, principal: Principal):
+    try:
+        acknowledge_termination(tenant_id=principal.tenant_id,worker_node_id=principal.worker_node_id,
+            dispatch_id=dispatch_id,claim_version=body.claim_version)
+    except DispatchLeaseLost:
+        raise HTTPException(status_code=409,detail='Dispatch authority unavailable') from None
 
 
 @app.post("/v1/worker/heartbeat", status_code=204)

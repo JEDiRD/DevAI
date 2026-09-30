@@ -36,6 +36,11 @@ def finalize_attempt_and_budget(
     with connect() as conn:
         with conn.cursor() as cur:
 
+            cur.execute('''SELECT id FROM execution_attempts WHERE id=%s AND job_id=%s
+                AND status='running' AND billing_mode=%s FOR UPDATE''',(attempt_id,job_id,billing_mode))
+            if cur.fetchone() is None:
+                raise AccountingError('ATTEMPT_SETTLEMENT_FAILED')
+
             if billing_mode == 'metered':
                 _settle_metered(cur, job_id, reserved_usd, actual_usd)
             elif reserved_usd != 0 or actual_usd != 0 or pricing_key is not None or pricing_version is not None:

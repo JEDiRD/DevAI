@@ -9,6 +9,7 @@ from .budget import (
     reserve_budget,
 )
 from .ledger import start_attempt
+from .reconciliation import start_metered_attempt, defer_missing_usage
 from .pricing import (
     calculate_cost,
     get_active_price,
@@ -81,27 +82,8 @@ class BudgetedLedgerObserver:
             pricing_key
         )
 
-        reserve_budget(
-            self.job_id,
-            reservation,
-        )
-
-        try:
-            attempt_id = start_attempt(
-                job_id=self.job_id,
-                task_id=self.task_id,
-                attempt_number=number,
-                route_key=route.key,
-                provider=route.provider,
-                gateway_model=gateway_model,
-                billing_mode=mode,
-            )
-        except Exception:
-            release_budget(
-                self.job_id,
-                reservation,
-            )
-            raise
+        attempt_id = start_metered_attempt(job_id=self.job_id,task_id=self.task_id,
+            number=number,route=route,model=gateway_model,price=price,reservation=reservation)
 
         self._state[number] = (
             attempt_id,
@@ -129,6 +111,7 @@ class BudgetedLedgerObserver:
             attempt.prompt_tokens is None
             or attempt.completion_tokens is None
         ):
+            defer_missing_usage(attempt_id=attempt_id,result_success=attempt.success)
             raise UsageMissing('METERED_USAGE_REQUIRED')
 
         else:

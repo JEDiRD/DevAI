@@ -95,7 +95,7 @@ class WorkerApiClient:
     def replace_token(self, token: str) -> None:
         self._token = token
 
-    def _post(self, path: str, payload: dict | None = None):
+    def _post(self, path: str, payload: dict | None = None, *, timeout=None):
         body = json.dumps(payload or {}).encode("utf-8")
         outgoing = request.Request(
             self.base_url + path,
@@ -108,7 +108,7 @@ class WorkerApiClient:
             method="POST",
         )
         try:
-            with self._opener.open(outgoing, timeout=self.timeout) as incoming:
+            with self._opener.open(outgoing, timeout=self.timeout if timeout is None else timeout) as incoming:
                 status = incoming.status
                 raw = incoming.read(1_000_001)
                 if len(raw)>1_000_000:
@@ -199,3 +199,16 @@ class WorkerApiClient:
         )
         if result is not None:
             raise ProtocolError("Unexpected failure response")
+
+    def status(self, dispatch):
+        result = self._post(f'/v1/worker/dispatches/{dispatch.id}/status',
+            {'claim_version':dispatch.claim_version},timeout=1.5)
+        if not isinstance(result,dict) or set(result)!={'state'} or result['state'] not in ('claimed','succeeded','failed','expired','cancelled'):
+            raise ProtocolError('Invalid execution authority response')
+        return result['state']
+
+    def terminated(self, dispatch):
+        result = self._post(f'/v1/worker/dispatches/{dispatch.id}/terminated',
+            {'claim_version':dispatch.claim_version},timeout=1.5)
+        if result is not None:
+            raise ProtocolError('Invalid termination acknowledgement')

@@ -8,7 +8,7 @@ from unittest.mock import patch
 import psycopg
 
 from devai import provider_registry as routes, worker_dispatch as queue
-from devai import transport, ledger, budget, accounting, pricing
+from devai import transport, ledger, budget, accounting, pricing, reconciliation
 from devai.budgeted_observer import BudgetedLedgerObserver,UsageMissing
 from devai.pricing import PricingNotConfigured
 from devai.types import ModelCandidate,Capability,ExecutionAttempt
@@ -21,7 +21,7 @@ class AdapterFoundationTests(unittest.TestCase):
         self.conn=psycopg.connect(os.environ['DEVAI_TEST_DATABASE_URL'])
         self.addCleanup(self.conn.close)
         self.addCleanup(self.conn.rollback)
-        for module in (routes,queue,transport,ledger,budget,accounting,pricing):
+        for module in (routes,queue,transport,ledger,budget,accounting,pricing,reconciliation):
             p=patch.object(module,'connect',return_value=SharedTransaction(self.conn))
             p.start();self.addCleanup(p.stop)
         self.tenant,self.worker,self.connection=uuid4(),uuid4(),uuid4()
@@ -149,6 +149,8 @@ class AdapterFoundationTests(unittest.TestCase):
             accounting.finalize_attempt_and_budget(job,observer._state[1][0],
                 ExecutionAttempt('metered','test','model',True),Decimal(0),Decimal(0),None,None,'local')
         with self.assertRaises(UsageMissing): observer.attempt_finished(1,ExecutionAttempt('metered','test','model',True))
-        self.assertEqual(budget.get_budget(job)[1:],(Decimal('.01'),Decimal(0)))
-        observer.attempt_finished(1,ExecutionAttempt('metered','test','model',True,prompt_tokens=1000,completion_tokens=500))
+        self.assertEqual(budget.get_budget(job)[1:],(Decimal(0),Decimal(0)))
+        case=self.sql('SELECT id FROM metered_reconciliations WHERE attempt_id=%s',(observer._state[1][0],))[0][0]
+        reconciliation.resolve_case(tenant_id=self.tenant,case_id=case,actor='operator',
+            usage=(1000,500),evidence_sha256='1'*64)
         self.assertEqual(budget.get_budget(job)[1:],(Decimal(0),Decimal('.0035')))

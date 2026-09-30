@@ -26,6 +26,11 @@ def dispatch():
 
 
 class WorkerAdapterTests(unittest.TestCase):
+    def journal(self):
+        journal=ExecutionJournal(':memory:')
+        self.addCleanup(journal.db.close)
+        return journal
+
     def context(self,end=None):
         return ExecutionContext(threading.Event(),end or time.monotonic()+30)
 
@@ -83,7 +88,7 @@ class WorkerAdapterTests(unittest.TestCase):
         class Counting(AdapterRegistry):
             def __init__(self): super().__init__();self.calls=0
             def execute(self,d,c): self.calls+=1;return super().execute(d,c)
-        registry=Counting();client=FakeClient();journal=ExecutionJournal(':memory:')
+        registry=Counting();client=FakeClient();journal=self.journal()
         config=AgentConfig(uuid4(),'http://100.91.132.78:8765',Path('unused'))
         agent=WorkerAgent(config,FakeStore('FAKE'),client=client,adapters=registry,journal=journal)
         d=dispatch();agent._process(d);agent._process(d)
@@ -105,7 +110,7 @@ class WorkerAdapterTests(unittest.TestCase):
 
     def test_agent_unsupported_adapter_sends_code_no_fallback(self):
         client=FakeClient();config=AgentConfig(uuid4(),'http://100.91.132.78:8765',Path('unused'))
-        agent=WorkerAgent(config,FakeStore('FAKE'),client=client,journal=ExecutionJournal(':memory:'))
+        agent=WorkerAgent(config,FakeStore('FAKE'),client=client,journal=self.journal())
         d=replace(dispatch(),adapter_key='unsupported')
         agent._process(d)
         self.assertEqual(client.failed,[(d.id,1,'UNSUPPORTED_ADAPTER')])

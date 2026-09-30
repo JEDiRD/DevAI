@@ -68,6 +68,12 @@ class FakeClient:
     def replace_token(self, token):
         pass
 
+    def status(self, dispatch):
+        return 'claimed'
+
+    def terminated(self, dispatch):
+        pass
+
     def complete(self, dispatch, content, **usage):
         self.completed.append((dispatch.id, dispatch.claim_version, content))
 
@@ -76,6 +82,11 @@ class FakeClient:
 
 
 class WorkerAgentTests(unittest.TestCase):
+    def journal(self):
+        journal=ExecutionJournal(':memory:')
+        self.addCleanup(journal.db.close)
+        return journal
+
     def test_client_accepts_only_private_origins(self):
         self.assertEqual(
             validate_private_base_url("http://100.91.132.78:8765/"),
@@ -134,7 +145,7 @@ class WorkerAgentTests(unittest.TestCase):
             credential_path=Path("unused"),
         )
         client = FakeClient()
-        agent = WorkerAgent(config, FakeStore("devai_wkr_test"), client=client,journal=ExecutionJournal(':memory:'))
+        agent = WorkerAgent(config, FakeStore("devai_wkr_test"), client=client,journal=self.journal())
         dispatch = sample_dispatch(
             id=uuid4(),
             route_key="synthetic/windows",
@@ -190,7 +201,7 @@ class WorkerAgentTests(unittest.TestCase):
             credential_path=Path("unused"),
             heartbeat_seconds=1,
         )
-        agent = WorkerAgent(config, FakeStore("devai_wkr_test"), client=client,journal=ExecutionJournal(':memory:'))
+        agent = WorkerAgent(config, FakeStore("devai_wkr_test"), client=client,journal=self.journal())
         with patch.object(Backoff, "next_delay", return_value=0):
             thread = threading.Thread(target=agent._heartbeat_loop)
             thread.start()
@@ -227,7 +238,7 @@ class WorkerAgentTests(unittest.TestCase):
         )
         agent = WorkerAgent(
             config, FakeStore("devai_wkr_test"),
-            client=client, adapters=adapters,journal=ExecutionJournal(':memory:'),
+            client=client, adapters=adapters,journal=self.journal(),
         )
         dispatch = sample_dispatch(
             id=uuid4(),

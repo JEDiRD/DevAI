@@ -1,6 +1,6 @@
 from typing import Callable
 
-from .gateway import GatewayClient, GatewayResult
+from .gateway import GatewayClient, GatewayResult, ExecutionSafetyError
 from .observer import (
     ExecutionObserver,
     NullExecutionObserver,
@@ -110,6 +110,9 @@ def execute_with_fallback(
                 number,
                 attempt,
             )
+
+            if isinstance(exc, ExecutionSafetyError):
+                raise
 
             continue
 

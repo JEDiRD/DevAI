@@ -1,0 +1,11 @@
+[Unit]
+Description=Reconcile DevAI accounting holds every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Persistent=true
+Unit=devai-accounting-reconciliation.service
+
+[Install]
+WantedBy=timers.target

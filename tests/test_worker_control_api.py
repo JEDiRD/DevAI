@@ -382,3 +382,28 @@ class WorkerControlApiTests(unittest.TestCase):
                 sorted(row[0] for row in cur.fetchall()),
                 ["failed", "succeeded", "succeeded"],
             )
+
+    def test_authority_and_termination_are_scoped_and_versioned(self):
+        token=worker_identity.issue_worker_token(self.tenant_a,self.worker_a1).token
+        foreign=worker_identity.issue_worker_token(self.tenant_b,self.worker_b).token
+        self.client.post('/v1/worker/heartbeat',headers=self.auth(token),json={})
+        self.route(self.tenant_a,'hardening/control',self.worker_a1)
+        identifier=worker_dispatch.create_dispatch(tenant_id=self.tenant_a,worker_node_id=self.worker_a1,
+            route_key='hardening/control',gateway_model='model',prompt='synthetic')
+        claimed=self.client.post('/v1/worker/claim',headers=self.auth(token)).json()
+        path=f'/v1/worker/dispatches/{identifier}'
+        version=claimed['claim_version']
+        self.assertEqual(self.client.post(path+'/status',headers=self.auth(token),json={'claim_version':version}).json(),{'state':'claimed'})
+        for endpoint in ('status','terminated'):
+            for auth,body in ((self.auth(foreign),{'claim_version':version}),
+                    (self.auth(token),{'claim_version':version+1})):
+                self.assertEqual(self.client.post(path+'/'+endpoint,headers=auth,json=body).status_code,409)
+            self.assertEqual(self.client.post(path+'/'+endpoint,json={'claim_version':version}).status_code,401)
+        self.assertEqual(self.client.post(path+'/terminated',headers=self.auth(token),json={'claim_version':version}).status_code,409)
+        self.assertFalse(worker_dispatch.termination_confirmed(tenant_id=self.tenant_a,dispatch_id=identifier))
+        worker_dispatch.cancel_dispatch(tenant_id=self.tenant_a,dispatch_id=identifier)
+        self.assertEqual(self.client.post(path+'/status',headers=self.auth(token),json={'claim_version':version}).json(),{'state':'cancelled'})
+        for _ in range(2):
+            self.assertEqual(self.client.post(path+'/terminated',headers=self.auth(token),json={'claim_version':version}).status_code,204)
+        self.assertTrue(worker_dispatch.termination_confirmed(tenant_id=self.tenant_a,dispatch_id=identifier))
+        self.assertEqual(self.client.post(path+'/complete',headers=self.auth(token),json={'claim_version':version,'content':'late'}).status_code,409)

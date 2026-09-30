@@ -15,6 +15,11 @@ class ModelPrice:
     input_per_million_usd: Decimal
     output_per_million_usd: Decimal
 
+    def __post_init__(self):
+        if any(not isinstance(value,Decimal) or not value.is_finite() or value<0
+                for value in (self.input_per_million_usd,self.output_per_million_usd)):
+            raise PricingNotConfigured('INVALID_PRICE_SNAPSHOT')
+
 
 def get_active_price(
     pricing_key: str,

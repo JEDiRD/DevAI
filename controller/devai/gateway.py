@@ -17,6 +17,10 @@ class GatewayConnectionError(GatewayError):
     """Network or transport connectivity problem."""
 
 
+class ExecutionSafetyError(GatewayError):
+    """Termination is unconfirmed. Starting a fallback could overlap side effects."""
+
+
 class GatewayHTTPError(GatewayError):
 
     def __init__(

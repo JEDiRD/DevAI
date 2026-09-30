@@ -29,7 +29,7 @@ class _DataBlob(ctypes.Structure):
     ]
 
 
-def _dpapi(data: bytes, *, protect: bool) -> bytes:
+def _dpapi(data: bytes, *, protect: bool, machine: bool = False) -> bytes:
     if sys.platform != "win32":
         raise OSError("Windows DPAPI is available only on Windows")
 
@@ -63,7 +63,7 @@ def _dpapi(data: bytes, *, protect: bool) -> bytes:
         None,
         None,
         None,
-        0x1,  # CRYPTPROTECT_UI_FORBIDDEN, user-scoped by default.
+        0x1 | (0x4 if machine and protect else 0),
         ctypes.byref(output_blob),
     ):
         raise ctypes.WinError(ctypes.get_last_error())
