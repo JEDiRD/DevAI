@@ -87,7 +87,7 @@ files. Graceful stop sends a bounded failure/termination acknowledgement.
 
 ## Metered evidence reconciliation
 
-Migration `015_worker_execution_hardening.sql` adds price snapshots, evidence
+Applied, immutable migration `015_worker_execution_hardening.sql` adds price snapshots, evidence
 cases, immutable audit events, recovery and unpriced exposures. Prior applied
 migrations remain unchanged. Attempt creation and reservation are atomic. Missing
 usage transfers reservation to recoverable exposure immediately, stops fallback,

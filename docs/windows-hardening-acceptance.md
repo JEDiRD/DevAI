@@ -1,8 +1,11 @@
 # Acceptance evidence — checkpoint OPEN
 
 Validated on 2026-09-30 from DevAI `4cc5ca8`, branch
-`windows-worker-execution-hardening`. Production remains at `4cc5ca8`.
-Migration 015 and new systemd units are staged, not applied/enabled in production.
+`windows-worker-execution-hardening`, implementation commit `114d6a4`.
+The Controller was fast-forwarded to that implementation. Migration 015 was
+applied transactionally; the Worker API restarted healthy on its existing private
+binding, and `devai-accounting-reconciliation.timer` is enabled/active. Windows
+service installation and its acceptance gates remain pending.
 
 | Gate | Result |
 | --- | --- |
@@ -27,6 +30,24 @@ Migration 015 and new systemd units are staged, not applied/enabled in productio
 | Reboot online before manual login | PENDING real Windows reboot |
 | Secret scan | PASS: 101 source files, 12 local output files; actual Worker token compared only in memory |
 | Existing production state | No active dispatches, funded reservations or running metered attempts observed |
+| Controller migration/timer deployment | PASS: 015 applied, accounting sweep success, API health ok |
+| Pre-migration backup/real restore | PASS: private 0600 archive, five core tables checked in temporary DB, DB destroyed |
+
+Migration 015 is now immutable, SHA-256
+`56f67ca027814c1e8827171205ddd5a4f098f55b6e4a88aa580270e1d6c92daf`.
+Further schema corrections must use 016. The pre-015 snapshot is managed at
+`/home/ubuntu/.local/state/devai-hardening-backups/20260930T221110Z-pre015.dump`,
+with directory 0700 and file 0600. It supplements existing backups and must be
+retained until final deployment acceptance; do not restore it over production
+merely to revert code. It was genuinely restored to a disposable database, checked
+against five core table counts, then that temporary database was destroyed.
+
+Final observed application bindings: PostgreSQL `127.0.0.1:5432`, Paperclip
+`127.0.0.1:3100`, Worker API `100.91.132.78:8765`, Tailscale Serve/private 443.
+LiteLLM remains absent. SSH retains its existing `0.0.0.0/[::]:22` private firewall
+policy; this checkpoint did not change its binding or any OCI/UFW/Tailscale rules.
+The accounting timer has no listener. Existing DNS and Tailscale transport
+listeners are unchanged by deployment.
 
 The elevated installer attempt did not receive Windows elevation
 (`ELEVATION_NOT_GRANTED`, InvalidOperationException). No DevAIWorker services were
@@ -36,6 +57,6 @@ outside Git. A non-secret personal ACL fixture was created by that managed packa
 preparation; no existing credential was modified or rotated.
 
 To continue, run the prepared installer with actual administrator consent, verify
-the installed identity's native startup report, then perform Controller deployment,
-token cutover, live E2E/service recovery and a real reboot proof. Do not advertise
+the installed identity's native startup report, then perform token cutover,
+live E2E/service recovery and a real reboot proof. Do not advertise
 this checkpoint complete or enable any model adapter while those gates are open.
