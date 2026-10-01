@@ -1,25 +1,72 @@
-param([Parameter(Mandatory=$true)][string]$PackageRoot)
+param([Parameter(Mandatory=$true)][string]$PackageRoot,[switch]$ValidateOnly)
 $ErrorActionPreference='Stop'
-$admin=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
-if (!$admin.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'ADMINISTRATOR_INSTALL_REQUIRED' }
+function Assert-PackageEntryName([string]$Name) {
+  $parts=$Name -split '[\\/]'
+  if ([string]::IsNullOrWhiteSpace($Name) -or [IO.Path]::IsPathRooted($Name) -or
+      $parts -contains '..' -or $parts -contains '.' -or $parts -contains '' -or $Name.Contains(':')) {
+    throw 'UNSAFE_PACKAGE_PATH'
+  }
+}
+
 $PackageRoot=(Resolve-Path -LiteralPath $PackageRoot).Path
 for ($parent=Get-Item -LiteralPath $PackageRoot; $null -ne $parent; $parent=$parent.Parent) {
   if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'PACKAGE_ANCESTOR_REPARSE_POINT' }
 }
-$installRoot=Join-Path $env:ProgramFiles 'DevAIWorker'
-$stateRoot=Join-Path $env:ProgramData 'DevAIWorker'
-if (Get-Service -Name DevAIWorker -ErrorAction SilentlyContinue) { throw 'EXISTING_SERVICE_REQUIRES_REVIEWED_UPGRADE' }
-if ((Test-Path -LiteralPath $installRoot) -or (Test-Path -LiteralPath $stateRoot)) { throw 'EXISTING_INSTALLATION_PATH_REQUIRES_REVIEW' }
-$package=Get-Content -LiteralPath (Join-Path $PackageRoot 'package.json') -Raw | ConvertFrom-Json
+$manifestPath=Join-Path $PackageRoot 'package.json'
+$manifestItem=Get-Item -LiteralPath $manifestPath
+if ($manifestItem.PSIsContainer -or ($manifestItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'UNSAFE_PACKAGE_MANIFEST' }
+$package=Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+if (@($package.PSObject.Properties.Name | Where-Object {$_ -notin @('worker_id','api_base_url','personal_denial_fixture','files')}).Count) { throw 'INVALID_PACKAGE_METADATA' }
+$workerId=[Guid]::Empty
+if (![Guid]::TryParse($package.worker_id,[ref]$workerId) -or $workerId -eq [Guid]::Empty) { throw 'INVALID_PACKAGE_WORKER_ID' }
+$origin=$null
+$address=[Net.IPAddress]::None
+if (![Uri]::TryCreate($package.api_base_url,[UriKind]::Absolute,[ref]$origin) -or
+    $origin.Scheme -notin @('http','https') -or $origin.UserInfo -or $origin.AbsolutePath -ne '/' -or
+    $origin.Query -or $origin.Fragment -or ![Net.IPAddress]::TryParse($origin.Host,[ref]$address)) { throw 'INVALID_PACKAGE_API_ORIGIN' }
+$bytes=$address.GetAddressBytes()
+if (![Net.IPAddress]::IsLoopback($address) -and !($bytes.Length -eq 4 -and $bytes[0] -eq 100 -and $bytes[1] -ge 64 -and $bytes[1] -le 127)) { throw 'INVALID_PACKAGE_API_ORIGIN' }
+if (![IO.Path]::IsPathRooted($package.personal_denial_fixture)) { throw 'INVALID_PERSONAL_FIXTURE_PATH' }
+$fixtureItem=Get-Item -LiteralPath $package.personal_denial_fixture
+if ($fixtureItem.PSIsContainer -or ($fixtureItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'INVALID_PERSONAL_FIXTURE_PATH' }
+if ($null -eq $package.files -or @($package.files.PSObject.Properties).Count -eq 0) { throw 'EMPTY_PACKAGE_MANIFEST' }
+$validatedFiles=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($entry in $package.files.PSObject.Properties) {
-  if ([IO.Path]::IsPathRooted($entry.Name) -or $entry.Name.Split('/','\') -contains '..') { throw 'UNSAFE_PACKAGE_PATH' }
-  $path=Join-Path $PackageRoot $entry.Name
-  for ($parent=(Get-Item -LiteralPath $path).Directory; $parent.FullName -ne $PackageRoot; $parent=$parent.Parent) {
+  Assert-PackageEntryName $entry.Name
+  $path=[IO.Path]::GetFullPath((Join-Path $PackageRoot $entry.Name))
+  if (!$path.StartsWith($PackageRoot+'\',[StringComparison]::OrdinalIgnoreCase) -or !$validatedFiles.Add($path)) { throw 'UNSAFE_PACKAGE_PATH' }
+  if ($entry.Value -notmatch '^[a-f0-9]{64}$') { throw 'INVALID_PACKAGE_DIGEST' }
+  $item=Get-Item -LiteralPath $path
+  if ($item.PSIsContainer) { throw 'PACKAGE_ENTRY_MUST_BE_FILE' }
+  for ($parent=$item.Directory; $parent.FullName -ne $PackageRoot; $parent=$parent.Parent) {
     if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'PACKAGE_ANCESTOR_REPARSE_POINT' }
   }
   if ((Get-Item -LiteralPath $path).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'PACKAGE_REPARSE_POINT' }
   if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $entry.Value) { throw 'PACKAGE_INTEGRITY_FAILED' }
 }
+# Copy-Item must not later copy files absent from the validated manifest. Inspect
+# one directory at a time; reject reparse points before descending into them.
+$directories=[Collections.Generic.Stack[string]]::new()
+$directories.Push($PackageRoot)
+while ($directories.Count) {
+  foreach ($item in Get-ChildItem -LiteralPath $directories.Pop() -Force) {
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'PACKAGE_REPARSE_POINT' }
+    if ($item.PSIsContainer) { $directories.Push($item.FullName) }
+    elseif ($item.FullName -ne $manifestPath -and !$validatedFiles.Contains($item.FullName)) { throw 'UNMANIFESTED_PACKAGE_FILE' }
+  }
+}
+foreach ($required in @('install-worker.ps1','worker.dpapi','host-runtime/python.exe','sandbox-runtime/python.exe','control/worker_agent/windows_service.py')) {
+  if (!$validatedFiles.Contains([IO.Path]::GetFullPath((Join-Path $PackageRoot $required)))) { throw 'REQUIRED_PACKAGE_FILE_MISSING' }
+}
+if ($ValidateOnly) { Write-Output 'DEVAI_PACKAGE_VALIDATED'; return }
+
+# Installation boundary: package validation above performs read-only operations.
+$admin=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+if (!$admin.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'ADMINISTRATOR_INSTALL_REQUIRED' }
+$installRoot=Join-Path $env:ProgramFiles 'DevAIWorker'
+$stateRoot=Join-Path $env:ProgramData 'DevAIWorker'
+if (Get-Service -Name DevAIWorker -ErrorAction Ignore) { throw 'EXISTING_SERVICE_REQUIRES_REVIEWED_UPGRADE' }
+if ((Test-Path -LiteralPath $installRoot) -or (Test-Path -LiteralPath $stateRoot)) { throw 'EXISTING_INSTALLATION_PATH_REQUIRES_REVIEW' }
 
 function Set-ManagedAcl([string]$Path,[string]$Sid,[string]$Rights,[bool]$Directory=$true,[bool]$PublicRead=$false) {
   $acl=if ($Directory) {[Security.AccessControl.DirectorySecurity]::new()} else {[Security.AccessControl.FileSecurity]::new()}

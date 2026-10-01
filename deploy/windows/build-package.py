@@ -19,6 +19,7 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--destination',type=Path,required=True)
     parser.add_argument('--existing-config',type=Path,required=True)
+    parser.add_argument('--reuse-personal-fixture',action='store_true')
     args=parser.parse_args()
     destination=args.destination.absolute()
     if destination.exists():raise RuntimeError('PACKAGE_DESTINATION_EXISTS')
@@ -28,9 +29,11 @@ def main():
     config=AgentConfig.load(args.existing_config)
     personal_fixture=config.credential_path.parent/'service-access-denial.fixture'
     if personal_fixture.exists():
-        raise RuntimeError('PERSONAL_TEST_FIXTURE_ALREADY_EXISTS')
-    personal_fixture.write_text('Non-secret DevAI dedicated-service ACL acceptance fixture.\n')
-    set_directory_acl(personal_fixture,owner)
+        if not args.reuse_personal_fixture:raise RuntimeError('PERSONAL_TEST_FIXTURE_ALREADY_EXISTS')
+        no_reparse(personal_fixture)
+    else:
+        personal_fixture.write_text('Non-secret DevAI dedicated-service ACL acceptance fixture.\n')
+        set_directory_acl(personal_fixture,owner)
     token=WindowsDpapiCredentialStore(config.credential_path).load(config.worker_id)
     (destination/'worker.dpapi').write_bytes(ServiceCredentialStore.encrypted(config.worker_id,token))
     del token
