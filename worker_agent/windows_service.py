@@ -18,7 +18,7 @@ from .process_adapter import process_registry
 from .service_credentials import ServiceCredentialStore
 from .windows_process import ProcessAllowlist, WindowsProcessTreeLauncher
 from .windows_security import api, check, no_reparse, windows_only
-from .workspace import WorkspaceManager
+from .workspace import WorkspaceManager, workspace_access_metadata
 
 SERVICE_NAME = 'DevAIWorker'
 VOLUME_SERVICE = 'DevAIWorkerVolumes'
@@ -212,6 +212,15 @@ class ServiceHost:
         except Exception as failure:
             error=1
             diagnostic=safe_startup_failure(failure,phase)
+            if not self.volume_host and phase == 'workspace_open':
+                # Identity/runtime verification already passed. Probe in THIS
+                # service thread without impersonation or privilege adjustment.
+                # A probe failure cannot change the original error or allow startup.
+                try:
+                    diagnostic['workspace_access'] = workspace_access_metadata(
+                        state/'workspace-volume', config['volume_guid'])
+                except Exception:
+                    diagnostic['workspace_access'] = {'status': 'UNAVAILABLE'}
             logging.getLogger(__name__).error('Service failed: %s',diagnostic['error'])
             # Fixed local destination, no config values or exception text. Keep
             # early verification failures observable without following links or

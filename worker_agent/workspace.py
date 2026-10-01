@@ -15,6 +15,133 @@ from .windows_security import AppContainerSid, api, check, no_reparse, set_direc
 WORKSPACE_BYTES = 128 * 1024 * 1024
 MAX_FILES = 4096
 
+ACCESS_LABELS = ('state_parent', 'state_root', 'mount_host_entry',
+                 'mount_target', 'mount_target_trailing', 'guid_root')
+ACCESS_KINDS = (('list', 1), ('attributes', 0x80), ('read_control', 0x20000))
+
+
+def effective_token_metadata():
+    """Query this thread's effective token, never enable/adjust any privilege.
+
+    Return only numeric/boolean metadata, no SIDs, privilege lists or token bytes.
+    If a thread token exists it takes precedence over the process primary token.
+    """
+    kernel = C.WinDLL('kernel32', use_last_error=True)
+    security = C.WinDLL('advapi32', use_last_error=True)
+    token = W.HANDLE()
+    close = api(kernel, 'CloseHandle', W.BOOL, [W.HANDLE])
+    thread = api(kernel, 'GetCurrentThread', W.HANDLE, [])()
+    opened = api(security, 'OpenThreadToken', W.BOOL,
+                 [W.HANDLE, W.DWORD, W.BOOL, C.POINTER(W.HANDLE)])
+    source = 'thread'
+    if not opened(thread, 8, True, C.byref(token)):
+        # ERROR_NO_TOKEN is the ONLY reason to consult the primary token.
+        if C.get_last_error() != 1008:
+            return {'status': 'UNAVAILABLE', 'winerror': C.get_last_error()}
+        process = api(kernel, 'GetCurrentProcess', W.HANDLE, [])()
+        if not api(security, 'OpenProcessToken', W.BOOL,
+                   [W.HANDLE, W.DWORD, C.POINTER(W.HANDLE)])(process, 8, C.byref(token)):
+            return {'status': 'UNAVAILABLE', 'winerror': C.get_last_error()}
+        source = 'process'
+    try:
+        getter = api(security, 'GetTokenInformation', W.BOOL,
+                     [W.HANDLE, C.c_int, C.c_void_p, W.DWORD, C.POINTER(W.DWORD)])
+
+        def information(kind):
+            needed = W.DWORD()
+            # Bounded single query also handles classes returning BAD_LENGTH for
+            # a zero-byte size probe. Respect the ACTUAL returned byte count.
+            data = C.create_string_buffer(4 if kind in (20, 21, 29) else 65536)
+            check(getter(token, kind, data, len(data), C.byref(needed)))
+            if not 1 <= needed.value <= len(data):
+                raise AdapterError('TOKEN_METADATA_UNAVAILABLE')
+            return bytearray(data.raw[:needed.value])
+
+        result = {'status': 'AVAILABLE', 'source': source}
+        for field, kind in (('elevated', 20), ('has_restrictions', 21), ('appcontainer', 29)):
+            data = information(kind)
+            # TokenHasRestrictions returns BOOLEAN (one byte) on this Windows
+            # runtime; other flag classes return DWORD. Never overread the buffer.
+            value = (C.c_uint8 if kind == 21 and len(data) == 1 else C.c_uint32).from_buffer(data).value
+            if value not in (0, 1): raise AdapterError('TOKEN_METADATA_UNAVAILABLE')
+            result[field] = bool(value)
+        restricted = C.c_uint32.from_buffer(information(11)).value
+        if restricted > 128: raise AdapterError('TOKEN_METADATA_UNAVAILABLE')
+        result['restricted_sid_count'] = restricted
+        privileges = information(3)
+        count = C.c_uint32.from_buffer(privileges).value
+        if count > 128 or len(privileges) < 4 + 12 * count:
+            raise AdapterError('TOKEN_METADATA_UNAVAILABLE')
+        # LUID is two 32-bit fields. TOKEN_PRIVILEGES entries have a 12-byte stride.
+        for label, name in (('change_notify', 'SeChangeNotifyPrivilege'),
+                            ('backup', 'SeBackupPrivilege'), ('restore', 'SeRestorePrivilege')):
+            luid = (C.c_uint32 * 2)()
+            check(api(security, 'LookupPrivilegeValueW', W.BOOL,
+                      [W.LPCWSTR, W.LPCWSTR, C.c_void_p])(None, name, luid))
+            result[label + '_present'] = False
+            result[label + '_enabled'] = False
+            for index in range(count):
+                entry = (C.c_uint32 * 3).from_buffer(privileges, 4 + index * 12)
+                if entry[0] == luid[0] and entry[1] == luid[1]:
+                    result[label + '_present'] = True
+                    result[label + '_enabled'] = bool(entry[2] & 2)
+        return result
+    finally:
+        close(token)
+
+
+def directory_open_metadata(targets):
+    """Bounded opens only; never enumerate/read contents or request write access."""
+    kernel = C.WinDLL('kernel32', use_last_error=True)
+    opened = api(kernel, 'CreateFileW', W.HANDLE,
+                 [W.LPCWSTR, W.DWORD, W.DWORD, C.c_void_p, W.DWORD, W.DWORD, W.HANDLE])
+    close = api(kernel, 'CloseHandle', W.BOOL, [W.HANDLE])
+    results = []
+    if len(targets) > len(ACCESS_LABELS): raise AdapterError('ACCESS_METADATA_UNAVAILABLE')
+    for label, path, no_follow in targets:
+        if label not in ACCESS_LABELS: raise AdapterError('ACCESS_METADATA_UNAVAILABLE')
+        for kind, access in ACCESS_KINDS:
+            handle = opened(str(path), access, 7, None, 3,
+                            0x02000000 | (0x00200000 if no_follow else 0), None)
+            ok = handle is not None and handle != C.c_void_p(-1).value
+            error = 0 if ok else C.get_last_error()
+            if ok: close(handle)
+            results.append({'label': label, 'access': kind, 'opened': ok, 'winerror': error})
+    return results
+
+
+def workspace_access_metadata(root, expected_guid):
+    """Called ONLY after verified Worker startup fails at workspace_open.
+
+    This is diagnostics, never a fallback or an execution/authorization gate.
+    Fixed managed paths, pinned mount, no arbitrary Controller path accepted.
+    """
+    import re
+    root = Path(root)
+    state = Path(os.environ['ProgramData']) / 'DevAIWorker'
+    if root != state / 'workspace-volume' or not re.fullmatch(
+            r'\\\\\?\\Volume\{[0-9a-fA-F-]{36}\}\\', expected_guid):
+        return {'status': 'UNAVAILABLE'}
+    no_reparse(root, allowed_mount=root)
+    kernel = C.WinDLL('kernel32', use_last_error=True)
+    guid = C.create_unicode_buffer(1024)
+    check(api(kernel, 'GetVolumeNameForVolumeMountPointW', W.BOOL,
+              [W.LPCWSTR, W.LPWSTR, W.DWORD])(str(root) + '\\', guid, 1024))
+    if guid.value != expected_guid: return {'status': 'UNAVAILABLE'}
+    try:
+        token = effective_token_metadata()
+    except Exception:
+        # Token-query availability cannot hide the independent directory probes.
+        # No exception text or token bytes are published on this path either.
+        token = {'status': 'UNAVAILABLE'}
+    return {'status': 'AVAILABLE', 'context': 'VERIFIED_WORKER_STARTUP',
+            'token': token,
+            'opens': directory_open_metadata((
+                ('state_parent', state.parent, True), ('state_root', state, True),
+                ('mount_host_entry', root, True), ('mount_target', root, False),
+                ('mount_target_trailing', str(root) + '\\', False),
+                ('guid_root', expected_guid, False)))}
+
 
 class IO_STATUS_VALUE(C.Union):
     _fields_ = [('status', C.c_int32), ('pointer', C.c_void_p)]

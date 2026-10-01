@@ -12,6 +12,14 @@ from unittest.mock import patch
 
 @unittest.skipUnless(sys.platform=='win32','Windows PowerShell required')
 class InstallerTests(unittest.TestCase):
+    def test_service_access_update_restores_both_files_and_manifest_on_integrity_failure(self):
+        script=Path(__file__).parent/'windows'/'test_access_update_rollback.ps1'
+        env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}
+        result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+            '-File',str(script)],capture_output=True,text=True,timeout=30,env=env)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('ACCESS_UPDATE_AND_ROLLBACK_PASSED',result.stdout)
+
     def test_workspace_access_diagnostic_distinguishes_reparse_entry_and_target_read_only(self):
         script=Path(__file__).parent/'windows'/'test_workspace_access_diagnostic.ps1'
         env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}

@@ -24,6 +24,27 @@ function Get-SafeStartupFailure($Value) {
       $safe.frames+=@{file=[string]$frame.file;line=[int]$frame.line}
     }
   }
+  $probe=$Value.workspace_access
+  if($probe.status -ceq 'UNAVAILABLE') {$safe.workspace_access=@{status='UNAVAILABLE'}}
+  elseif($probe.status -ceq 'AVAILABLE' -and $probe.context -ceq 'VERIFIED_WORKER_STARTUP') {
+    $checked=@{status='AVAILABLE';context='VERIFIED_WORKER_STARTUP';opens=@();token=@{status='UNAVAILABLE'}}
+    $token=$probe.token
+    if($token.status -ceq 'AVAILABLE' -and $token.source -cin @('process','thread')) {
+      $checked.token=@{status='AVAILABLE';source=[string]$token.source}
+      foreach($field in @('elevated','has_restrictions','appcontainer','change_notify_present','change_notify_enabled','backup_present','backup_enabled','restore_present','restore_enabled')) {
+        if($token.$field -is [bool]){$checked.token[$field]=[bool]$token.$field}
+      }
+      if($token.restricted_sid_count -is [int] -and $token.restricted_sid_count -ge 0 -and $token.restricted_sid_count -le 128){$checked.token.restricted_sid_count=[int]$token.restricted_sid_count}
+    }
+    foreach($row in @($probe.opens | Select-Object -First 18)) {
+      if($row.label -cin @('state_parent','state_root','mount_host_entry','mount_target','mount_target_trailing','guid_root') -and
+          $row.access -cin @('list','attributes','read_control') -and $row.opened -is [bool] -and
+          $row.winerror -is [int] -and $row.winerror -ge 0 -and $row.winerror -le 65535) {
+        $checked.opens+=@{label=[string]$row.label;access=[string]$row.access;opened=[bool]$row.opened;winerror=[int]$row.winerror}
+      }
+    }
+    $safe.workspace_access=$checked
+  }
   return $safe
 }
 $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())

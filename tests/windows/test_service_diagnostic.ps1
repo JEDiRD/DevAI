@@ -17,6 +17,16 @@ if($safe.phase -ne 'personal_probe' -or $safe.errno -ne 2 -or $safe.winerror -ne
    ($safe | ConvertTo-Json -Depth 5) -match 'DO_NOT_LOG_THIS_FIXTURE'){throw 'STRUCTURED_REDACTION_TEST_FAILED'}
 $value.phase='DO_NOT_LOG_THIS_FIXTURE'
 if((Get-SafeStartupFailure $value).status -ne 'UNAVAILABLE'){throw 'UNKNOWN_PHASE_ACCEPTED'}
+$value.phase='workspace_open'
+$value | Add-Member -NotePropertyName workspace_access -NotePropertyValue ([pscustomobject]@{status='AVAILABLE';context='VERIFIED_WORKER_STARTUP';
+  token=[pscustomobject]@{status='AVAILABLE';source='process';elevated=$false;change_notify_enabled=$true;restricted_sid_count=0;secret='DO_NOT_LOG_THIS_FIXTURE'};
+  opens=@([pscustomobject]@{label='mount_target';access='list';opened=$false;winerror=5;path='DO_NOT_LOG_THIS_FIXTURE'},
+          [pscustomobject]@{label='DO_NOT_LOG_THIS_FIXTURE';access='list';opened=$true;winerror=0})})
+$safe=Get-SafeStartupFailure $value
+if($safe.workspace_access.opens.Count -ne 1 -or $safe.workspace_access.token.elevated -ne $false -or
+  !$safe.workspace_access.token.change_notify_enabled -or ($safe | ConvertTo-Json -Depth 7) -match 'DO_NOT_LOG_THIS_FIXTURE'){throw 'EFFECTIVE_ACCESS_REDACTION_FAILED'}
+$value.workspace_access.context='DO_NOT_LOG_THIS_FIXTURE'
+if((Get-SafeStartupFailure $value).ContainsKey('workspace_access')){throw 'UNKNOWN_CONTEXT_ACCEPTED'}
 $commands=$ast.FindAll({param($node) $node -is [Management.Automation.Language.CommandAst]},$true)
 foreach($command in $commands) {
   if($command.GetCommandName() -match '(?i)^(Start-Service|Stop-Service|Set-Service|Set-Acl|Set-ItemProperty|New-Service|New-Item|Copy-Item|Remove-Item|Format-Volume|Initialize-Disk|Mount-DiskImage|sc\.exe)$') {throw 'DIAGNOSTIC_MUTATES_SYSTEM'}

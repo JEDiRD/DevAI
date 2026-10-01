@@ -1,5 +1,6 @@
 $ErrorActionPreference='Stop'
-$path=Join-Path $PSScriptRoot '../../deploy/windows/update-worker-capacity.ps1'
+foreach($script in @('update-worker-capacity.ps1','update-worker-access-diagnostic.ps1')) {
+$path=Join-Path $PSScriptRoot ('../../deploy/windows/'+$script)
 $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$errors)
 if($errors.Count){throw 'CAPACITY_UPDATE_SYNTAX_INVALID'}
@@ -20,5 +21,6 @@ try {
 } finally {
   if([IO.Path]::GetDirectoryName($temp) -ne [IO.Path]::GetTempPath().TrimEnd([char[]]'\/')){throw 'UNSAFE_TEST_CLEANUP'}
   [IO.Directory]::Delete($temp,$true)
+}
 }
 Write-Output 'CAPACITY_UPDATE_BOUNDARY_PASSED'
