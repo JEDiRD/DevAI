@@ -110,7 +110,7 @@ $root=Join-Path ([IO.Path]::GetTempPath()) ('devai-partial-install-test-'+[Guid]
 [IO.Directory]::CreateDirectory($root) | Out-Null
 try {
   $code=Join-Path $root 'code';$state=Join-Path $root 'state'
-  $names=@('host-runtime/python.exe','sandbox-runtime/python.exe','sandbox-runtime/synthetic_process.py','control/worker_agent/windows_service.py','control/worker_agent/volume_host.py')
+  $names=@('host-runtime/python.exe','sandbox-runtime/python.exe','sandbox-runtime/synthetic_process.py','control/worker_agent/windows_service.py','control/worker_agent/volume_host.py','control/worker_agent/workspace.py')
   $hashes=@{}
   foreach($name in $names) {
     $path=Join-Path $code $name
@@ -172,6 +172,14 @@ try {
   try{Assert-PartialWorkerInstall $code $state $package -ExistingService -PreviousServiceHash $oldService;throw 'UNRELATED_RUNTIME_UPGRADE_ACCEPTED'}
   catch{if($_.Exception.Message -ne 'DIAGNOSTIC_PACKAGE_RUNTIME_MISMATCH'){throw}}
   $package.files.'sandbox-runtime/python.exe'=$hashes['sandbox-runtime/python.exe']
+  $oldWorkspace=$hashes['control/worker_agent/workspace.py']
+  $package.files.'control/worker_agent/workspace.py'='d'*64
+  Assert-PartialWorkerInstall $code $state $package -ExistingService -PreviousServiceHash $oldService -PreviousWorkspaceHash $oldWorkspace | Out-Null
+  try{Assert-PartialWorkerInstall $code $state $package -ExistingService -PreviousServiceHash $oldService -PreviousWorkspaceHash ('e'*64);throw 'UNKNOWN_WORKSPACE_HASH_ACCEPTED'}
+  catch{if($_.Exception.Message -ne 'DIAGNOSTIC_PACKAGE_RUNTIME_MISMATCH'){throw}}
+  try{Assert-PartialWorkerInstall $code $state $package -ExistingService -PreviousServiceHash $oldService;throw 'WORKSPACE_UPDATE_WITHOUT_PIN_ACCEPTED'}
+  catch{if($_.Exception.Message -ne 'DIAGNOSTIC_PACKAGE_RUNTIME_MISMATCH'){throw}}
+  $package.files.'control/worker_agent/workspace.py'=$oldWorkspace
   $package.files.'control/worker_agent/windows_service.py'=$oldService
   $script:helper.State='Stopped'
   [IO.File]::WriteAllText((Join-Path $code 'host-runtime/python.exe'),'altered code')

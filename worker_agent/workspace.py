@@ -87,7 +87,11 @@ class WorkspaceManager:
                 raise AdapterError('WORKSPACE_VOLUME_MISMATCH')
             available, total, free = C.c_uint64(), C.c_uint64(), C.c_uint64()
             disk = api(k, 'GetDiskFreeSpaceExW', W.BOOL, [W.LPCWSTR, C.POINTER(C.c_uint64), C.POINTER(C.c_uint64), C.POINTER(C.c_uint64)])
-            check(disk(str(self.root), C.byref(available), C.byref(total), C.byref(free)))
+            # Query the already pinned target volume explicitly. A mounted
+            # folder has a separate host-side security descriptor; do not use
+            # that object to infer the target volume's capacity/access policy.
+            check(disk(self.volume_guid, C.byref(available), C.byref(total), C.byref(free)),
+                  'WORKSPACE_CAPACITY_QUERY_FAILED')
             if total.value > WORKSPACE_BYTES:
                 raise AdapterError('WORKSPACE_QUOTA_TOO_LARGE')
 

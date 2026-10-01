@@ -148,6 +148,8 @@ $vhd=Join-Path $stateRoot 'volumes/workspace.vhdx'
 $mount=Join-Path $stateRoot 'workspace-volume'
 $volume=New-PrivateWorkspaceVolume $vhd $mount
 Set-ManagedAcl $mount $serviceSid 'Modify'
+# Protect the actual mounted NTFS root as well as the host-side mount folder.
+Set-WorkspaceRootPolicy $vhd $mount $volume $serviceSid | Out-Null
 $attachFile=Join-Path $stateRoot 'volumes/attach.txt'
 [IO.File]::WriteAllText($attachFile,"select vdisk file=`"$vhd`"`nattach vdisk`nexit`n")
 Set-ManagedAcl $vhd '' '' $false

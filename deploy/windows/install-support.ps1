@@ -100,9 +100,10 @@ function Get-VerifiedWorkspaceVolume([string]$VhdPath,[string]$Mount,[string]$Ex
   return @{disk_number=[uint32]$disk.Number;file_backed=$true;disk_bytes=134217728;filesystem='NTFS';no_drive_letter=$true;mount_verified=$true}
 }
 
-function Assert-PartialWorkerInstall([string]$InstallRoot,[string]$StateRoot,$Package,[switch]$ExistingService,[string]$PreviousServiceHash) {
+function Assert-PartialWorkerInstall([string]$InstallRoot,[string]$StateRoot,$Package,[switch]$ExistingService,[string]$PreviousServiceHash,[string]$PreviousWorkspaceHash) {
   if (!$ExistingService -and (Get-Service -Name DevAIWorker -ErrorAction Ignore)) { throw 'RESUME_REQUIRES_WORKER_SERVICE_ABSENT' }
   if ($ExistingService -and $PreviousServiceHash -notmatch '^[a-f0-9]{64}$') { throw 'DIAGNOSTIC_PREVIOUS_HASH_REQUIRED' }
+  if ($PreviousWorkspaceHash -and (!$ExistingService -or $PreviousWorkspaceHash -notmatch '^[a-f0-9]{64}$')) { throw 'WORKSPACE_PREVIOUS_HASH_INVALID' }
   Assert-ManagedNoReparse $InstallRoot | Out-Null
   Assert-ManagedNoReparse $StateRoot | Out-Null
   $sidOutput=& sc.exe showsid DevAIWorker
@@ -146,7 +147,8 @@ function Assert-PartialWorkerInstall([string]$InstallRoot,[string]$StateRoot,$Pa
     if ($entry.Value -notmatch '^[a-f0-9]{64}$' -or (Get-FileHash -LiteralPath $path).Hash.ToLowerInvariant() -ne $entry.Value) { throw 'INSTALLED_RUNTIME_INTEGRITY_FAILED' }
     $packaged=$Package.files.PSObject.Properties[$entry.Name]
     if ($ExistingService) {
-      $allowed=if ($entry.Name -eq 'control/worker_agent/windows_service.py') {@($PreviousServiceHash,$packaged.Value)} else {@($packaged.Value)}
+      $allowed=if ($entry.Name -eq 'control/worker_agent/windows_service.py') {@($PreviousServiceHash,$packaged.Value)}
+        elseif ($entry.Name -eq 'control/worker_agent/workspace.py' -and $PreviousWorkspaceHash) {@($PreviousWorkspaceHash,$packaged.Value)} else {@($packaged.Value)}
       if (!$packaged -or $entry.Value -notin $allowed) { throw 'DIAGNOSTIC_PACKAGE_RUNTIME_MISMATCH' }
     } elseif (!$packaged -or ($entry.Name -ne 'control/worker_agent/volume_host.py' -and $entry.Value -ne $packaged.Value)) { throw 'RESUME_PACKAGE_RUNTIME_MISMATCH' }
   }
@@ -166,6 +168,74 @@ function Assert-PartialWorkerInstall([string]$InstallRoot,[string]$StateRoot,$Pa
       $config.sandbox_payload_sha256 -ne $manifest.'sandbox-runtime/synthetic_process.py') { throw 'PARTIAL_INSTALL_ALLOWLIST_MISMATCH' }
   $volume=Get-VerifiedWorkspaceVolume $vhd (Join-Path $StateRoot 'workspace-volume') $config.volume_guid
   return @{command=$base;config=$config;volume=$volume;manifest=$manifest;manifest_file=$manifestFile}
+}
+
+function Initialize-WorkspaceSecurityApi {
+  if (!('DevAIWorkspaceSecurity' -as [type])) {
+    Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class DevAIWorkspaceSecurity {
+ [DllImport("advapi32.dll", EntryPoint="GetFileSecurityW", CharSet=CharSet.Unicode, SetLastError=true)]
+ public static extern bool Get(string path,uint info,byte[] data,uint length,out uint needed);
+ [DllImport("advapi32.dll", EntryPoint="SetFileSecurityW", CharSet=CharSet.Unicode, SetLastError=true)]
+ public static extern bool Set(string path,uint info,byte[] data);
+}
+'@
+  }
+}
+
+function Get-NativeWorkspaceSecurity([string]$Path) {
+  Initialize-WorkspaceSecurityApi
+  [uint32]$needed=0
+  $ok=[DevAIWorkspaceSecurity]::Get($Path,5,$null,0,[ref]$needed)
+  $errorCode=[Runtime.InteropServices.Marshal]::GetLastWin32Error()
+  if ($ok -or $errorCode -ne 122 -or $needed -le 0 -or $needed -gt 65536) {throw 'WORKSPACE_ROOT_SECURITY_SIZE_FAILED'}
+  $bytes=[byte[]]::new($needed)
+  if (![DevAIWorkspaceSecurity]::Get($Path,5,$bytes,$needed,[ref]$needed)) {throw 'WORKSPACE_ROOT_SECURITY_READ_FAILED'}
+  return [Security.AccessControl.RawSecurityDescriptor]::new($bytes,0)
+}
+
+function Set-NativeWorkspaceSecurity([string]$Path,[Security.AccessControl.RawSecurityDescriptor]$Descriptor) {
+  Initialize-WorkspaceSecurityApi
+  $bytes=[byte[]]::new($Descriptor.BinaryLength)
+  $Descriptor.GetBinaryForm($bytes,0)
+  # DACL only: preserve owner, SACL/integrity labels and volume identity.
+  [uint32]$flags=if ($Descriptor.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected) {2147483652} else {536870916}
+  if (![DevAIWorkspaceSecurity]::Set($Path,$flags,$bytes)) {throw 'WORKSPACE_ROOT_SECURITY_WRITE_FAILED'}
+}
+
+function Get-WorkspaceRootPolicy([string]$VhdPath,[string]$Mount,[string]$ExpectedGuid,[string]$ServiceSid) {
+  # No arbitrary path/drive is accepted by this higher-level operation.
+  if ($ExpectedGuid -notmatch '^\\\\\?\\Volume\{[0-9a-fA-F-]{36}\}\\$' -or $ServiceSid -notmatch '^S-1-5-80(?:-\d+){5}$') {throw 'WORKSPACE_ROOT_SECURITY_TARGET_INVALID'}
+  Get-VerifiedWorkspaceVolume $VhdPath $Mount $ExpectedGuid | Out-Null
+  $descriptor=Get-NativeWorkspaceSecurity $ExpectedGuid
+  if ($descriptor.Owner.Value -notin @('S-1-5-18','S-1-5-32-544') -or !$descriptor.DiscretionaryAcl) {throw 'WORKSPACE_ROOT_OWNER_OR_DACL_UNTRUSTED'}
+  $foreign=0;$workerList=$false;$workerModify=$false
+  foreach($ace in $descriptor.DiscretionaryAcl) {
+    if($ace.AceType -eq [Security.AccessControl.AceType]::AccessDenied) {throw 'WORKSPACE_ROOT_DENY_REQUIRES_REVIEW'}
+    if($ace.AceType -eq [Security.AccessControl.AceType]::AccessAllowed) {
+      if($ace.SecurityIdentifier.Value -notin @('S-1-5-18','S-1-5-32-544',$ServiceSid)){$foreign++}
+      if($ace.SecurityIdentifier.Value -eq $ServiceSid) {
+        $workerList=$workerList -or ($ace.AccessMask -band 1) -ne 0
+        $workerModify=$workerModify -or ($ace.AccessMask -band 0x1301bf) -eq 0x1301bf
+      }
+    }
+  }
+  $expected=[Security.AccessControl.RawSecurityDescriptor]::new(('D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;'+$ServiceSid+')'))
+  $section=[Security.AccessControl.AccessControlSections]::Access
+  return @{descriptor=$descriptor;expected=$expected;guid=$ExpectedGuid;
+    matches=($descriptor.GetSddlForm($section) -ceq $expected.GetSddlForm($section));
+    summary=@{owner_trusted=$true;protected=[bool]($descriptor.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected);
+      foreign_allow_entries=$foreign;worker_can_list=$workerList;worker_can_modify=$workerModify}}
+}
+
+function Set-WorkspaceRootPolicy([string]$VhdPath,[string]$Mount,[string]$ExpectedGuid,[string]$ServiceSid) {
+  $policy=Get-WorkspaceRootPolicy $VhdPath $Mount $ExpectedGuid $ServiceSid
+  if (!$policy.matches) {Set-NativeWorkspaceSecurity $ExpectedGuid $policy.expected}
+  $after=Get-WorkspaceRootPolicy $VhdPath $Mount $ExpectedGuid $ServiceSid
+  if (!$after.matches) {throw 'WORKSPACE_ROOT_SECURITY_NOT_VERIFIED'}
+  return $after.summary
 }
 
 function New-PrivateWorkspaceVolume([string]$VhdPath,[string]$Mount) {
