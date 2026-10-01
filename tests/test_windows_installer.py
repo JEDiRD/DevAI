@@ -12,6 +12,14 @@ from unittest.mock import patch
 
 @unittest.skipUnless(sys.platform=='win32','Windows PowerShell required')
 class InstallerTests(unittest.TestCase):
+    def test_service_diagnostic_redacts_logs_and_is_read_only(self):
+        script=Path(__file__).parent/'windows'/'test_service_diagnostic.ps1'
+        env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}
+        result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+            '-File',str(script)],capture_output=True,text=True,timeout=30,env=env)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('SAFE_SERVICE_DIAGNOSTIC_TEST_PASSED',result.stdout)
+
     def test_structured_service_creation_and_storage_resume_guards(self):
         script=Path(__file__).parent/'windows'/'test_install_support.ps1'
         env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}
