@@ -8,6 +8,14 @@ import unittest
 
 @unittest.skipUnless(sys.platform=='win32','Windows PowerShell required')
 class InstallerTests(unittest.TestCase):
+    def test_launcher_preserves_original_location_without_secret_text(self):
+        script=Path(__file__).parent/'windows'/'test_install_launcher.ps1'
+        env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}
+        result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+            '-File',str(script)],capture_output=True,text=True,timeout=30,env=env)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('LAUNCHER_DIAGNOSTICS_TEST_PASSED',result.stdout)
+
     def test_source_paths_and_read_only_package_boundary(self):
         script=Path(__file__).parent/'windows'/'test_installer.ps1'
         # The test runner may inherit a PowerShell 7 module path. Use the actual

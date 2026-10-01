@@ -48,3 +48,26 @@ explicitly without changing its permissions, and keeps credentials DPAPI-encrypt
 and outside Git. No credentials, migration, Controller service or networking
 configuration were modified in this correction. The overall hardening checkpoint
 remains open until installed-service, recovery and real reboot gates pass.
+
+## Subsequent elevated ItemNotFoundException
+
+On 2026-10-01 an elevated launcher reported only ItemNotFoundException. The
+previous wrapper discarded the original error location, so that output does not
+identify a missing file or prove its cause. Local inspection found no installation
+directories or services, and the same package validates from Windows System32.
+An unelevated full-source probe reaches the expected ADMINISTRATOR_INSTALL_REQUIRED
+guard, without installation mutations. The elevated-only cause is not yet known.
+
+`deploy/windows/launch-worker-install.ps1` now preserves a safe phase, fixed error
+identifier and original script basenames/line numbers, without exception text,
+arguments, URLs or secret values. `-DiagnoseOnly` validates the pinned real package
+and performs read-only target/service checks. Its only output-file mutation is a
+separate non-secret diagnostic JSON; the original failure record is preserved.
+This mode does not create services, installation directories or volumes.
+
+Two Windows PowerShell 5.1 tests verify source package validation and that a
+simulated ItemNotFoundException retains its original line while secret-bearing
+exception text is absent from the diagnostic. The generated local launcher embeds
+this tracked source template; package/installer hashes remain unchanged. An actual
+elevated diagnostic is still needed before identifying the cause or retrying an
+installation. Do not call this a diagnosed or fixed installation failure yet.
