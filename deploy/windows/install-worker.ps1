@@ -27,8 +27,11 @@ if (![Uri]::TryCreate($package.api_base_url,[UriKind]::Absolute,[ref]$origin) -o
 $bytes=$address.GetAddressBytes()
 if (![Net.IPAddress]::IsLoopback($address) -and !($bytes.Length -eq 4 -and $bytes[0] -eq 100 -and $bytes[1] -ge 64 -and $bytes[1] -le 127)) { throw 'INVALID_PACKAGE_API_ORIGIN' }
 if (![IO.Path]::IsPathRooted($package.personal_denial_fixture)) { throw 'INVALID_PERSONAL_FIXTURE_PATH' }
-$fixtureItem=Get-Item -LiteralPath $package.personal_denial_fixture
+$fixtureItem=Get-Item -LiteralPath $package.personal_denial_fixture -Force
 if ($fixtureItem.PSIsContainer -or ($fixtureItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'INVALID_PERSONAL_FIXTURE_PATH' }
+for ($parent=$fixtureItem.Directory; $null -ne $parent; $parent=$parent.Parent) {
+  if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'INVALID_PERSONAL_FIXTURE_PATH' }
+}
 if ($null -eq $package.files -or @($package.files.PSObject.Properties).Count -eq 0) { throw 'EMPTY_PACKAGE_MANIFEST' }
 $validatedFiles=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($entry in $package.files.PSObject.Properties) {

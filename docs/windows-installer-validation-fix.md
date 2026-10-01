@@ -71,3 +71,56 @@ exception text is absent from the diagnostic. The generated local launcher embed
 this tracked source template; package/installer hashes remain unchanged. An actual
 elevated diagnostic is still needed before identifying the cause or retrying an
 installation. Do not call this a diagnosed or fixed installation failure yet.
+
+## Confirmed profile-fixture failure and correction (2026-10-01)
+
+The elevated diagnostic identified package_validation / PathNotFound at
+install-worker.ps1 line 30: Get-Item on the non-secret personal access fixture.
+This was an AppData filesystem-view mismatch, not missing package files:
+the Codex packaged process saw Local/DevAI/service-access-denial.fixture;
+an unpackaged Python process did not. The physical fixture existed below the
+application package's LocalCache/Local/DevAI directory. No fixture contents or
+credential values were printed to establish that evidence.
+
+The builder now creates the non-secret probe at
+%USERPROFILE%/DevAIWorkerAccessProbe/service-access-denial.fixture, outside
+virtualized AppData. The managed directory and file have protected allowlist
+DACLs containing only the personal owner, SYSTEM and Administrators. The service
+and execution AppContainers receive no access. Existing credentials, credential
+paths and personal-profile permissions are unchanged. The original probe and
+failure records are retained. Reuse is explicit and does not rewrite the probe.
+The installer checks file metadata with -Force and rejects reparse points in
+both the fixture and its ancestors, before the installation boundary.
+
+Validation adds private-probe ACL/location/reuse tests, an unsupported-runtime
+pre-mutation guard test, and hidden/missing-fixture package tests. Ten path cases
+and eleven full-package flow cases retain mutation interception. The launcher
+still pins the installer and manifest and retains sanitized diagnostics.
+
+The local Windows suite passes 32 tests using the existing, previously tested
+CPython 3.13 distribution. An intermediate build using a different bundled
+runtime failed native process startup probes and was archived as unvalidated;
+it is not the package referenced by the launcher. CPython 3.11 also cannot run
+the deliberately pinned python313.dll/_pth layout. The builder now rejects a
+non-3.13 interpreter or absent python313.dll before filesystem mutations.
+Acceptance applies to the actual pinned package, not arbitrary Python runtimes.
+
+Final private package: 1,257 manifested files.
+Manifest SHA-256:
+94497f46a946091ba56ec89ebd3c9d220282a5de49a2ad68984010a97f715325
+Installer SHA-256:
+b51110f7ce183847850b0b5dec887bbcee97321caf3b0b971fb7cc60f85ec225
+
+An unpackaged process now finds the probe and Windows PowerShell 5.1 validates
+the complete pinned package from C:/Windows/System32. DiagnoseOnly completes
+installation_preflight, with no services, installation directories or volumes
+created. Actual elevation, installation, service recovery and reboot acceptance
+remain pending; local tests do not replace those gates. No networking, model
+adapter, Controller runtime, migrations or credentials changed in this fix.
+
+VPS acceptance rerun for this correction: 86 discovered, 72 passed and 14
+Windows-only tests skipped, using a disposable database migrated through 015.
+The disposable database was removed. The 14 Windows-specific gates are covered
+by the 32-test local Windows run. Source/output secret scans passed, including
+an in-memory comparison against the existing Worker token. Repository changes
+are limited to the builder, installer, tests and this evidence document.

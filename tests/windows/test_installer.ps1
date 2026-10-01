@@ -49,6 +49,17 @@ try {
   function Remove-Item { throw 'MUTATION_BEFORE_VALIDATION' }
   $output=& $Installer -PackageRoot $root -ValidateOnly
   if ($output -ne 'DEVAI_PACKAGE_VALIDATED') { throw 'VALID_PACKAGE_REJECTED' }
+  # Read-only metadata validation must handle hidden non-secret probes, but
+  # must still reject absent probes before any installation mutation.
+  [IO.File]::SetAttributes($fixture,[IO.FileAttributes]::Hidden)
+  $output=& $Installer -PackageRoot $root -ValidateOnly
+  if ($output -ne 'DEVAI_PACKAGE_VALIDATED') { throw 'HIDDEN_PERSONAL_FIXTURE_REJECTED' }
+  [IO.File]::SetAttributes($fixture,[IO.FileAttributes]::Normal)
+  $originalFixture=$manifest.personal_denial_fixture
+  $manifest.personal_denial_fixture=$fixture+'-missing';Save-Manifest
+  try { & $Installer -PackageRoot $root;throw 'MISSING_PERSONAL_FIXTURE_ACCEPTED' }
+  catch { if ($_.Exception -isnot [Management.Automation.ItemNotFoundException]) { throw } }
+  $manifest.personal_denial_fixture=$originalFixture;Save-Manifest
   foreach ($name in @('../evil.txt','..\evil.txt','dir/../../evil.txt','dir\..\..\evil.txt','C:\evil.txt')) {
     $manifest.files[$name]='0'*64;Save-Manifest
     try { & $Installer -PackageRoot $root;throw 'INVALID_PACKAGE_ACCEPTED' }
@@ -78,7 +89,7 @@ try {
       if ($call.GetCommandName() -match '(?i)^(New-Item|Set-Acl|Copy-Item|New-Service|Start-Service|Remove-Item|diskpart(?:\.exe)?|icacls(?:\.exe)?|sc\.exe)$') { throw 'MUTATION_BEFORE_BOUNDARY' }
     } elseif ($call.Member.Value -match '(?i)^(Write.*|CreateDirectory)$') { throw 'MUTATION_BEFORE_BOUNDARY' }
   }
-  Write-Output (@{path_cases=$cases.Count;package_flow_cases=9;mutation_interceptors=$true;source_tested=$true;passed=$true} | ConvertTo-Json -Compress)
+  Write-Output (@{path_cases=$cases.Count;package_flow_cases=11;mutation_interceptors=$true;source_tested=$true;passed=$true} | ConvertTo-Json -Compress)
 } finally {
   # Only this verified test root is removed; no installation paths are touched.
   if ([IO.Path]::GetDirectoryName($root) -ne [IO.Path]::GetTempPath().TrimEnd([char[]]'\/')) { throw 'UNSAFE_TEST_CLEANUP_PATH' }
