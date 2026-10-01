@@ -25,6 +25,12 @@ if($summary.worker_explicit_allow_list -or $summary.worker_explicit_allow_modify
 $result.Error=5;$result.SecurityError=5;$result.Descriptor=$null
 $summary=Get-WorkspaceAccessSummary 'mount_target' $result $serviceSid
 if($summary.opened_as_admin -or $summary.acl_readable -or $summary.open_winerror -ne 5){throw 'ACCESS_DENIAL_HIDDEN'}
+$generic=[Security.AccessControl.RawSecurityDescriptor]::new(('O:SYG:SYD:P(A;;GRGW;;;'+$serviceSid+')(A;;GR;;;AU)(A;;GR;;;AC)'))
+$bytes=[byte[]]::new($generic.BinaryLength);$generic.GetBinaryForm($bytes,0)
+$result.Error=0;$result.SecurityError=0;$result.Descriptor=$bytes
+$summary=Get-WorkspaceAccessSummary 'volume_device' $result $serviceSid
+if(!$summary.worker_generic_read -or !$summary.worker_generic_write -or $summary.worker_full_control -or
+  !$summary.authenticated_users_allow_present -or !$summary.appcontainers_allow_present -or $summary.everyone_allow_present){throw 'GENERIC_DEVICE_RIGHTS_MISREPRESENTED'}
 try {Get-WorkspaceAccessSummary 'DO_NOT_LOG_THIS_FIXTURE' $result $serviceSid;throw 'UNKNOWN_LABEL_ACCEPTED'}
 catch {if($_.Exception.Message -ne 'ACCESS_DIAGNOSTIC_LABEL_INVALID'){throw}}
 $commands=$ast.FindAll({param($node) $node -is [Management.Automation.Language.CommandAst]},$true)
@@ -34,6 +40,8 @@ foreach($command in $commands) {
 $source=[IO.File]::ReadAllText($path)
 if($source -match 'SetSecurityInfo|SetFileSecurity|WriteFile|DeviceIoControl|AdjustTokenPrivileges|CryptUnprotectData'){throw 'ACCESS_DIAGNOSTIC_NATIVE_MUTATION'}
 if($source -notmatch "effective_service_access='NOT_TESTED'"){throw 'ADMIN_CHECK_MISREPRESENTED_AS_SERVICE_PROOF'}
+if($source -notmatch 'device \? 0x20000u : 0x20080u' -or $source -notmatch 'Get-VerifiedVhdDisk' -or
+  $source -notmatch 'attachment_filter_verified=\$false'){throw 'DEVICE_METADATA_BOUNDARY_MISSING'}
 $temp=Join-Path ([IO.Path]::GetTempPath()) ('devai-access-diagnostic-'+[Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($temp) | Out-Null
 try {
@@ -44,6 +52,25 @@ try {
   if($native.Error -ne 0 -or $native.SecurityError -ne 0 -or $native.TagError -ne 0 -or !$native.Descriptor){throw 'NATIVE_METADATA_READ_FAILED'}
   $summary=Get-WorkspaceAccessSummary 'mount_target' $native $serviceSid
   if(!$summary.is_directory -or $summary.is_mount_point -or !$summary.acl_readable){throw 'NATIVE_METADATA_SCHEMA_FAILED'}
+  # Prove the device-mode open requests security metadata, not content access.
+  # Use ONLY our owned regular-file fixture; no actual disk is opened in tests.
+  $file=Join-Path $temp 'metadata-only.fixture'
+  [IO.File]::WriteAllText($file,'synthetic non-secret metadata fixture')
+  . (Join-Path $PSScriptRoot '../../deploy/windows/install-support.ps1')
+  $originalDescriptor=Get-NativeWorkspaceSecurity $file
+  $identity=[Security.Principal.WindowsIdentity]::GetCurrent().User
+  # A synchronous CreateFile open also requires SYNCHRONIZE; permit that while
+  # retaining explicit FILE_READ_DATA denial. Neither right permits data reads.
+  $restrictedDescriptor=[Security.AccessControl.RawSecurityDescriptor]::new(('D:P(D;;0x1;;;'+$identity.Value+')(A;;0x120000;;;'+$identity.Value+')'))
+  Set-NativeWorkspaceSecurity $file $restrictedDescriptor
+  try {
+    $dataDenied=$false
+    try {$stream=[IO.File]::Open($file,'Open','Read','ReadWrite');$stream.Dispose()}
+    catch [UnauthorizedAccessException] {$dataDenied=$true}
+    if(!$dataDenied){throw 'CONTENT_DENIAL_FIXTURE_FAILED'}
+    $securityOnly=[DevAIWorkspaceAccessReader]::Read($file,$false,$true)
+    if($securityOnly.Error -ne 0 -or $securityOnly.SecurityError -ne 0 -or !$securityOnly.Descriptor){throw ('READ_CONTROL_ONLY_QUERY_FAILED_'+$securityOnly.Error+'_'+$securityOnly.SecurityError)}
+  } finally {Set-NativeWorkspaceSecurity $file $originalDescriptor}
   # Create and delete ONLY our own junction entry, never recurse into its target.
   $target=Join-Path $temp 'target';$junction=Join-Path $temp 'junction'
   [IO.Directory]::CreateDirectory($target) | Out-Null
