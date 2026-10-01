@@ -81,6 +81,9 @@ if ($ResumeServiceCreation) {
   Copy-Item -LiteralPath (Join-Path $PackageRoot 'control/worker_agent/volume_host.py') -Destination $helper
   $partial.manifest.'control/worker_agent/volume_host.py'=$package.files.'control/worker_agent/volume_host.py'
   [IO.File]::WriteAllText($partial.manifest_file,($partial.manifest | ConvertTo-Json -Depth 3))
+  $manifestAcl=Get-Acl -LiteralPath $partial.manifest_file
+  $manifestAcl.SetAccessRuleProtection($true,$true)
+  Set-Acl -LiteralPath $partial.manifest_file -AclObject $manifestAcl
   New-WorkerService $partial.command
   Set-WorkerServiceRecovery
   Start-Service -Name DevAIWorkerVolumes
@@ -171,6 +174,7 @@ Get-ChildItem -LiteralPath $installRoot -Recurse -File | ForEach-Object {
 }
 $manifestFile=Join-Path $installRoot 'manifest.json'
 [IO.File]::WriteAllText($manifestFile,($manifest | ConvertTo-Json -Depth 3))
+Set-ManagedAcl $manifestFile $serviceSid 'Read' $false
 
 $base=Get-WorkerServiceCommand $installRoot $configFile
 New-Service -Name DevAIWorkerVolumes -BinaryPathName ($base+' --volume-host') -StartupType Automatic -DisplayName 'DevAI private workspace volume host' | Out-Null

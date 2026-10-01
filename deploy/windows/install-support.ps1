@@ -7,11 +7,11 @@ function Assert-ManagedNoReparse([string]$Path) {
   return $item
 }
 
-function Assert-ManagedPrivateAcl([string]$Path,[string]$ServiceSid) {
+function Assert-ManagedPrivateAcl([string]$Path,[string]$ServiceSid,[switch]$AllowInherited) {
   Assert-ManagedNoReparse $Path | Out-Null
   $acl=Get-Acl -LiteralPath $Path
   $owner=([Security.Principal.NTAccount]$acl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value
-  if ($owner -notin @('S-1-5-18','S-1-5-32-544') -or !$acl.AreAccessRulesProtected) { throw 'MANAGED_INSTALL_ACL_UNSAFE' }
+  if ($owner -notin @('S-1-5-18','S-1-5-32-544') -or (!$AllowInherited -and !$acl.AreAccessRulesProtected)) { throw 'MANAGED_INSTALL_ACL_UNSAFE' }
   foreach ($entry in $acl.Access) {
     $sid=$entry.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
     if ($entry.AccessControlType -eq 'Allow') {
@@ -110,10 +110,13 @@ function Assert-PartialWorkerInstall([string]$InstallRoot,[string]$StateRoot,$Pa
   $configFile=Join-Path $StateRoot 'service.json'
   $manifestFile=Join-Path $InstallRoot 'manifest.json'
   $vhd=Join-Path $StateRoot 'volumes/workspace.vhdx'
-  foreach ($path in @($InstallRoot,$StateRoot,$configFile,$manifestFile,(Join-Path $StateRoot 'credentials'),
+  foreach ($path in @($InstallRoot,$StateRoot,$configFile,(Join-Path $StateRoot 'credentials'),
       (Join-Path $StateRoot 'credentials/worker.dpapi'),(Join-Path $StateRoot 'volumes'),$vhd,(Join-Path $StateRoot 'volumes/attach.txt'))) {
     Assert-ManagedPrivateAcl $path $serviceSid
   }
+  # The original installer inherited this file's safe DACL from the protected
+  # code root. Accept that exact legacy state, still checking owner and rights.
+  Assert-ManagedPrivateAcl $manifestFile $serviceSid -AllowInherited
   # This config contains paths, IDs and hashes only. Never read/decrypt tokens.
   $config=Get-Content -LiteralPath $configFile -Raw | ConvertFrom-Json
   $keys=@('worker_id','api_base_url','heartbeat_seconds','poll_seconds','credential_path','service_sid','volume_guid','sandbox_runtime','sandbox_executable_sha256','sandbox_payload_sha256','personal_denial_fixture')

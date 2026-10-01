@@ -38,6 +38,30 @@ $script:scCalls=@()
 Set-WorkerServiceRecovery
 if ($script:scCalls.Count -ne 5 -or ($script:scCalls[-1] -join '|') -ne 'sidtype|DevAIWorker|unrestricted') {throw 'SERVICE_RECOVERY_POLICY_TEST_FAILED'}
 
+# Preserve the exact original manifest inheritance without permitting broader
+# identities or Worker write rights. Inventory/ACL queries are mocked only.
+$tokens=$null;$errors=$null
+$supportAst=[Management.Automation.Language.Parser]::ParseFile($Support,[ref]$tokens,[ref]$errors)
+if($errors.Count){throw 'SUPPORT_SYNTAX_INVALID'}
+$noReparse=$supportAst.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-ManagedNoReparse'},$true)
+function Assert-ManagedNoReparse {param($Path) return $null}
+$adminSid=[Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+$workerSid=[Security.Principal.SecurityIdentifier]::new('S-1-5-80-1-2-3-4-5')
+$script:acl=[pscustomobject]@{Owner=$adminSid.Translate([Security.Principal.NTAccount]).Value;AreAccessRulesProtected=$false;
+  Access=@([Security.AccessControl.FileSystemAccessRule]::new($adminSid,'FullControl','Allow'),
+           [Security.AccessControl.FileSystemAccessRule]::new($workerSid,'Read','Allow'))}
+function Get-Acl {param($LiteralPath) return $script:acl}
+try {Assert-ManagedPrivateAcl 'manifest.json' $workerSid.Value;throw 'INHERITANCE_ACCEPTED_WITHOUT_EXCEPTION'}
+catch {if($_.Exception.Message -ne 'MANAGED_INSTALL_ACL_UNSAFE'){throw}}
+Assert-ManagedPrivateAcl 'manifest.json' $workerSid.Value -AllowInherited
+$script:acl.Access+=[Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-1-0'),'Read','Allow')
+try {Assert-ManagedPrivateAcl 'manifest.json' $workerSid.Value -AllowInherited;throw 'WORLD_READABLE_MANIFEST_ACCEPTED'}
+catch {if($_.Exception.Message -ne 'MANAGED_INSTALL_ACL_UNSAFE'){throw}}
+$script:acl.Access=@([Security.AccessControl.FileSystemAccessRule]::new($workerSid,'Modify','Allow'))
+try {Assert-ManagedPrivateAcl 'manifest.json' $workerSid.Value -AllowInherited;throw 'WRITABLE_MANIFEST_ACCEPTED'}
+catch {if($_.Exception.Message -ne 'MANAGED_INSTALL_ACL_UNSAFE'){throw}}
+. ([ScriptBlock]::Create($noReparse.Extent.Text))
+
 # Fake only read-only storage inventory. No native storage mutations occur.
 $script:vhd='C:\ProgramData\DevAIWorker\volumes\workspace.vhdx'
 $script:mount='C:\ProgramData\DevAIWorker\workspace-volume'
@@ -112,7 +136,7 @@ try {
   $script:helper=[pscustomobject]@{State='Stopped';StartName='LocalSystem';PathName=((Get-WorkerServiceCommand $code $cfg)+' --volume-host')}
   function Get-Service {param($Name,$ErrorAction) return $null}
   function Get-CimInstance {param($ClassName,$Filter) return $script:helper}
-  function Assert-ManagedPrivateAcl {param($Path,$ServiceSid) Assert-ManagedNoReparse $Path | Out-Null}
+  function Assert-ManagedPrivateAcl {param($Path,$ServiceSid,[switch]$AllowInherited) Assert-ManagedNoReparse $Path | Out-Null}
   function sc.exe {$global:LASTEXITCODE=0;return $sid}
   $tokens=$null;$errors=$null
   $installerAst=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '../../deploy/windows/install-worker.ps1'),[ref]$tokens,[ref]$errors)

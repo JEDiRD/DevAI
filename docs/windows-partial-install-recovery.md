@@ -65,11 +65,11 @@ process-tree recovery, profile/environment/network isolation gates. Privileged S
 and storage changes are mocked in installer tests; these do not prove deployment.
 
 Manifest SHA-256:
-7da44b04566a41aa9d29e0a6bdccfcea01ecf4fbf9454a57573f910ea871a9b1
+c865865a543e39943ec08184030f7d412c8596d340f714f02c4b1a39c97b490c
 Installer SHA-256:
-5ba4536601f749d6e99388b115742d4c8e890a932c1dc8e93e8b79fc808da7d4
+facf24323c9ae573c3f0df1be3fd2703214b87dccb506ebe3134c2571c68e0bd
 Support SHA-256 (also pinned by the manifest):
-2f6eb41d9160de2a4e343e68ce4502605586ec7b2d77706a5c83c7c924c0773f
+2e2e734ed85b15352c63e1f54bd8c2b6cf5d104df3039abfe3d66278cc7f06eb
 Private package: 1,258 manifested files, original tested CPython 3.13 runtime.
 
 The agent is unelevated and cannot inspect protected installed state or establish
@@ -91,3 +91,9 @@ VPS acceptance: 90 discovered, 75 passed, 15 Windows-only tests skipped;
 all migrations through 015 applied only in a disposable test DB, then removed.
 Source/output secret scans passed, including an in-memory comparison against
 the real existing Worker token. Original failure evidence remains preserved.
+
+Legacy compatibility: original manifest.json inherited its allowed DACL from the
+protected code root. Resume accepts inheritance only for this exact file, while
+still requiring trusted owner, allowed identities and service read-only rights.
+After writing the updated hash, resume protects the same permitted entries.
+Fresh installs explicitly protect the manifest file with administrator ownership.
