@@ -12,6 +12,14 @@ from unittest.mock import patch
 
 @unittest.skipUnless(sys.platform=='win32','Windows PowerShell required')
 class InstallerTests(unittest.TestCase):
+    def test_startup_update_validates_before_mutation_and_preserves_system_scope(self):
+        script=Path(__file__).parent/'windows'/'test_startup_update.ps1'
+        env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}
+        result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+            '-File',str(script)],capture_output=True,text=True,timeout=30,env=env)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('STARTUP_UPDATE_VALIDATION_BOUNDARY_PASSED',result.stdout)
+
     def test_service_diagnostic_redacts_logs_and_is_read_only(self):
         script=Path(__file__).parent/'windows'/'test_service_diagnostic.ps1'
         env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}

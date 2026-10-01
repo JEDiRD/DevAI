@@ -8,6 +8,24 @@ function Get-SafeServiceFailureTypes([string[]]$Lines) {
     }
   }
 }
+function Get-SafeStartupFailure($Value) {
+  $phases=@('config','install_verification','logging','volume_attach','workspace_open','workspace_recovery','process_allowlist','personal_probe','native_gates','journal','agent','startup_proof','running','unknown')
+  $types=@('RuntimeError','AdapterError','PermissionError','FileNotFoundError','OSError','TimeoutError','ValueError','KeyError','JSONDecodeError','UNKNOWN_ERROR_CLASS')
+  $files=@('windows_service.py','windows_security.py','workspace.py','windows_process.py','service_acceptance.py','execution_journal.py','service_credentials.py','agent.py','process_adapter.py','adapters.py','volume_host.py')
+  if (!$Value -or $Value.phase -notin $phases -or $Value.error -notin $types) {return @{status='UNAVAILABLE'}}
+  $safe=@{phase=[string]$Value.phase;error=[string]$Value.error;frames=@()}
+  if(($Value.at -is [double] -or $Value.at -is [long] -or $Value.at -is [int]) -and $Value.at -ge 1000000000 -and $Value.at -le 4102444800) {$safe.failure_at_epoch=$Value.at}
+  foreach($key in @('errno','winerror')) {
+    $number=$Value.$key
+    if($number -is [int] -and $number -ge 0 -and $number -le 65535) {$safe[$key]=$number}
+  }
+  foreach($frame in @($Value.frames | Select-Object -Last 8)) {
+    if($frame.file -cin $files -and $frame.line -is [int] -and $frame.line -gt 0 -and $frame.line -le 100000) {
+      $safe.frames+=@{file=[string]$frame.file;line=[int]$frame.line}
+    }
+  }
+  return $safe
+}
 $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
 if (!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'ADMINISTRATOR_DIAGNOSTIC_REQUIRED' }
 $state=Join-Path $env:ProgramData 'DevAIWorker'
@@ -21,6 +39,11 @@ foreach ($name in @('DevAIWorkerVolumes','DevAIWorker')) {
     $types=@(Get-SafeServiceFailureTypes (Get-Content -LiteralPath $path -Tail 30))
     $report.logs+=@{service=$name;readable=$true;recent_failure_types=$types}
   } catch { $report.logs+=@{service=$name;readable=$false} }
+  $startup=Join-Path $state ('reports/'+$name+'-startup-failure.json')
+  try {
+    $failure=Get-SafeStartupFailure (Get-Content -LiteralPath $startup -Raw | ConvertFrom-Json)
+  } catch {$failure=@{status='UNAVAILABLE'}}
+  $report.logs[-1].startup_failure=$failure
 }
 # Only public paths/IDs/hash configuration is read. The DPAPI file is NEVER read.
 $config=Get-Content -LiteralPath (Join-Path $state 'service.json') -Raw | ConvertFrom-Json

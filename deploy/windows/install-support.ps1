@@ -100,8 +100,9 @@ function Get-VerifiedWorkspaceVolume([string]$VhdPath,[string]$Mount,[string]$Ex
   return @{disk_number=[uint32]$disk.Number;file_backed=$true;disk_bytes=134217728;filesystem='NTFS';no_drive_letter=$true;mount_verified=$true}
 }
 
-function Assert-PartialWorkerInstall([string]$InstallRoot,[string]$StateRoot,$Package) {
-  if (Get-Service -Name DevAIWorker -ErrorAction Ignore) { throw 'RESUME_REQUIRES_WORKER_SERVICE_ABSENT' }
+function Assert-PartialWorkerInstall([string]$InstallRoot,[string]$StateRoot,$Package,[switch]$ExistingService,[string]$PreviousServiceHash) {
+  if (!$ExistingService -and (Get-Service -Name DevAIWorker -ErrorAction Ignore)) { throw 'RESUME_REQUIRES_WORKER_SERVICE_ABSENT' }
+  if ($ExistingService -and $PreviousServiceHash -notmatch '^[a-f0-9]{64}$') { throw 'DIAGNOSTIC_PREVIOUS_HASH_REQUIRED' }
   Assert-ManagedNoReparse $InstallRoot | Out-Null
   Assert-ManagedNoReparse $StateRoot | Out-Null
   $sidOutput=& sc.exe showsid DevAIWorker
@@ -126,8 +127,14 @@ function Assert-PartialWorkerInstall([string]$InstallRoot,[string]$StateRoot,$Pa
       $config.credential_path -ne (Join-Path $StateRoot 'credentials/worker.dpapi') -or
       $config.sandbox_runtime -ne (Join-Path $InstallRoot 'sandbox-runtime')) { throw 'PARTIAL_INSTALL_CONFIG_MISMATCH' }
   $base=Get-WorkerServiceCommand $InstallRoot $configFile
+  if ($ExistingService) {
+    $worker=Get-CimInstance Win32_Service -Filter "Name='DevAIWorker'"
+    if (!$worker -or $worker.StartName -ne 'NT SERVICE\DevAIWorker' -or $worker.PathName -cne $base -or
+        $worker.StartMode -ne 'Auto' -or $worker.State -notin @('Stopped','Running')) { throw 'DIAGNOSTIC_WORKER_SERVICE_MISMATCH' }
+  }
   $helper=Get-CimInstance Win32_Service -Filter "Name='DevAIWorkerVolumes'"
-  if (!$helper -or $helper.State -ne 'Stopped' -or $helper.StartName -ne 'LocalSystem' -or
+  $helperStates=if ($ExistingService) {@('Stopped','Running')} else {@('Stopped')}
+  if (!$helper -or $helper.State -notin $helperStates -or $helper.StartName -ne 'LocalSystem' -or
       $helper.PathName -cne ($base+' --volume-host')) { throw 'PARTIAL_INSTALL_HELPER_MISMATCH' }
   $manifest=Get-Content -LiteralPath $manifestFile -Raw | ConvertFrom-Json
   $verified=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -138,7 +145,10 @@ function Assert-PartialWorkerInstall([string]$InstallRoot,[string]$StateRoot,$Pa
     Assert-ManagedNoReparse $path | Out-Null
     if ($entry.Value -notmatch '^[a-f0-9]{64}$' -or (Get-FileHash -LiteralPath $path).Hash.ToLowerInvariant() -ne $entry.Value) { throw 'INSTALLED_RUNTIME_INTEGRITY_FAILED' }
     $packaged=$Package.files.PSObject.Properties[$entry.Name]
-    if (!$packaged -or ($entry.Name -ne 'control/worker_agent/volume_host.py' -and $entry.Value -ne $packaged.Value)) { throw 'RESUME_PACKAGE_RUNTIME_MISMATCH' }
+    if ($ExistingService) {
+      $allowed=if ($entry.Name -eq 'control/worker_agent/windows_service.py') {@($PreviousServiceHash,$packaged.Value)} else {@($packaged.Value)}
+      if (!$packaged -or $entry.Value -notin $allowed) { throw 'DIAGNOSTIC_PACKAGE_RUNTIME_MISMATCH' }
+    } elseif (!$packaged -or ($entry.Name -ne 'control/worker_agent/volume_host.py' -and $entry.Value -ne $packaged.Value)) { throw 'RESUME_PACKAGE_RUNTIME_MISMATCH' }
   }
   $directories=[Collections.Generic.Stack[string]]::new()
   $directories.Push($InstallRoot)

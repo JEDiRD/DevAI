@@ -23,6 +23,35 @@ from .workspace import WorkspaceManager
 SERVICE_NAME = 'DevAIWorker'
 VOLUME_SERVICE = 'DevAIWorkerVolumes'
 
+STARTUP_PHASES = frozenset(('config', 'install_verification', 'logging', 'volume_attach',
+    'workspace_open', 'workspace_recovery', 'process_allowlist', 'personal_probe',
+    'native_gates', 'journal', 'agent', 'startup_proof', 'running'))
+FAILURE_TYPES = frozenset(('RuntimeError', 'AdapterError', 'PermissionError',
+    'FileNotFoundError', 'OSError', 'TimeoutError', 'ValueError', 'KeyError', 'JSONDecodeError'))
+FAILURE_SOURCES = frozenset(('windows_service.py', 'windows_security.py', 'workspace.py',
+    'windows_process.py', 'service_acceptance.py', 'execution_journal.py',
+    'service_credentials.py', 'agent.py', 'process_adapter.py', 'adapters.py', 'volume_host.py'))
+
+
+def safe_startup_failure(failure, phase):
+    """Only closed-schema metadata. Never exception text, filenames or locals."""
+    kind = type(failure).__name__
+    result = {'phase': phase if phase in STARTUP_PHASES else 'unknown',
+        'error': kind if kind in FAILURE_TYPES else 'UNKNOWN_ERROR_CLASS', 'frames': []}
+    for name in ('errno', 'winerror'):
+        value = getattr(failure, name, None)
+        if type(value) is int and 0 <= value <= 65535:
+            result[name] = value
+    frame = failure.__traceback__
+    root = Path(__file__).parent
+    while frame:
+        source = Path(frame.tb_frame.f_code.co_filename)
+        if source.parent == root and source.name in FAILURE_SOURCES:
+            result['frames'].append({'file': source.name, 'line': frame.tb_lineno})
+        frame = frame.tb_next
+    result['frames'] = result['frames'][-8:]
+    return result
+
 
 def verify_install(config_path, config, *, volume_host=False):
     """Administrator-created config/runtime/state must not be writable by payloads."""
@@ -120,30 +149,38 @@ class ServiceHost:
             return
         self.status(2)
         error=0
+        phase='config'
         try:
             config=json.loads(self.config_path.read_text())
+            phase='install_verification'
             verify_install(self.config_path,config,volume_host=self.volume_host)
             state=self.config_path.parent
             logs=state/'logs'
+            phase='logging'
             handler=RotatingFileHandler(logs/(self.name+'.log'),maxBytes=1024*1024,backupCount=3)
             handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
             logging.getLogger().addHandler(handler)
             logging.getLogger().setLevel(logging.INFO)
             if self.volume_host:
                 from .volume_host import attach_workspace_volume
+                phase='volume_attach'
                 attach_workspace_volume(config)
                 self.status(4)
                 self.stop.wait()
             else:
+                phase='workspace_open'
                 workspaces=WorkspaceManager(state/'workspace-volume',config['service_sid'],volume_guid=config['volume_guid'],recovery_dir=state/'journal')
+                phase='workspace_recovery'
                 workspaces.recover()
+                phase='process_allowlist'
                 runtime=Path(config['sandbox_runtime'])
                 allowlist=ProcessAllowlist(runtime/'python.exe',runtime/'synthetic_process.py',
                     config['sandbox_executable_sha256'],config['sandbox_payload_sha256'])
                 registry=process_registry(WindowsProcessTreeLauncher(allowlist),workspaces)
                 from .service_acceptance import native_gates
                 # This exact non-secret fixture was created by the installer
-                # preparation under the personal account's private token folder.
+                # preparation in a separate private personal-profile directory.
+                phase='personal_probe'
                 personal_fixture=Path(config['personal_denial_fixture'])
                 try:
                     no_reparse(personal_fixture)
@@ -152,25 +189,41 @@ class ServiceHost:
                     personal_denied=True
                 else:
                     raise RuntimeError('SERVICE_PERSONAL_PROFILE_ACCESS_NOT_DENIED')
+                phase='native_gates'
                 gates=native_gates(workspaces,registry._allowlisted['synthetic_process'].launcher,state)
                 gates['service_personal_profile_denied']=personal_denied
+                phase='journal'
                 journal=ExecutionJournal(state/'journal'/'executions.sqlite')
                 journal.recover_after_containment()
+                phase='agent'
                 self.agent=WorkerAgent(AgentConfig.load(self.config_path),ServiceCredentialStore(state/'credentials'/'worker.dpapi'),
                     adapters=registry,journal=journal)
                 proof={'service':'DevAIWorker','service_sid':config['service_sid'],'started_at':time.time(),
                     'boot_tick_ms':api(C.WinDLL('kernel32'),'GetTickCount64',C.c_uint64,[])(),'identity_verified':True,
                     'runtime_verified':True,'workspace_hard_quota_verified':True}
                 proof['native_gates']=gates
+                phase='startup_proof'
                 (state/'reports'/'service-start.json').write_text(json.dumps(proof))
                 self.status(4)
+                phase='running'
                 self.agent.run_forever()
                 if not self.stop.is_set():
                     raise RuntimeError('WORKER_SAFETY_STOP')
         except Exception as failure:
             error=1
-            # Fixed class only, never exception text, requests, token or config content.
-            logging.getLogger(__name__).error('Service failed: %s',type(failure).__name__)
+            diagnostic=safe_startup_failure(failure,phase)
+            logging.getLogger(__name__).error('Service failed: %s',diagnostic['error'])
+            # Fixed local destination, no config values or exception text. Keep
+            # early verification failures observable without following links or
+            # allowing any further startup operation. Report writes are best-effort.
+            try:
+                import os
+                report=Path(os.environ['ProgramData'])/'DevAIWorker'/'reports'/(self.name+'-startup-failure.json')
+                no_reparse(report.parent)
+                if report.exists(): no_reparse(report)
+                report.write_text(json.dumps({**diagnostic,'at':time.time()}))
+            except Exception:
+                pass
         finally:
             self.status(1,error=error)
 

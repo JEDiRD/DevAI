@@ -135,7 +135,8 @@ try {
   $package=[pscustomobject]@{worker_id=$config.worker_id;api_base_url=$config.api_base_url;personal_denial_fixture=$config.personal_denial_fixture;files=($hashes | ConvertTo-Json | ConvertFrom-Json)}
   $script:helper=[pscustomobject]@{State='Stopped';StartName='LocalSystem';PathName=((Get-WorkerServiceCommand $code $cfg)+' --volume-host')}
   function Get-Service {param($Name,$ErrorAction) return $null}
-  function Get-CimInstance {param($ClassName,$Filter) return $script:helper}
+  $script:worker=[pscustomobject]@{State='Stopped';StartName='NT SERVICE\DevAIWorker';PathName=(Get-WorkerServiceCommand $code $cfg);StartMode='Auto'}
+  function Get-CimInstance {param($ClassName,$Filter) if($Filter -eq "Name='DevAIWorker'"){return $script:worker};return $script:helper}
   function Assert-ManagedPrivateAcl {param($Path,$ServiceSid,[switch]$AllowInherited) Assert-ManagedNoReparse $Path | Out-Null}
   function sc.exe {$global:LASTEXITCODE=0;return $sid}
   $tokens=$null;$errors=$null
@@ -154,6 +155,24 @@ try {
   $script:helper.State='Running'
   try{Assert-PartialWorkerInstall $code $state $package;throw 'RUNNING_HELPER_ACCEPTED'}
   catch{if($_.Exception.Message -ne 'PARTIAL_INSTALL_HELPER_MISMATCH'){throw}}
+  $script:helper.State='Stopped'
+  # Existing-service diagnostics accept ONLY the pinned old/new service source.
+  # Any other runtime mismatch or administrative service identity stays closed.
+  $oldService=$hashes['control/worker_agent/windows_service.py']
+  $package.files.'control/worker_agent/windows_service.py'='a'*64
+  $script:helper.State='Running'
+  Assert-PartialWorkerInstall $code $state $package -ExistingService -PreviousServiceHash $oldService | Out-Null
+  try{Assert-PartialWorkerInstall $code $state $package -ExistingService -PreviousServiceHash ('b'*64);throw 'UNKNOWN_SERVICE_HASH_ACCEPTED'}
+  catch{if($_.Exception.Message -ne 'DIAGNOSTIC_PACKAGE_RUNTIME_MISMATCH'){throw}}
+  $script:worker.StartName='LocalSystem'
+  try{Assert-PartialWorkerInstall $code $state $package -ExistingService -PreviousServiceHash $oldService;throw 'ADMIN_WORKER_ACCEPTED'}
+  catch{if($_.Exception.Message -ne 'DIAGNOSTIC_WORKER_SERVICE_MISMATCH'){throw}}
+  $script:worker.StartName='NT SERVICE\DevAIWorker'
+  $package.files.'sandbox-runtime/python.exe'='c'*64
+  try{Assert-PartialWorkerInstall $code $state $package -ExistingService -PreviousServiceHash $oldService;throw 'UNRELATED_RUNTIME_UPGRADE_ACCEPTED'}
+  catch{if($_.Exception.Message -ne 'DIAGNOSTIC_PACKAGE_RUNTIME_MISMATCH'){throw}}
+  $package.files.'sandbox-runtime/python.exe'=$hashes['sandbox-runtime/python.exe']
+  $package.files.'control/worker_agent/windows_service.py'=$oldService
   $script:helper.State='Stopped'
   [IO.File]::WriteAllText((Join-Path $code 'host-runtime/python.exe'),'altered code')
   try{Assert-PartialWorkerInstall $code $state $package;throw 'TAMPERED_RUNTIME_ACCEPTED'}
