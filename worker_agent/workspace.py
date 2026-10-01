@@ -16,6 +16,56 @@ WORKSPACE_BYTES = 128 * 1024 * 1024
 MAX_FILES = 4096
 
 
+class IO_STATUS_VALUE(C.Union):
+    _fields_ = [('status', C.c_int32), ('pointer', C.c_void_p)]
+
+
+class IO_STATUS_BLOCK(C.Structure):
+    _fields_ = [('value', IO_STATUS_VALUE), ('information', C.c_size_t)]
+
+
+class FILE_FS_SIZE_INFORMATION(C.Structure):
+    _fields_ = [('total_units', C.c_int64), ('available_units', C.c_int64),
+               ('sectors_per_unit', C.c_uint32), ('bytes_per_sector', C.c_uint32)]
+
+
+def directory_capacity(root, expected_guid):
+    """Query via a noninheritable directory handle, never a raw device handle.
+
+    Requires FILE_LIST_DIRECTORY. Bind the opened root to the pinned GUID before
+    querying size, and close the handle on every path. No elevation or fallback.
+    """
+    kernel = C.WinDLL('kernel32', use_last_error=True)
+    opened = api(kernel, 'CreateFileW', W.HANDLE,
+        [W.LPCWSTR,W.DWORD,W.DWORD,C.c_void_p,W.DWORD,W.DWORD,W.HANDLE])
+    handle = opened(str(root).rstrip('\\/')+'\\',1,7,None,3,0x02000000,None)
+    check(handle and handle != C.c_void_p(-1).value, 'WORKSPACE_DIRECTORY_OPEN_FAILED')
+    try:
+        final = C.create_unicode_buffer(1024)
+        received = api(kernel,'GetFinalPathNameByHandleW',W.DWORD,
+            [W.HANDLE,W.LPWSTR,W.DWORD,W.DWORD])(handle,final,1024,1)
+        check(received and received < 1024, 'WORKSPACE_HANDLE_PATH_QUERY_FAILED')
+        if final.value.rstrip('\\').casefold() != expected_guid.rstrip('\\').casefold():
+            raise AdapterError('WORKSPACE_HANDLE_VOLUME_MISMATCH')
+        status, size = IO_STATUS_BLOCK(), FILE_FS_SIZE_INFORMATION()
+        native = C.WinDLL('ntdll',use_last_error=True)
+        result = api(native,'NtQueryVolumeInformationFile',C.c_int32,
+            [W.HANDLE,C.POINTER(IO_STATUS_BLOCK),C.c_void_p,C.c_uint32,C.c_int])(
+                handle,C.byref(status),C.byref(size),C.sizeof(size),3)
+        if result != 0 or status.value.status != 0:
+            failure = AdapterError('WORKSPACE_CAPACITY_QUERY_FAILED')
+            failure.winerror = int(api(native,'RtlNtStatusToDosError',C.c_uint32,[C.c_int32])(
+                result if result != 0 else status.value.status))
+            raise failure
+        if status.information != C.sizeof(size) or size.total_units <= 0 or \
+            size.available_units < 0 or size.available_units > size.total_units or \
+            size.sectors_per_unit == 0 or size.bytes_per_sector == 0:
+            raise AdapterError('WORKSPACE_CAPACITY_INVALID')
+        return size.total_units * size.sectors_per_unit * size.bytes_per_sector
+    finally:
+        check(api(kernel,'CloseHandle',W.BOOL,[W.HANDLE])(handle),'WORKSPACE_DIRECTORY_CLOSE_FAILED')
+
+
 class WorkspaceManager:
     def __init__(self, root, owner_sid, *, volume_guid=None, require_hard_quota=True, recovery_dir=None):
         self.root = Path(os.path.abspath(root))
@@ -85,14 +135,8 @@ class WorkspaceManager:
             check(get(str(self.root) + '\\', volume, 1024), 'WORKSPACE_VOLUME_NOT_MOUNTED')
             if volume.value != self.volume_guid:
                 raise AdapterError('WORKSPACE_VOLUME_MISMATCH')
-            available, total, free = C.c_uint64(), C.c_uint64(), C.c_uint64()
-            disk = api(k, 'GetDiskFreeSpaceExW', W.BOOL, [W.LPCWSTR, C.POINTER(C.c_uint64), C.POINTER(C.c_uint64), C.POINTER(C.c_uint64)])
-            # Query the already pinned target volume explicitly. A mounted
-            # folder has a separate host-side security descriptor; do not use
-            # that object to infer the target volume's capacity/access policy.
-            check(disk(self.volume_guid, C.byref(available), C.byref(total), C.byref(free)),
-                  'WORKSPACE_CAPACITY_QUERY_FAILED')
-            if total.value > WORKSPACE_BYTES:
+            total = directory_capacity(self.root,self.volume_guid)
+            if total > WORKSPACE_BYTES:
                 raise AdapterError('WORKSPACE_QUOTA_TOO_LARGE')
 
     def create(self):
