@@ -26,7 +26,7 @@ if ((Get-Content -LiteralPath $Installer -Raw) -match '\.Split\(') { throw 'AMBI
 $root=Join-Path ([IO.Path]::GetTempPath()) ('devai-installer-validation-'+[Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($root) | Out-Null
 try {
-  $required=@('install-worker.ps1','worker.dpapi','host-runtime/python.exe','sandbox-runtime/python.exe','control/worker_agent/windows_service.py')
+  $required=@('install-worker.ps1','install-support.ps1','worker.dpapi','host-runtime/python.exe','sandbox-runtime/python.exe','control/worker_agent/windows_service.py')
   $files=@{}
   foreach ($relative in $required) {
     $path=Join-Path $root $relative

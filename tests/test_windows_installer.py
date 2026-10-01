@@ -12,6 +12,18 @@ from unittest.mock import patch
 
 @unittest.skipUnless(sys.platform=='win32','Windows PowerShell required')
 class InstallerTests(unittest.TestCase):
+    def test_structured_service_creation_and_storage_resume_guards(self):
+        script=Path(__file__).parent/'windows'/'test_install_support.ps1'
+        env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}
+        result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+            '-File',str(script)],capture_output=True,text=True,timeout=30,env=env)
+        self.assertEqual(result.returncode,0,result.stderr)
+        report=json.loads(result.stdout)
+        self.assertTrue(report['passed'])
+        self.assertTrue(report['service_quoting'])
+        self.assertTrue(report['resume_no_format'])
+        self.assertEqual(report['storage_rejection_cases'],8)
+
     def test_unsupported_runtime_rejected_before_package_or_probe_creation(self):
         builder=Path(__file__).parent.parent/'deploy'/'windows'/'build-package.py'
         spec=importlib.util.spec_from_file_location('devai_package_builder_runtime',builder)

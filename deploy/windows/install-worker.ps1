@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$PackageRoot,[switch]$ValidateOnly)
+param([Parameter(Mandatory=$true)][string]$PackageRoot,[switch]$ValidateOnly,[switch]$ResumeServiceCreation,[switch]$InspectInstall)
 $ErrorActionPreference='Stop'
 function Assert-PackageEntryName([string]$Name) {
   $parts=$Name -split '[\\/]'
@@ -58,7 +58,7 @@ while ($directories.Count) {
     elseif ($item.FullName -ne $manifestPath -and !$validatedFiles.Contains($item.FullName)) { throw 'UNMANIFESTED_PACKAGE_FILE' }
   }
 }
-foreach ($required in @('install-worker.ps1','worker.dpapi','host-runtime/python.exe','sandbox-runtime/python.exe','control/worker_agent/windows_service.py')) {
+foreach ($required in @('install-worker.ps1','install-support.ps1','worker.dpapi','host-runtime/python.exe','sandbox-runtime/python.exe','control/worker_agent/windows_service.py')) {
   if (!$validatedFiles.Contains([IO.Path]::GetFullPath((Join-Path $PackageRoot $required)))) { throw 'REQUIRED_PACKAGE_FILE_MISSING' }
 }
 if ($ValidateOnly) { Write-Output 'DEVAI_PACKAGE_VALIDATED'; return }
@@ -68,8 +68,30 @@ $admin=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIde
 if (!$admin.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'ADMINISTRATOR_INSTALL_REQUIRED' }
 $installRoot=Join-Path $env:ProgramFiles 'DevAIWorker'
 $stateRoot=Join-Path $env:ProgramData 'DevAIWorker'
+. (Join-Path $PackageRoot 'install-support.ps1')
+if ($InspectInstall -and !$ResumeServiceCreation) { throw 'INSPECT_REQUIRES_EXPLICIT_RESUME' }
+if ($ResumeServiceCreation) {
+  # Entire existing installation and volume are checked read-only FIRST.
+  $partial=Assert-PartialWorkerInstall $installRoot $stateRoot $package
+  Write-Output (@{partial_install_validated=$true;volume=$partial.volume;volume_reformatted=$false} | ConvertTo-Json -Depth 4 -Compress)
+  if ($InspectInstall) { return }
+  # Preserve credential/config/VHDX/workspaces. Upgrade only this manifested
+  # mount helper to suppress automatic drive letters on subsequent boots.
+  $helper=Join-Path $installRoot 'control/worker_agent/volume_host.py'
+  Copy-Item -LiteralPath (Join-Path $PackageRoot 'control/worker_agent/volume_host.py') -Destination $helper
+  $partial.manifest.'control/worker_agent/volume_host.py'=$package.files.'control/worker_agent/volume_host.py'
+  [IO.File]::WriteAllText($partial.manifest_file,($partial.manifest | ConvertTo-Json -Depth 3))
+  New-WorkerService $partial.command
+  Set-WorkerServiceRecovery
+  Start-Service -Name DevAIWorkerVolumes
+  Start-Service -Name DevAIWorker
+  [IO.File]::WriteAllText((Join-Path $stateRoot 'reports/install.json'),(@{installed=$true;resumed=$true;identity='NT SERVICE\DevAIWorker';delayed_start=$true;recovery=$true;volume_reformatted=$false;workspace_max_bytes=134217728} | ConvertTo-Json))
+  Write-Output 'DEVAI_WORKER_INSTALL_FINISHED'
+  return
+}
 if (Get-Service -Name DevAIWorker -ErrorAction Ignore) { throw 'EXISTING_SERVICE_REQUIRES_REVIEWED_UPGRADE' }
-if ((Test-Path -LiteralPath $installRoot) -or (Test-Path -LiteralPath $stateRoot)) { throw 'EXISTING_INSTALLATION_PATH_REQUIRES_REVIEW' }
+if ((Test-Path -LiteralPath $installRoot) -or (Test-Path -LiteralPath $stateRoot) -or
+    (Get-Service -Name DevAIWorkerVolumes -ErrorAction Ignore)) { throw 'EXISTING_INSTALLATION_PATH_REQUIRES_REVIEW' }
 
 function Set-ManagedAcl([string]$Path,[string]$Sid,[string]$Rights,[bool]$Directory=$true,[bool]$PublicRead=$false) {
   $acl=if ($Directory) {[Security.AccessControl.DirectorySecurity]::new()} else {[Security.AccessControl.FileSecurity]::new()}
@@ -121,28 +143,12 @@ foreach ($path in @('control','host-runtime','sandbox-runtime')) {
 
 $vhd=Join-Path $stateRoot 'volumes/workspace.vhdx'
 $mount=Join-Path $stateRoot 'workspace-volume'
-$createFile=Join-Path $stateRoot 'volumes/create.txt'
-$diskCommands=@("create vdisk file=`"$vhd`" maximum=128 type=fixed","select vdisk file=`"$vhd`"",'attach vdisk','create partition primary','format fs=ntfs label=DevAIWorkspace quick',"assign mount=`"$mount`"",'exit')
-[IO.File]::WriteAllText($createFile,($diskCommands -join "`r`n")+"`r`n")
-& "$env:SystemRoot/System32/diskpart.exe" /s $createFile | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'WORKSPACE_VOLUME_CREATION_FAILED' }
-Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-using System.Text;
-public static class DevAIVolume {
- [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
- public static extern bool GetVolumeNameForVolumeMountPoint(string path,StringBuilder name,uint size);
-}
-'@
-$volume=[Text.StringBuilder]::new(1024)
-if (![DevAIVolume]::GetVolumeNameForVolumeMountPoint($mount+'\',$volume,1024)) { throw 'WORKSPACE_MOUNT_NOT_VERIFIED' }
+$volume=New-PrivateWorkspaceVolume $vhd $mount
 Set-ManagedAcl $mount $serviceSid 'Modify'
 $attachFile=Join-Path $stateRoot 'volumes/attach.txt'
 [IO.File]::WriteAllText($attachFile,"select vdisk file=`"$vhd`"`nattach vdisk`nexit`n")
 Set-ManagedAcl $vhd '' '' $false
 Set-ManagedAcl $attachFile '' '' $false
-Remove-Item -LiteralPath $createFile
 
 $credential=Join-Path $stateRoot 'credentials/worker.dpapi'
 Copy-Item -LiteralPath (Join-Path $PackageRoot 'worker.dpapi') -Destination $credential
@@ -150,7 +156,7 @@ Set-ManagedAcl $credential $serviceSid 'Read' $false
 $runtime=Join-Path $installRoot 'sandbox-runtime'
 $config=@{
  worker_id=$package.worker_id;api_base_url=$package.api_base_url;heartbeat_seconds=20;poll_seconds=2;
- credential_path=$credential;service_sid=$serviceSid;volume_guid=$volume.ToString();sandbox_runtime=$runtime;
+ credential_path=$credential;service_sid=$serviceSid;volume_guid=$volume;sandbox_runtime=$runtime;
  sandbox_executable_sha256=(Get-FileHash -LiteralPath (Join-Path $runtime 'python.exe')).Hash.ToLowerInvariant();
  sandbox_payload_sha256=(Get-FileHash -LiteralPath (Join-Path $runtime 'synthetic_process.py')).Hash.ToLowerInvariant()
  personal_denial_fixture=$package.personal_denial_fixture
@@ -166,23 +172,12 @@ Get-ChildItem -LiteralPath $installRoot -Recurse -File | ForEach-Object {
 $manifestFile=Join-Path $installRoot 'manifest.json'
 [IO.File]::WriteAllText($manifestFile,($manifest | ConvertTo-Json -Depth 3))
 
-$python=Join-Path $installRoot 'host-runtime/python.exe'
-$base='"'+$python+'" -I -S -B -m worker_agent.windows_service --config "'+$configFile+'"'
+$base=Get-WorkerServiceCommand $installRoot $configFile
 New-Service -Name DevAIWorkerVolumes -BinaryPathName ($base+' --volume-host') -StartupType Automatic -DisplayName 'DevAI private workspace volume host' | Out-Null
 # Virtual account: unique local service identity, no password, no Administrators membership.
-& sc.exe create DevAIWorker binPath= $base start= delayed-auto obj= 'NT SERVICE\DevAIWorker' depend= DevAIWorkerVolumes DisplayName= 'DevAI isolated Windows Worker' | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'WORKER_SERVICE_CREATION_FAILED' }
-foreach ($name in @('DevAIWorkerVolumes','DevAIWorker')) {
-  & sc.exe failure $name reset= 86400 actions= restart/10000/restart/10000/restart/60000 | Out-Null
-  if ($LASTEXITCODE -ne 0) { throw 'SERVICE_RECOVERY_CONFIG_FAILED' }
-  & sc.exe failureflag $name 1 | Out-Null
-  if ($LASTEXITCODE -ne 0) { throw 'SERVICE_FAILURE_FLAG_FAILED' }
-}
-& sc.exe sidtype DevAIWorker unrestricted | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'SERVICE_SID_CONFIG_FAILED' }
-$actual=Get-CimInstance Win32_Service -Filter "Name='DevAIWorker'"
-if ($actual.PathName -ne $base -or $actual.StartName -ne 'NT SERVICE\DevAIWorker') { throw 'SERVICE_IDENTITY_OR_PATH_NOT_VERIFIED' }
+New-WorkerService $base
+Set-WorkerServiceRecovery
 Start-Service -Name DevAIWorkerVolumes
 Start-Service -Name DevAIWorker
-[IO.File]::WriteAllText((Join-Path $stateRoot 'reports/install.json'),(@{installed=$true;identity='NT SERVICE\DevAIWorker';delayed_start=$true;recovery=$true;volume_guid=$volume.ToString();workspace_max_bytes=134217728} | ConvertTo-Json))
+[IO.File]::WriteAllText((Join-Path $stateRoot 'reports/install.json'),(@{installed=$true;identity='NT SERVICE\DevAIWorker';delayed_start=$true;recovery=$true;volume_guid=$volume;workspace_max_bytes=134217728} | ConvertTo-Json))
 Write-Output 'DEVAI_WORKER_INSTALL_FINISHED'

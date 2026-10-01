@@ -3,7 +3,8 @@ param(
   [Parameter(Mandatory=$true)][string]$ExpectedManifestSHA256,
   [Parameter(Mandatory=$true)][string]$ExpectedInstallerSHA256,
   [Parameter(Mandatory=$true)][string]$ResultPath,
-  [switch]$DiagnoseOnly
+  [switch]$DiagnoseOnly,
+  [switch]$ResumeServiceCreation
 )
 $ErrorActionPreference='Stop'
 $phase='manifest_hash'
@@ -23,13 +24,16 @@ try {
   $existingCode=Test-Path -LiteralPath (Join-Path $programFiles.FullName 'DevAIWorker')
   $existingState=Test-Path -LiteralPath (Join-Path $programData.FullName 'DevAIWorker')
   if ($DiagnoseOnly) {
+    if ($ResumeServiceCreation) {
+      & $installer -PackageRoot $PackageRoot -ResumeServiceCreation -InspectInstall
+    }
     $proof=@{diagnostic_only=$true;package_validated=$true;administrator=$admin;service_exists=$service;installation_directory_exists=$existingCode;state_directory_exists=$existingState;process_64_bit=[Environment]::Is64BitProcess;phase=$phase;at=[DateTime]::UtcNow.ToString('o')}
     [IO.File]::WriteAllText($ResultPath,($proof | ConvertTo-Json))
     Write-Output ($proof | ConvertTo-Json -Compress)
     return
   }
   $phase='installation'
-  & $installer -PackageRoot $PackageRoot
+  & $installer -PackageRoot $PackageRoot -ResumeServiceCreation:$ResumeServiceCreation
   [IO.File]::WriteAllText($ResultPath,(@{completed=$true;phase='completed';at=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json))
 } catch {
   $original=$_

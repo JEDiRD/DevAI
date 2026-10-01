@@ -61,6 +61,7 @@ def main():
     control=destination/'control';control.mkdir()
     shutil.copytree(root/'worker_agent',control/'worker_agent',ignore=shutil.ignore_patterns('__pycache__'))
     shutil.copy2(root/'deploy'/'windows'/'install-worker.ps1',destination/'install-worker.ps1')
+    shutil.copy2(root/'deploy'/'windows'/'install-support.ps1',destination/'install-support.ps1')
     for name in ('host-runtime','sandbox-runtime'):
         runtime=destination/name;runtime.mkdir()
         for file in ('python.exe','python313.dll','python3.dll','vcruntime140.dll','vcruntime140_1.dll'):
