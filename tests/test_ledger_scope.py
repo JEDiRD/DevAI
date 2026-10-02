@@ -29,6 +29,7 @@ from devai import (
     reconciliation,
     runtime,
 )
+from devai.pricing import ModelPrice
 from devai.tenancy import TenantScopeError
 from devai.types import ExecutionAttempt, ModelCandidate
 from test_tenancy_invariants import canonical, _tokenize
@@ -1255,6 +1256,24 @@ class _FakePrice:
     output_per_million_usd = 3
 
 
+def _rollback_price(pricing_key, version=1):
+    """A price snapshot bound to a rollback fixture's generated pricing key.
+
+    ``_FakePrice`` keeps its shared ``"pk"`` default for the many unrelated
+    tests that rely on it. The rollback fixtures instead own a unique
+    pricing row, and production start_metered_attempt looks pricing up by
+    ``price.pricing_key``/``price.version``
+    (reconciliation.py:27), so those tests need an explicitly keyed instance.
+    This is test-only data plumbing: production pricing lookup is untouched.
+    """
+    return ModelPrice(
+        pricing_key=pricing_key,
+        version=version,
+        input_per_million_usd=Decimal(2),
+        output_per_million_usd=Decimal(3),
+    )
+
+
 class _FakeRoute:
     key = "k"
     provider = "p"
@@ -1458,12 +1477,19 @@ class LedgerDatabaseTests(unittest.TestCase):
         because task X does not belong to job A.
         """
         tenant = uuid4()
-        job_a, job_b, task_x = _build_rollback_fixture(self, tenant)
+        (job_a, job_b, task_x,
+         pricing_key, pricing_version) = _build_rollback_fixture(self, tenant)
         amount = Decimal("1.00")
+        # Bind the price snapshot to the row this fixture committed; a shared
+        # "pk" snapshot would fail pricing lookup before statement A.
+        price = _rollback_price(pricing_key, pricing_version)
 
         probe = psycopg.connect(_DB_URL)
         self.addCleanup(probe.close)
         with probe.cursor() as cur:
+            # static pricing gate: identity statement A depends on
+            _assert_rollback_pricing_identity(
+                self, cur, pricing_key, price)
             # preconditions: statement A is genuinely load-bearing
             cur.execute("SELECT 1 FROM jobs WHERE id=%s AND tenant_id=%s",
                         (job_a, tenant))
@@ -1488,7 +1514,7 @@ class LedgerDatabaseTests(unittest.TestCase):
             with self.assertRaises(reconciliation.ReconciliationError):
                 reconciliation.start_metered_attempt(
                     job_id=job_a, task_id=task_x, number=1,
-                    route=_FakeRoute(), model="m", price=_FakePrice(),
+                    route=_FakeRoute(), model="m", price=price,
                     reservation=amount, tenant_id=tenant)
 
         # fresh, different connection; no cleanup has run
@@ -1697,15 +1723,36 @@ class LedgerDatabaseTests(unittest.TestCase):
         # The pricing lookup must succeed against tenant B's real pricing row
         # so the denial below comes from the tenancy/budget path, not from an
         # unconfigured-price short circuit.
+        candidate = ModelCandidate("pk", "p", None, "standard", 1,
+                                   pricing_key="pk", billing_mode="metered")
+        # Production resolves the key as route.pricing_key or route.key
+        # (budgeted_observer.py:83); derive it the same way rather than
+        # hardcoding a second literal that could drift from the candidate.
+        route_pricing_key = candidate.pricing_key or candidate.key
+        self.assertEqual(route_pricing_key, candidate.pricing_key)
         self.ensure_pricing()
-        price = pricing.get_active_price("pk", 1)
-        self.assertIsNotNone(price)
+        row = self.sql(
+            "SELECT pricing_key, version, active FROM model_pricing"
+            " WHERE pricing_key=%s AND active", (route_pricing_key,))
+        self.assertEqual(len(row), 1,
+                         "exactly one active pricing row for the route key")
+        self.assertEqual(row[0][0], route_pricing_key)
 
-        with self.assertRaises(reconciliation.ReconciliationError):
-            observer.attempt_started(
-                1, ModelCandidate("pk", "p", None, "standard", 1,
-                                  pricing_key="pk", billing_mode="metered"),
-                "m")
+        # Real production lookup, with the actual one-argument signature
+        # get_active_price(pricing_key). No mock, no wrapper.
+        price = pricing.get_active_price(route_pricing_key)
+        self.assertEqual(price.pricing_key, route_pricing_key)
+        self.assertEqual(price.version, row[0][1])
+
+        with self.assertRaises(reconciliation.ReconciliationError) as denial:
+            observer.attempt_started(1, candidate, "m")
+
+        # The denial must be the tenancy/budget refusal, not a pricing fault.
+        self.assertNotIsInstance(denial.exception,
+                                 pricing.PricingNotConfigured)
+        self.assertNotIsInstance(denial.exception, TypeError)
+        self.assertNotIsInstance(denial.exception, ValueError)
+        self.assertNotIsInstance(denial.exception, KeyError)
 
         # Independently re-read all three affected surfaces.
         self.assertEqual(self.budget_row(job_b), before_budget)
@@ -2421,8 +2468,14 @@ def _real_connection_factory(test_case, url=None):
 def _build_rollback_fixture(test_case, tenant):
     """Committed rollback fixtures: funded job A plus task X on job B.
 
-    Returns (job_a, job_b, task_x). Statement A qualifies on job A; statement
-    B rejects because task X belongs to job B, not job A.
+    Returns (job_a, job_b, task_x, pricing_key, pricing_version). Statement A
+    qualifies on job A; statement B rejects because task X belongs to job B,
+    not job A.
+
+    The generated pricing_key is returned so callers can bind the price object
+    handed to production to the row this fixture actually committed. Sharing
+    the key with an unrelated price snapshot would raise PricingNotConfigured
+    before statement A could run.
     """
     job_a, job_b, task_x = uuid4(), uuid4(), uuid4()
     # A per-test pricing key, so two rollback tests can never contend on the
@@ -2454,7 +2507,34 @@ def _build_rollback_fixture(test_case, tenant):
     setup.commit()
     test_case.addCleanup(_purge_rollback,
                          (task_x, job_a, job_b, tenant, pricing_key))
-    return job_a, job_b, task_x
+    return (job_a, job_b, task_x, pricing_key, ROLLBACK_PRICING_VERSION)
+
+
+def _assert_rollback_pricing_identity(test_case, cur, pricing_key, price):
+    """Prove the price identity that statement A depends on.
+
+    Production start_metered_attempt looks pricing up by
+    ``price.pricing_key``/``price.version`` and raises
+    METERED_PRICING_UNAVAILABLE before any budget mutation if that lookup
+    misses. Without this gate a pricing mismatch would surface as a pricing
+    error rather than as the statement A/statement B rollback proof the test
+    exists to make, so the identity is checked before production is invoked.
+    """
+    test_case.assertTrue(pricing_key, "generated pricing key must be nonempty")
+    test_case.assertEqual(price.pricing_key, pricing_key,
+                          "price snapshot must carry the fixture's key")
+    cur.execute(
+        "SELECT pricing_key, version, active FROM model_pricing"
+        " WHERE pricing_key=%s", (pricing_key,))
+    rows = cur.fetchall()
+    test_case.assertEqual(len(rows), 1,
+                          f"exactly one pricing row for {pricing_key}: {rows}")
+    row_key, row_version, row_active = rows[0]
+    test_case.assertEqual(row_key, price.pricing_key)
+    test_case.assertEqual(row_version, price.version,
+                          "price.version must match the committed row version")
+    test_case.assertTrue(row_active, "committed pricing row must be active")
+    return price
 
 
 def _purge_rollback(ids):
@@ -2507,11 +2587,17 @@ class StartMeteredRealTransactionTests(unittest.TestCase):
 
         # (1) committed fixtures, with cleanup registered for every row
         # created -- including the committed pricing row.
-        job_a, job_b, task_x = _build_rollback_fixture(self, tenant)
+        (job_a, job_b, task_x,
+         pricing_key, pricing_version) = _build_rollback_fixture(self, tenant)
+        # Bind the price snapshot to the row this fixture committed; a shared
+        # "pk" snapshot would fail pricing lookup before statement A.
+        price = _rollback_price(pricing_key, pricing_version)
         setup = self._fresh()
 
         # (2) mechanical preconditions: statement A is genuinely load-bearing
         with setup.cursor() as cur:
+            # static pricing gate: identity statement A depends on
+            _assert_rollback_pricing_identity(self, cur, pricing_key, price)
             cur.execute("SELECT 1 FROM jobs WHERE id=%s AND tenant_id=%s",
                         (job_a, tenant))
             self.assertIsNotNone(cur.fetchone(),
@@ -2541,7 +2627,7 @@ class StartMeteredRealTransactionTests(unittest.TestCase):
             with self.assertRaises(reconciliation.ReconciliationError):
                 reconciliation.start_metered_attempt(
                     job_id=job_a, task_id=task_x, number=1,
-                    route=_FakeRoute(), model="m", price=_FakePrice(),
+                    route=_FakeRoute(), model="m", price=price,
                     reservation=amount, tenant_id=tenant)
 
         # (4) after-state read from a FRESH connection; no cleanup has run
