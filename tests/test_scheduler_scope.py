@@ -237,6 +237,94 @@ def _is_name(tok, word):
     return tok.kind == "name" and tok.text.upper() == word
 
 
+THREAD_NAMES = frozenset({"first", "second"})
+
+
+def _concurrency_defects(results, shapes):
+    """Reasons a concurrent-duplicate outcome is unacceptable.
+
+    Two valid threads may finish in either order, so nothing here depends on
+    completion order. The requirements remain strict: both calls succeed,
+    no scope error, no unexpected error, and the per-thread SQL shapes form
+    exactly one winner and exactly one loser that ran Statement B.
+    """
+    defects = []
+    if len(results) != 2:
+        defects.append(f"expected 2 results, got {len(results)}")
+    failures = [r for r in results if r[0] != "ok"]
+    if failures:
+        defects.append(f"unexpected failures: {failures}")
+    # Both threads must have succeeded exactly once, in any order.
+    ok_names = [r[1] for r in results if r[0] == "ok"]
+    if len(ok_names) != 2:
+        defects.append(f"expected 2 successes, got {len(ok_names)}")
+    elif set(ok_names) != THREAD_NAMES:
+        defects.append(f"unexpected successful threads: {sorted(ok_names)}")
+    if any(r[2] is not None for r in results if r[0] == "ok"):
+        defects.append("successful result carried an exception payload")
+    # Exact multiset of per-thread statement shapes, order between threads
+    # irrelevant: exactly one ["A"] and exactly one ["A", "B"].
+    observed = sorted(tuple(s) for s in shapes.values())
+    if observed != [("A",), ("A", "B")]:
+        defects.append(f"unexpected statement shapes: {observed}")
+    return defects
+
+
+class ConcurrencyOutcomeOrderTests(unittest.TestCase):
+    """Narrow control over the order-independent outcome check.
+
+    No database and no threads: this pins the assertion logic only, so a
+    future edit cannot reintroduce a fixed completion order or quietly
+    weaken the SQL-shape requirement.
+    """
+
+    def test_reversed_completion_order_is_accepted(self):
+        results = [("ok", "second", None), ("ok", "first", None)]
+        shapes = {"second": ["A", "B"], "first": ["A"]}
+        self.assertEqual(_concurrency_defects(results, shapes), [])
+
+    def test_forward_completion_order_is_accepted(self):
+        results = [("ok", "first", None), ("ok", "second", None)]
+        shapes = {"first": ["A"], "second": ["A", "B"]}
+        self.assertEqual(_concurrency_defects(results, shapes), [])
+
+    def test_reversed_winner_roles_are_accepted(self):
+        """Either thread may be the one that only ran Statement A."""
+        results = [("ok", "first", None), ("ok", "second", None)]
+        shapes = {"first": ["A", "B"], "second": ["A"]}
+        self.assertEqual(_concurrency_defects(results, shapes), [])
+
+    def test_missing_result_is_rejected(self):
+        results = [("ok", "first", None)]
+        shapes = {"first": ["A"]}
+        self.assertNotEqual(_concurrency_defects(results, shapes), [])
+
+    def test_duplicate_same_thread_result_is_rejected(self):
+        results = [("ok", "first", None), ("ok", "first", None)]
+        shapes = {"first": ["A"], "second": ["A", "B"]}
+        self.assertNotEqual(_concurrency_defects(results, shapes), [])
+
+    def test_duplicate_statement_shapes_are_rejected(self):
+        cases = [
+            ({"first": ["A"], "second": ["A"]}, "both winners, no loser"),
+            ({"first": ["A", "B"], "second": ["A", "B"]}, "both losers"),
+        ]
+        results = [("ok", "first", None), ("ok", "second", None)]
+        for shapes, label in cases:
+            with self.subTest(shapes=label):
+                self.assertNotEqual(
+                    _concurrency_defects(results, shapes), [], label
+                )
+
+    def test_scope_error_result_is_rejected(self):
+        results = [
+            ("ok", "first", None),
+            ("scope_error", "second", "Dependency is not in tenant scope"),
+        ]
+        shapes = {"first": ["A"], "second": ["A"]}
+        self.assertNotEqual(_concurrency_defects(results, shapes), [])
+
+
 class SchedulerSignatureTests(unittest.TestCase):
     TARGETS = ("set_task_status", "add_dependency")
 
@@ -1024,11 +1112,6 @@ class AddDependencyDatabaseTests(unittest.TestCase):
             "second thread never issued Statement A: no real contention",
         )
         self.assertEqual(len(results), 2, results)
-        self.assertEqual([r for r in results if r[0] == "ok"],
-                         [("ok", "first", None), ("ok", "second", None)], results)
-        self.assertEqual([r for r in results if r[0] == "scope_error"], [])
-        self.assertEqual([r for r in results if r[0] == "error"], [])
-
         shapes = {
             name: [
                 "A" if "ON CONFLICT" in sql.upper() else "B"
@@ -1037,11 +1120,11 @@ class AddDependencyDatabaseTests(unittest.TestCase):
             for name, entries in logs.items()
         }
         self.assertEqual(
-            sorted(shapes.values()),
-            [["A"], ["A", "B"]],
-            f"expected one winner and one loser running Statement B: {shapes}",
+            _concurrency_defects(results, shapes),
+            [],
+            f"unexpected concurrency outcome: results={results} shapes={shapes}",
         )
-        loser = [n for n, s in shapes.items() if s == ["A", "B"]][0]
+        loser = [n for n, s in shapes.items() if list(s) == ["A", "B"]][0]
         loser_sql = " ".join(logs[loser])
         self.assertIn("ON CONFLICT", loser_sql.upper())
         self.assertIn("task_dependencies", loser_sql)
