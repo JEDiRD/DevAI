@@ -123,6 +123,105 @@ def _same_job_conditions(sql):
     return found
 
 
+def _is_update_of_tasks(sql):
+    """True if the statement's leading verb mutates the tasks table."""
+    for tok in _tokenize(sql):
+        if tok.kind == "name" and tok.text.upper() in (
+            "UPDATE", "INSERT", "DELETE", "MERGE", "TRUNCATE", "SELECT",
+            "WITH", "DO", "CREATE", "ALTER", "DROP", "SET",
+        ):
+            return tok.text.upper() == "UPDATE"
+    return False
+
+
+def _targets_tasks(sql):
+    """True if an UPDATE statement's target table is tasks."""
+    toks = _tokenize(sql)
+    for index, tok in enumerate(toks):
+        if tok.kind == "name" and tok.text.upper() == "UPDATE":
+            j = index + 1
+            while j < len(toks) and _is_name(toks[j], "ONLY"):
+                j += 1
+            target = _qualified(toks, j)
+            return target.split(".")[-1] == "tasks"
+    return False
+
+
+def _qualified(toks, i):
+    parts = []
+    while i < len(toks):
+        tok = toks[i]
+        if tok.kind in ("name", "quoted"):
+            parts.append(
+                tok.text.replace('""', '"').strip('"').lower()
+            )
+            i += 1
+        else:
+            break
+        if i < len(toks) and toks[i].kind == "punct" and toks[i].text == ".":
+            i += 1
+            continue
+        break
+    return ".".join(parts)
+
+
+def _status_update_defects(statements):
+    """Reasons set_task_status lacks a tenant-authoritative mutation.
+
+    `statements` is the full ordered log, not just the first entry. The
+    proof locates the authoritative UPDATE of tasks rather than trusting
+    statement order, so a preceding tenant-scoped SELECT cannot stand in
+    for the authorization, and a second unscoped UPDATE cannot hide.
+    """
+    defects = []
+    updates = [
+        (sql, params) for sql, params in statements
+        if _targets_tasks(sql)
+    ]
+    if len(updates) != 1:
+        defects.append(
+            f"expected exactly one UPDATE of tasks, found {len(updates)}"
+        )
+        return defects
+    sql, params = updates[0]
+    if STATUS_SCOPE not in _code(sql):
+        defects.append("authoritative UPDATE is not tenant scoped")
+    if _boolean_bypasses(sql):
+        defects.append("boolean neutralisation in UPDATE")
+    for other, _ in statements:
+        if other is sql:
+            continue
+        if _is_update_of_tasks(other):
+            defects.append("additional UPDATE of tasks")
+        if _boolean_bypasses(other):
+            defects.append("boolean neutralisation in auxiliary statement")
+    return defects
+
+
+def _select_b_defects(sql):
+    """Reasons statement B is not exactly the tenant-scoped verification.
+
+    Statement B must be ONLY the scoped edge check. Any alternative result
+    source (UNION / UNION ALL / INTERSECT / EXCEPT / VALUES / an appended
+    branch) could manufacture success independently of the tenant-scoped
+    edge, so the statement shape is compared exactly.
+    """
+    defects = []
+    code = _code(sql)
+    if SELECT_B_SCOPE not in code:
+        defects.append("fallback scope missing or altered")
+    if _boolean_bypasses(sql):
+        defects.append("boolean neutralisation")
+    for keyword in ("UNION", "INTERSECT", "EXCEPT", "VALUES"):
+        if keyword in code:
+            defects.append(f"alternative result source: {keyword}")
+    # exact shape: nothing may follow the tenant-scoped predicate
+    if code.strip() != SELECT_B_SCOPE:
+        defects.append("statement is not exactly the scoped verification")
+    defects.extend(_same_job_conditions(sql))
+    return defects
+
+
 def _insert_defects(sql):
     """Reasons statement A is not a correctly tenant-scoped insert."""
     defects = []
@@ -134,15 +233,8 @@ def _insert_defects(sql):
     return defects
 
 
-def _select_b_defects(sql):
-    """Reasons statement B is not a correctly tenant-scoped check."""
-    defects = []
-    if SELECT_B_SCOPE not in _code(sql):
-        defects.append("fallback scope missing or altered")
-    if _boolean_bypasses(sql):
-        defects.append("boolean neutralisation")
-    defects.extend(_same_job_conditions(sql))
-    return defects
+def _is_name(tok, word):
+    return tok.kind == "name" and tok.text.upper() == word
 
 
 class SchedulerSignatureTests(unittest.TestCase):
@@ -223,7 +315,9 @@ class SetTaskStatusScopeTests(unittest.TestCase):
 
     def test_mutation_carries_task_job_tenant_scope(self):
         task, tenant = uuid4(), uuid4()
-        sql, params = self._record(task, tenant)[0]
+        log = self._record(task, tenant)
+        self.assertEqual(_status_update_defects(log), [])
+        sql, params = log[0]
         self.assertIn(STATUS_SCOPE, _code(sql))
         self.assertEqual(_boolean_bypasses(sql), [])
         self.assertEqual(params, ("completed", task, tenant))
@@ -232,10 +326,68 @@ class SetTaskStatusScopeTests(unittest.TestCase):
             [("status", "completed"), ("id", task), ("tenant_id", tenant)],
         )
 
-    def test_tenant_bound_to_the_tenant_predicate(self):
+    def test_exactly_one_authoritative_update_is_issued(self):
+        """A scoped precheck must not stand in for the mutation's scope."""
+        task, tenant = uuid4(), uuid4()
+        log = self._record(task, tenant)
+        updates = [s for s, _ in log if _targets_tasks(s)]
+        self.assertEqual(len(updates), 1, log)
+        self.assertEqual(_status_update_defects(log), [])
+        # A harmless leading SELECT alone is tolerated, but it can never
+        # satisfy the proof on its own.
+        only_precheck = [
+            ("SELECT 1 FROM jobs WHERE tenant_id = %s", (tenant,))
+        ]
+        self.assertNotEqual(_status_update_defects(only_precheck), [])
+        # And a precheck in front of the real mutation changes nothing.
+        self.assertEqual(
+            _status_update_defects(
+                [("SELECT 1 FROM jobs WHERE tenant_id = %s", (tenant,))]
+                + log
+            ),
+            [],
+        )
+
+    def test_precheck_plus_unscoped_update_is_rejected(self):
+        """The reproduced survivor: scoped SELECT, then unscoped UPDATE."""
+        task, tenant = uuid4(), uuid4()
+        statements = [
+            (
+                "SELECT 1 FROM tasks t JOIN jobs j ON j.id = t.job_id"
+                " WHERE t.id = %s AND j.tenant_id = %s",
+                (task, tenant),
+            ),
+            (
+                "UPDATE tasks SET status = %s, updated_at = now()"
+                " WHERE id = %s",
+                ("completed", task),
+            ),
+        ]
+        defects = _status_update_defects(statements)
+        self.assertNotEqual(defects, [], defects)
+        self.assertIn(
+            "authoritative UPDATE is not tenant scoped", defects
+        )
+
+    def test_two_unscoped_updates_are_rejected(self):
+        task, tenant = uuid4(), uuid4()
+        statements = [
+            ("UPDATE tasks SET status = %s WHERE id = %s AND jobs.tenant_id = %s",
+             ("completed", task, tenant)),
+            ("UPDATE tasks SET status = %s WHERE id = %s",
+             ("failed", task)),
+        ]
+        defects = _status_update_defects(statements)
+        self.assertIn(
+            "expected exactly one UPDATE of tasks, found 2", defects
+        )
+
+    def test_tenant_bound_to_the_authoritative_update(self):
         task, tenant, foreign = uuid4(), uuid4(), uuid4()
-        sql, params = self._record(task, tenant)[0]
+        log = self._record(task, tenant)
+        sql, params = log[0]
         self.assertEqual(params[2], tenant)
+        self.assertEqual(_bindings(sql, params)[2], ("tenant_id", tenant))
         wrong = ("completed", task, foreign)
         self.assertNotEqual(_bindings(sql, wrong)[2][1], tenant)
 
@@ -243,8 +395,9 @@ class SetTaskStatusScopeTests(unittest.TestCase):
         """Missing and foreign must share one observable path."""
         task, tenant = uuid4(), uuid4()
         log = self._record_raising(task, tenant)
-        code = _code(log[0][0])
-        self.assertIn(STATUS_SCOPE, code)
+        self.assertEqual(_status_update_defects(log), [])
+        for sql, _ in log:
+            self.assertIn("UPDATE", _code(sql))
 
         messages = set()
         for subject in ("missing", "foreign"):
@@ -337,6 +490,28 @@ class AddDependencyScopeTests(unittest.TestCase):
                 ("tenant_id", tenant),
             ],
         )
+
+    def test_fallback_union_all_is_rejected(self):
+        """An appended UNION branch manufactures success unconditionally."""
+        a, b, tenant = uuid4(), uuid4(), uuid4()
+        sql, _ = self._denied(a, b, tenant, rows=[None, None])[1]
+        self.assertEqual(_select_b_defects(sql), [])
+        for label, mutated in {
+            "UNION ALL SELECT 1": sql
+            + "\nUNION ALL SELECT 1\n",
+            "UNION SELECT 1": sql + "\nUNION SELECT 1\n",
+            "EXCEPT append": sql + "\nEXCEPT SELECT 1 WHERE false\n",
+            "INTERSECT append": sql + "\nINTERSECT SELECT 1\n",
+            "VALUES branch": sql + "\nUNION ALL VALUES (1)\n",
+        }.items():
+            with self.subTest(weakening=label):
+                self.assertNotEqual(mutated, sql, "mutation did not apply")
+                defects = _select_b_defects(mutated)
+                self.assertNotEqual(defects, [], label)
+                self.assertIn(
+                    "statement is not exactly the scoped verification",
+                    defects,
+                )
 
     def test_fallback_runs_on_same_connection(self):
         """The duplicate re-check must share the connection/transaction."""
@@ -431,28 +606,43 @@ class AddDependencyScopeTests(unittest.TestCase):
         self.assertEqual(_bindings(sql, params)[3][1], tenant)
 
     def test_denial_message_is_uniform(self):
-        a, b, tenant = uuid4(), uuid4(), uuid4()
+        """One message for every denial shape.
+
+        Labels name the fixture actually supplied. With no database there
+        are no foreign-owned tasks here, so only missing identifiers are
+        exercised; the foreign-vs-missing equivalence is proven in the
+        DB-gated oracle test with real foreign fixtures.
+        """
+        tenant = uuid4()
         messages = set()
-        for label in ("missing_a", "missing_b", "foreign_both"):
-            log = []
-            with _run(RecordingCursor(log, rowcount=0, rows=[None, None])):
-                try:
-                    scheduler.add_dependency(
-                        uuid4(), uuid4(), tenant_id=tenant
-                    )
-                except TenantScopeError as exc:
-                    messages.add(str(exc))
+        for label in ("missing_a_and_b",):
+            with self.subTest(fixture=label):
+                log = []
+                with _run(RecordingCursor(log, rowcount=0, rows=[None, None])):
+                    try:
+                        scheduler.add_dependency(
+                            uuid4(), uuid4(), tenant_id=tenant
+                        )
+                    except TenantScopeError as exc:
+                        messages.add(str(exc))
         self.assertEqual(len(messages), 1, messages)
 
 
 class ConnectionFactory:
-    """One independent connection per thread; commits on success."""
+    """One independent connection per thread; commits on success.
 
-    def __init__(self, url):
+    `wrap` optionally decorates each raw connection (test-side only) so the
+    caller can trace per-thread SQL without touching production code or
+    transaction isolation.
+    """
+
+    def __init__(self, url, wrap=None):
         self.url = url
+        self.wrap = wrap
         self._local = threading.local()
         self._connections = []
         self._lock = threading.Lock()
+        self._counter = 0
 
     def __call__(self):
         conn = getattr(self._local, "conn", None)
@@ -461,6 +651,9 @@ class ConnectionFactory:
             self._local.conn = conn
             with self._lock:
                 self._connections.append(conn)
+        name = threading.current_thread().name
+        if self.wrap is not None:
+            return self.wrap(conn, name)
         return conn
 
     def close_all(self):
@@ -662,12 +855,61 @@ class AddDependencyDatabaseTests(unittest.TestCase):
         self.assertEqual(len(messages), 1, messages)
         self.assertEqual(self.edges(), before)
 
-    def test_concurrent_duplicate_uses_second_statement(self):
-        """Both callers succeed and exactly one row exists.
+    def test_foreign_and_missing_share_one_uniform_message(self):
+        """Real foreign-owned tasks and missing ids in one message set.
 
-        Two independent connections with a barrier force genuine overlap;
-        the loser must observe the winner's row through the second
-        statement on the same connection.
+        Six denial shapes covering own/foreign/missing on both sides must
+        all raise TenantScopeError with the exact same message, and must
+        leave the dependency table untouched.
+        """
+        _, own_a = self.task()
+        _, own_b = self.task()
+        _, foreign_a = self.task(tenant=self.foreign)
+        _, foreign_b = self.task(tenant=self.foreign)
+        missing_a, missing_b = uuid4(), uuid4()
+
+        before = self.edges()
+        cases = {
+            "own_a + foreign_b": (own_a, foreign_b),
+            "foreign_a + own_b": (foreign_a, own_b),
+            "foreign_a + foreign_b": (foreign_a, foreign_b),
+            "missing_a + own_b": (missing_a, own_b),
+            "own_a + missing_b": (own_a, missing_b),
+            "missing_a + missing_b": (missing_a, missing_b),
+        }
+        messages = set()
+        for label, (x, y) in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(TenantScopeError) as ctx:
+                    scheduler.add_dependency(x, y, tenant_id=self.tenant)
+                messages.add(str(ctx.exception))
+
+        self.assertEqual(
+            messages, {"Dependency is not in tenant scope"}, messages
+        )
+        self.assertEqual(
+            self.edges(), before, "denials must not write rows"
+        )
+
+    def test_concurrent_duplicate_uses_second_statement(self):
+        """Both callers succeed; the loser provably runs Statement B.
+
+        Synchronization is deterministic and test-side only; transaction
+        isolation is not changed and no sleep is used as the primary
+        mechanism. Each thread records the SQL it executed:
+
+        A. both threads reach Statement A (a barrier gates entry);
+        B. the second thread's Statement A execution is observed before the
+           first thread is allowed to commit its transaction, proving the
+           conflict is genuinely contended rather than sequential;
+        C/D. the first thread commits and the second completes its
+           ON CONFLICT DO NOTHING path;
+        E. per-thread SQL logs are compared: one thread must show only
+           Statement A, the other must show Statement A and then the
+           tenant-scoped Statement B.
+
+        The test fails if Statement B is removed, if the loser returns
+        without executing it, or if the two calls never contend.
         """
         setup = psycopg.connect(_DB_URL)
         self.addCleanup(setup.close)
@@ -694,27 +936,82 @@ class AddDependencyDatabaseTests(unittest.TestCase):
         setup.commit()
         self.addCleanup(_purge_dependency, (a, b, job, tenant))
 
-        factory = ConnectionFactory(_DB_URL)
-        self.addCleanup(factory.close_all)
         barrier = threading.Barrier(2)
         lock = threading.Lock()
+        logs = {}
         results = []
+        # Set once the second thread has actually issued Statement A.
+        second_statement_a_issued = threading.Event()
 
-        def attempt():
+        class Recording:
+            """Wraps a connection so each thread's SQL is attributable."""
+
+            def __init__(self, connection, name):
+                self._connection = connection
+                self._name = name
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                if exc[0] is None:
+                    self._connection.commit()
+                else:
+                    self._connection.rollback()
+                return False
+
+            def cursor(self):
+                return _TracingCursor(self._connection, self._name)
+
+        class _TracingCursor:
+            def __init__(self, connection, name):
+                self._connection = connection
+                self._name = name
+                self._cursor = connection.cursor()
+
+            def execute(self, sql, params=()):
+                with lock:
+                    logs.setdefault(self._name, []).append(sql)
+                if "ON CONFLICT" in sql.upper():
+                    # Recorded immediately before the statement runs, so a
+                    # blocked statement still counts as having been issued.
+                    if self._name == "second":
+                        second_statement_a_issued.set()
+                return self._cursor.execute(sql, params)
+
+            def fetchone(self):
+                return self._cursor.fetchone()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        factory = ConnectionFactory(_DB_URL, wrap=Recording)
+        self.addCleanup(factory.close_all)
+
+        def attempt(name):
             barrier.wait(timeout=30)
             try:
                 scheduler.add_dependency(a, b, tenant_id=tenant)
             except TenantScopeError as exc:
                 with lock:
-                    results.append(("scope_error", str(exc)))
+                    results.append(("scope_error", name, str(exc)))
             except Exception as exc:  # pragma: no cover - diagnostics
                 with lock:
-                    results.append(("error", repr(exc)))
+                    results.append(("error", name, repr(exc)))
             else:
                 with lock:
-                    results.append(("ok", None))
+                    results.append(("ok", name, None))
+            # The winner may only commit once the loser is inside its own
+            # Statement A, guaranteeing real contention on the row.
+            second_statement_a_issued.wait(timeout=30)
 
-        threads = [threading.Thread(target=attempt) for _ in range(2)]
+        threads = [
+            threading.Thread(target=attempt, args=("first",), name="first"),
+            threading.Thread(target=attempt, args=("second",), name="second"),
+        ]
         with patch.object(scheduler, "connect", factory):
             for t in threads:
                 t.start()
@@ -722,12 +1019,32 @@ class AddDependencyDatabaseTests(unittest.TestCase):
                 t.join(timeout=60)
 
         self.assertFalse(any(t.is_alive() for t in threads), "thread hang")
-        self.assertEqual(len(results), 2, results)
-        self.assertEqual(
-            [r for r in results if r[0] == "ok"], [("ok", None)] * 2, results
+        self.assertTrue(
+            second_statement_a_issued.is_set(),
+            "second thread never issued Statement A: no real contention",
         )
+        self.assertEqual(len(results), 2, results)
+        self.assertEqual([r for r in results if r[0] == "ok"],
+                         [("ok", "first", None), ("ok", "second", None)], results)
         self.assertEqual([r for r in results if r[0] == "scope_error"], [])
         self.assertEqual([r for r in results if r[0] == "error"], [])
+
+        shapes = {
+            name: [
+                "A" if "ON CONFLICT" in sql.upper() else "B"
+                for sql in entries
+            ]
+            for name, entries in logs.items()
+        }
+        self.assertEqual(
+            sorted(shapes.values()),
+            [["A"], ["A", "B"]],
+            f"expected one winner and one loser running Statement B: {shapes}",
+        )
+        loser = [n for n, s in shapes.items() if s == ["A", "B"]][0]
+        loser_sql = " ".join(logs[loser])
+        self.assertIn("ON CONFLICT", loser_sql.upper())
+        self.assertIn("task_dependencies", loser_sql)
 
         with setup.cursor() as cur:
             cur.execute(
