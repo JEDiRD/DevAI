@@ -1,4 +1,5 @@
 import ast
+import threading
 """F-05 ledger lifecycle tenant isolation.
 
 Structural (no database) tests execute the real functions against recording
@@ -1525,27 +1526,41 @@ class LedgerDatabaseTests(unittest.TestCase):
                      " WHERE attempt_id=%s", (attempt,))[0][0], before_cases)
 
     def test_sweep_uses_each_resource_own_tenant(self):
-        """Two genuinely eligible attempts, each opened with its own tenant."""
+        """Two genuinely eligible attempts, each opened with its own tenant.
+
+        Fixture order matters: attempts are created and started, then
+        accounting_due_at is moved into the past, and only then is
+        eligibility independently asserted BEFORE sweep runs.
+        """
         job_a, task_a = self.metered_fixture(self.tenant)
         job_b, task_b = self.metered_fixture(self.foreign)
         attempt_a = self._start(job_a, task_a, self.tenant)
         attempt_b = self._start(job_b, task_b, self.foreign)
 
-        # Both candidates must satisfy the UNCHANGED sweep predicates, so
-        # the test cannot pass merely because neither was eligible.
-        eligible = self.sql(
-            "SELECT a.id FROM execution_attempts a"
-            " WHERE a.billing_mode='metered' AND a.status='running'"
-            " AND a.accounting_due_at<=clock_timestamp()"
-            " AND a.reserved_cost_usd IS NOT NULL AND a.id IN (%s,%s)",
-            (attempt_a, attempt_b))
-        self.assertEqual(len(eligible), 2,
-                         "both attempts must be sweep-eligible up-front")
-
+        # (2) satisfy the existing sweep eligibility condition
         self.sql("UPDATE execution_attempts SET accounting_due_at="
                  "clock_timestamp()-interval '1 second' WHERE id IN (%s,%s)",
                  (attempt_a, attempt_b))
 
+        # (3)/(4) independently prove BOTH candidates are eligible now,
+        # before any sweep call, so the test cannot pass by selecting none.
+        eligible = self.sql(
+            "SELECT a.id FROM execution_attempts a"
+            " WHERE a.billing_mode='metered' AND a.status='running'"
+            " AND a.accounting_due_at<=clock_timestamp()"
+            " AND a.reserved_cost_usd IS NOT NULL AND a.id IN (%s,%s)"
+            " ORDER BY a.id", (attempt_a, attempt_b))
+        self.assertEqual(
+            [row[0] for row in eligible],
+            sorted([attempt_a, attempt_b]),
+            "both attempts must be sweep-eligible before the call")
+        self.assertEqual(
+            self.sql("SELECT count(*) FROM metered_reconciliations"
+                     " WHERE attempt_id IN (%s,%s)",
+                     (attempt_a, attempt_b))[0][0],
+            0, "no case may exist before the sweep")
+
+        # (5) only now invoke the reaper
         counts = reconciliation.sweep()
         self.assertEqual(counts["opened"], 2)
 
@@ -1646,6 +1661,432 @@ class LedgerDatabaseTests(unittest.TestCase):
             before_attempts)
 
 
+def _neutralization_defects(sql):
+    """Obvious boolean neutralization in ONE normalized SQL statement.
+
+    Narrow by design: reports only OR immediately followed by TRUE or by the
+    literal 1 (covering OR TRUE, OR 1=1 and OR 1 = 1). Numeric literals lex as
+    ``number`` tokens, so both name and number tokens are considered. Applied
+    to a single known authoritative statement, never to arbitrary source text.
+    """
+    tokens = [
+        t.text.upper() for t in _tokenize(sql)
+        if t.kind in ("name", "number")
+    ]
+    defects = []
+    for index, token in enumerate(tokens[:-1]):
+        if token == "OR" and tokens[index + 1] in ("TRUE", "1"):
+            defects.append(f"OR {tokens[index + 1]}")
+    return defects
+
+
+def _open_statements_by_purpose(log):
+    """Classify the ordered _open SQL log by statement purpose.
+
+    Classification is by normalized statement shape so each security-relevant
+    statement can be asserted individually, instead of searching for a
+    fragment anywhere in the log.
+    """
+    purposes = {
+        "initial_lookup": None,
+        "authorization_gate": None,
+        "race_recheck": None,
+        "case_insert": None,
+        "budget_update": None,
+        "attempt_update": None,
+        "event": None,
+    }
+    for sql, params in log:
+        code = _code(sql)
+        if "METERED_RECONCILIATION_EVENTS" in code:
+            purposes["event"] = (sql, params)
+        elif "UPDATE JOB_BUDGETS" in code:
+            purposes["budget_update"] = (sql, params)
+        elif "UPDATE EXECUTION_ATTEMPTS" in code:
+            purposes["attempt_update"] = (sql, params)
+        elif "INSERT INTO METERED_RECONCILIATIONS" in code:
+            purposes["case_insert"] = (sql, params)
+        elif "FOR UPDATE OF A" in code:
+            purposes["authorization_gate"] = (sql, params)
+        elif code.startswith("SELECT M . ID FROM METERED_RECONCILIATIONS M"):
+            if purposes["initial_lookup"] is None:
+                purposes["initial_lookup"] = (sql, params)
+            else:
+                purposes["race_recheck"] = (sql, params)
+    return purposes
+
+
+class ActualEmittedStatementTests(unittest.TestCase):
+    """Assert on the statements production ACTUALLY emits.
+
+    The earlier controls inspected only hypothetical mutated copies, so an
+    actual bypass in emitted SQL stayed unproven.
+    """
+
+    def _emit(self, call, table):
+        tenant = uuid4()
+        log = []
+        with _patched(ledger, RecordingCursor(log, 1)):
+            call(tenant)
+        updates = [e for e in log if _targets(e[0], table, "UPDATE")]
+        self.assertEqual(len(updates), 1, f"expected one {table} UPDATE")
+        return updates[0], tenant
+
+    def _complete_job(self):
+        tenant, job = uuid4(), uuid4()
+        log = []
+        with _patched(ledger, RecordingCursor(log, 1)):
+            ledger.complete_job(job, tenant_id=tenant)
+        updates = [e for e in log if _targets(e[0], "jobs", "UPDATE")]
+        self.assertEqual(len(updates), 1)
+        return updates[0], tenant, job
+
+    def _complete_task(self):
+        tenant, task = uuid4(), uuid4()
+        log = []
+        with _patched(ledger, RecordingCursor(log, 1)):
+            ledger.complete_task(task, tenant_id=tenant)
+        updates = [e for e in log if _targets(e[0], "tasks", "UPDATE")]
+        self.assertEqual(len(updates), 1)
+        return updates[0], tenant, task
+
+    def _finish(self):
+        tenant, attempt = uuid4(), uuid4()
+        log = []
+        with _patched(ledger, RecordingCursor(log, 1)):
+            ledger.finish_attempt(attempt, True, tenant_id=tenant)
+        updates = [e for e in log
+                   if _targets(e[0], "execution_attempts", "UPDATE")]
+        self.assertEqual(len(updates), 1)
+        return updates[0], tenant, attempt
+
+    # ---- complete_job ----
+    def test_complete_job_emitted_update_is_scoped(self):
+        (sql, params), tenant, job = self._complete_job()
+        self.assertIn(COMPLETE_JOB_SCOPE, _code(sql))
+        self.assertEqual(params, (job, tenant))
+        self.assertEqual(_neutralization_defects(sql), [])
+
+    def test_complete_job_emitted_update_would_reject_or_bypasses(self):
+        (sql, _), _, _ = self._complete_job()
+        for bypass in ("OR TRUE", "OR 1=1", "OR 1 = 1"):
+            mutated = sql.replace("AND tenant_id = %s",
+                                  f"AND tenant_id = %s {bypass}")
+            self.assertNotEqual(mutated, sql, "mutation did not apply")
+            self.assertNotEqual(
+                _neutralization_defects(mutated), [],
+                f"{bypass} on the emitted UPDATE was not detected")
+
+    # ---- complete_task ----
+    def test_complete_task_emitted_update_is_scoped(self):
+        (sql, params), tenant, task = self._complete_task()
+        self.assertIn(COMPLETE_TASK_SCOPE, _code(sql))
+        self.assertEqual(params, (task, tenant))
+        self.assertEqual(_neutralization_defects(sql), [])
+
+    # ---- finish_attempt ----
+    def test_finish_attempt_emitted_update_is_scoped(self):
+        (sql, params), tenant, attempt = self._finish()
+        self.assertIn(FINISH_GUARD, _code(sql))
+        self.assertEqual(params, ("succeeded", None, attempt, tenant))
+        self.assertEqual(_neutralization_defects(sql), [])
+
+    def test_finish_attempt_emitted_update_would_reject_or_true(self):
+        (sql, _), _, _ = self._finish()
+        mutated = sql.replace("AND j.tenant_id = %s",
+                              "AND j.tenant_id = %s OR TRUE")
+        self.assertNotEqual(mutated, sql)
+        self.assertNotEqual(
+            _neutralization_defects(mutated), [],
+            "OR TRUE on the emitted UPDATE was not detected")
+
+
+class OpenPurposeStatementTests(unittest.TestCase):
+    """O1-O9 against the actual emitted _open statements."""
+
+    def _log(self, owner_job=None, attributed=None):
+        log = []
+        tenant = uuid4()
+        job = owner_job or uuid4()
+        rows = [None,
+                (job, attributed or uuid4(), Decimal(1), "metered",
+                 "running"),
+                None]
+        cursor = SelectiveCursor(log, rows=rows, insert_rowcount=1)
+        with _patched(reconciliation, cursor):
+            reconciliation._open(cursor, uuid4(), tenant_id=tenant)
+        return log, tenant, job
+
+    def _all(self):
+        log, tenant, job = self._log()
+        return _open_statements_by_purpose(log), tenant, job
+
+    def test_purposes_are_classified(self):
+        purposes, _, _ = self._all()
+        for name in ("initial_lookup", "authorization_gate", "race_recheck",
+                     "case_insert", "budget_update", "attempt_update"):
+            self.assertIsNotNone(purposes[name], f"{name} not classified")
+
+    def _assert_unneutralised(self, sql, label):
+        self.assertEqual(
+            _neutralization_defects(sql), [],
+            f"{label} carries boolean neutralization")
+
+    def _mutate_or_true_is_detected(self, sql, label):
+        mutated = sql.replace("AND j.tenant_id=%s",
+                              "AND j.tenant_id=%s OR TRUE")
+        self.assertNotEqual(mutated, sql, f"{label}: mutation did not apply")
+        self.assertNotEqual(
+            _neutralization_defects(mutated), [],
+            f"{label}: OR TRUE not detected")
+
+    def test_O1_initial_lookup(self):
+        purposes, tenant, _ = self._all()
+        sql, params = purposes["initial_lookup"]
+        self.assertIn("J . TENANT_ID = %S", _code(sql))
+        self.assertIn(("tenant_id", tenant), _bindings(sql, params))
+        self._assert_unneutralised(sql, "initial lookup")
+        self._mutate_or_true_is_detected(sql, "initial lookup")
+
+    def test_O2_authorization_gate(self):
+        purposes, tenant, _ = self._all()
+        sql, params = purposes["authorization_gate"]
+        self.assertIn("J . TENANT_ID = %S", _code(sql))
+        self.assertIn(("tenant_id", tenant), _bindings(sql, params))
+        self._assert_unneutralised(sql, "authorization gate")
+        self._mutate_or_true_is_detected(sql, "authorization gate")
+
+    def test_O3_case_insert_guard_or_true(self):
+        purposes, tenant, job = self._all()
+        sql, params = purposes["case_insert"]
+        self.assertIn(OPEN_CASE, _code(sql))
+        self.assertIn(("tenant_id", tenant), _bindings(sql, params))
+        self._assert_unneutralised(sql, "case INSERT")
+        self._mutate_or_true_is_detected(sql, "case INSERT")
+
+    def test_O4_case_insert_guard_or_one_eq_one(self):
+        purposes, tenant, job = self._all()
+        sql, _ = purposes["case_insert"]
+        for bypass in ("OR 1=1", "OR 1 = 1"):
+            mutated = sql.replace("AND j.tenant_id=%s",
+                                  f"AND j.tenant_id=%s {bypass}")
+            self.assertNotEqual(mutated, sql, "mutation did not apply")
+            self.assertNotEqual(
+                _neutralization_defects(mutated), [],
+                f"case INSERT: {bypass} not detected")
+
+    def test_O5_budget_update_or_true(self):
+        purposes, tenant, job = self._all()
+        sql, params = purposes["budget_update"]
+        self.assertIn(OPEN_BUDGET, _code(sql))
+        self.assertIn(("tenant_id", tenant), _bindings(sql, params))
+        self._assert_unneutralised(sql, "budget UPDATE")
+        self._mutate_or_true_is_detected(sql, "budget UPDATE")
+
+    def test_O6_attempt_update_or_true(self):
+        purposes, tenant, job = self._all()
+        sql, params = purposes["attempt_update"]
+        self.assertIn(OPEN_ATTEMPT, _code(sql))
+        self.assertIn(("tenant_id", tenant), _bindings(sql, params))
+        self._assert_unneutralised(sql, "attempt UPDATE")
+        self._mutate_or_true_is_detected(sql, "attempt UPDATE")
+
+    def test_O7_inserted_attempt_bound_correctly(self):
+        purposes, tenant, job = self._all()
+        sql, params = purposes["attempt_update"]
+        bindings = _bindings(sql, params)
+        self.assertEqual(bindings[-1], ("tenant_id", tenant))
+        self.assertEqual(bindings[0], ("id", bindings[0][1]))
+
+    def test_O8_case_exists_job_bound_correctly(self):
+        owner_job = uuid4()
+        log, tenant, job = self._log(owner_job=owner_job)
+        purposes = _open_statements_by_purpose(log)
+        sql, params = purposes["case_insert"]
+        gate = _bindings(sql, params)[-3:]
+        self.assertEqual([i for i, _ in gate], ["id", "job_id", "tenant_id"])
+        self.assertEqual(gate[1][1], owner_job)
+        self.assertEqual(gate[2][1], tenant)
+        wrong = list(params)
+        wrong[-2] = uuid4()
+        self.assertNotEqual(
+            _bindings(sql, tuple(wrong))[-2][1], owner_job)
+
+    def test_O9_budget_update_binds_the_authorized_job(self):
+        """Sentinel UUIDs: a wrong job cannot coincide with another value."""
+        owner_job = uuid4()
+        attributed = uuid4()
+        other_job = uuid4()
+        log, tenant, job = self._log(owner_job=owner_job,
+                                    attributed=attributed)
+        self.assertEqual(job, owner_job)
+        purposes = _open_statements_by_purpose(log)
+        gate_sql, gate_params = purposes["authorization_gate"]
+        budget_sql, budget_params = purposes["budget_update"]
+
+        self.assertIn(("tenant_id", tenant),
+                      _bindings(gate_sql, gate_params))
+
+        job_slots = [value for ident, value
+                     in _bindings(budget_sql, budget_params)
+                     if ident == "job_id"]
+        self.assertTrue(job_slots, "budget UPDATE has no job_id binding")
+        for value in job_slots:
+            self.assertEqual(
+                value, owner_job,
+                "budget UPDATE must bind the authorized job")
+        self.assertNotIn(other_job, budget_params)
+        self.assertNotIn(attributed, budget_params)
+        self.assertIn(("tenant_id", tenant),
+                      _bindings(budget_sql, budget_params))
+
+    def test_O9_wrong_budget_job_is_detected(self):
+        owner_job = uuid4()
+        log, tenant, job = self._log(owner_job=owner_job)
+        purposes = _open_statements_by_purpose(log)
+        sql, params = purposes["budget_update"]
+        bindings = _bindings(sql, params)
+        slot = [i for i, (ident, _) in enumerate(bindings)
+                if ident == "job_id"][0]
+        wrong = list(params)
+        wrong[slot] = uuid4()
+        self.assertNotEqual(
+            _bindings(sql, tuple(wrong))[slot][1], owner_job)
+
+    # ---- core _open controls preserved ----
+    def test_gate_scope_removal_detected(self):
+        purposes, _, _ = self._all()
+        sql, _ = purposes["authorization_gate"]
+        self.assertNotIn(
+            "J . TENANT_ID = %S",
+            _code(sql.replace("AND j.tenant_id=%s", "")))
+
+    def test_budget_scope_removal_detected(self):
+        purposes, _, _ = self._all()
+        sql, _ = purposes["budget_update"]
+        self.assertNotIn(
+            OPEN_BUDGET,
+            _code(sql.replace("AND j.tenant_id=%s", "")))
+
+    def test_attempt_scope_removal_detected(self):
+        purposes, _, _ = self._all()
+        sql, _ = purposes["attempt_update"]
+        self.assertNotIn(
+            OPEN_ATTEMPT,
+            _code(sql.replace("AND j.tenant_id=%s", "")))
+
+    def test_row_derived_authority_substitution_detected(self):
+        attributed = uuid4()
+        log, tenant, job = self._log(attributed=attributed)
+        purposes = _open_statements_by_purpose(log)
+        for name in ("authorization_gate", "case_insert", "budget_update",
+                     "attempt_update"):
+            sql, params = purposes[name]
+            bindings = _bindings(sql, params)
+            self.assertIn(("tenant_id", tenant), bindings,
+                          f"{name} lost the caller tenant")
+            self.assertNotIn(("tenant_id", attributed), bindings,
+                             f"{name} substituted the row tenant")
+
+
+class _KwargRecorder:
+    """Records call kwargs structurally, even when tenant_id is absent."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append({"args": args, "kwargs": dict(kwargs)})
+        return uuid4()
+
+
+class ObserverKwargPropagationTests(unittest.TestCase):
+    """Observer propagation proven by assertion, never by KeyError."""
+
+    def _observer(self, tenant):
+        return budgeted_observer.BudgetedLedgerObserver(
+            uuid4(), uuid4(), {"standard": Decimal(1)},
+            tenant_id=tenant)
+
+    def _assert_propagated(self, recorder, tenant, branch):
+        self.assertTrue(recorder.calls, f"{branch} was never called")
+        last = recorder.calls[-1]
+        self.assertIn("tenant_id", last["kwargs"],
+                      f"{branch} did not receive a tenant_id keyword")
+        self.assertEqual(last["kwargs"]["tenant_id"], tenant,
+                         f"{branch} propagated the wrong tenant")
+
+    def test_non_metered_start_propagates_constructor_tenant(self):
+        tenant = uuid4()
+        observer = self._observer(tenant)
+        recorder = _KwargRecorder()
+        with patch.object(budgeted_observer, "start_attempt", recorder):
+            observer.attempt_started(
+                1, ModelCandidate("k", "p", None, "free", 1,
+                                  billing_mode="free"), "m")
+        self._assert_propagated(recorder, tenant, "non-metered start")
+
+    def test_metered_start_propagates_constructor_tenant(self):
+        tenant = uuid4()
+        observer = self._observer(tenant)
+        recorder = _KwargRecorder()
+        with patch.object(budgeted_observer, "get_active_price") as price:
+            price.return_value = _FakePrice()
+            with patch.object(budgeted_observer, "start_metered_attempt",
+                              recorder):
+                observer.attempt_started(
+                    2, ModelCandidate("k2", "p", None, "standard", 1,
+                                      pricing_key="pk",
+                                      billing_mode="metered"), "m")
+        self._assert_propagated(recorder, tenant, "metered start")
+
+    def test_deferred_usage_propagates_constructor_tenant(self):
+        tenant = uuid4()
+        observer = self._observer(tenant)
+        observer._state[1] = (uuid4(), Decimal(1), _FakePrice(), "metered")
+        recorder = _KwargRecorder()
+        with patch.object(budgeted_observer, "defer_missing_usage", recorder):
+            with self.assertRaises(budgeted_observer.UsageMissing):
+                observer.attempt_finished(
+                    1, ExecutionAttempt("k", "p", "m", True))
+        self._assert_propagated(recorder, tenant, "deferred usage")
+
+    def test_finalize_propagates_constructor_tenant(self):
+        tenant = uuid4()
+        observer = self._observer(tenant)
+        observer._state[1] = (uuid4(), Decimal(0), None, "free")
+        recorder = _KwargRecorder()
+        with patch.object(budgeted_observer, "finalize_attempt_and_budget",
+                          recorder):
+            observer.attempt_finished(
+                1, ExecutionAttempt("k", "p", "m", True))
+        self._assert_propagated(recorder, tenant, "finalize")
+
+    def test_missing_tenant_keyword_fails_by_assertion(self):
+        tenant = uuid4()
+        observer = self._observer(tenant)
+        recorder = _KwargRecorder()
+        with patch.object(budgeted_observer, "start_attempt", recorder):
+            observer.attempt_started(
+                1, ModelCandidate("k", "p", None, "free", 1,
+                                  billing_mode="free"), "m")
+        del recorder.calls[-1]["kwargs"]["tenant_id"]
+        with self.assertRaises(AssertionError):
+            self._assert_propagated(recorder, tenant, "non-metered start")
+
+    def test_wrong_tenant_value_fails_by_assertion(self):
+        tenant, other = uuid4(), uuid4()
+        observer = self._observer(tenant)
+        recorder = _KwargRecorder()
+        with patch.object(budgeted_observer, "start_attempt", recorder):
+            observer.attempt_started(
+                1, ModelCandidate("k", "p", None, "free", 1,
+                                  billing_mode="free"), "m")
+        recorder.calls[-1]["kwargs"]["tenant_id"] = other
+        with self.assertRaises(AssertionError):
+            self._assert_propagated(recorder, tenant, "non-metered start")
+
+
 class _Shared:
     def __init__(self, connection):
         self.connection = connection
@@ -1655,6 +2096,134 @@ class _Shared:
 
     def __exit__(self, *_):
         return False
+
+
+def _purge_rollback(ids):
+    task_x, job_a, job_b, tenant = ids
+    conn = psycopg.connect(_DB_URL)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM execution_attempts WHERE task_id=%s",
+                        (task_x,))
+            cur.execute("DELETE FROM task_dependencies WHERE task_id=%s"
+                        " OR depends_on_task_id=%s", (task_x, task_x))
+            cur.execute("DELETE FROM tasks WHERE id=%s", (task_x,))
+            cur.execute("DELETE FROM job_budgets WHERE job_id IN (%s,%s)",
+                        (job_a, job_b))
+            cur.execute("DELETE FROM jobs WHERE id IN (%s,%s)", (job_a, job_b))
+            cur.execute("DELETE FROM tenants WHERE id=%s", (tenant,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@unittest.skipUnless(_DB_URL, "PostgreSQL integration URL required")
+class StartMeteredRealTransactionTests(unittest.TestCase):
+    """Rollback proven through a REAL Psycopg transaction context.
+
+    The production function receives a genuine psycopg connection so
+    ``with connect() as conn`` exercises real commit/rollback semantics.
+    The after-state is read from a SEPARATE fresh connection, so the aborted
+    transaction/session can never mask a leaked reservation.
+    """
+
+    def _fresh(self):
+        conn = psycopg.connect(_DB_URL)
+        self.addCleanup(conn.close)
+        return conn
+
+    def test_partial_rollback_is_real_and_load_bearing(self):
+        tenant = uuid4()
+        job_a, job_b, task_x = uuid4(), uuid4(), uuid4()
+        amount = Decimal("1.00")
+
+        # (1) fixtures on their own committed connection
+        setup = self._fresh()
+        with setup.cursor() as cur:
+            cur.execute("INSERT INTO tenants(id, slug, name)"
+                        " VALUES (%s,%s,'rollback test')",
+                        (tenant, str(tenant)))
+            for job in (job_a, job_b):
+                cur.execute("INSERT INTO jobs(id, tenant_id, objective,"
+                            " status) VALUES (%s,%s,'rollback','running')",
+                            (job, tenant))
+            cur.execute(
+                "INSERT INTO tasks(id, job_id, external_id, title,"
+                " description, capability, risk, status)"
+                " VALUES (%s,%s,%s,'t','d','basic','low','pending')",
+                (task_x, job_b, str(task_x)))
+            cur.execute("INSERT INTO job_budgets(job_id, limit_usd)"
+                        " VALUES (%s,%s)", (job_a, Decimal("10.00")))
+            cur.execute("INSERT INTO model_pricing(pricing_key, version,"
+                        " input_per_million_usd, output_per_million_usd,"
+                        " active) VALUES ('pk',1,2,3,TRUE)")
+        setup.commit()
+        self.addCleanup(_purge_rollback, (task_x, job_a, job_b, tenant))
+
+        # (2) mechanical preconditions: statement A is genuinely load-bearing
+        with setup.cursor() as cur:
+            cur.execute("SELECT 1 FROM jobs WHERE id=%s AND tenant_id=%s",
+                        (job_a, tenant))
+            self.assertIsNotNone(cur.fetchone(),
+                                 "job A must exist for the caller tenant")
+            cur.execute("SELECT limit_usd, reserved_usd, spent_usd,"
+                        " recovery_exposure_usd, unpriced_exposure_usd"
+                        " FROM job_budgets WHERE job_id=%s", (job_a,))
+            before = cur.fetchone()
+            self.assertIsNotNone(before, "budget row must exist")
+            limit, reserved, spent, recovery, unpriced = before
+            self.assertGreater(amount, Decimal(0),
+                               "reservation amount must be positive")
+            self.assertLessEqual(
+                reserved + spent + recovery + unpriced + amount, limit,
+                "funds must be sufficient so statement A qualifies")
+            cur.execute("SELECT job_id FROM tasks WHERE id=%s", (task_x,))
+            self.assertEqual(
+                cur.fetchone()[0], job_b,
+                "task X must not belong to job A so statement B rejects")
+        before_reserved = before[1]
+        before_limit = before[0]
+
+        # (3) invoke through a REAL psycopg connection factory
+        test_case = self
+
+        class RealConnections:
+            def __init__(self, url):
+                self.url = url
+                self._local = threading.local()
+
+            def __call__(self):
+                conn = getattr(self._local, "conn", None)
+                if conn is None or conn.closed:
+                    conn = psycopg.connect(self.url)
+                    self._local.conn = conn
+                    test_case.addCleanup(conn.close)
+                return conn
+
+        with patch.object(reconciliation, "connect", RealConnections(_DB_URL)):
+            with self.assertRaises(reconciliation.ReconciliationError):
+                reconciliation.start_metered_attempt(
+                    job_id=job_a, task_id=task_x, number=1,
+                    route=_FakeRoute(), model="m", price=_FakePrice(),
+                    reservation=amount, tenant_id=tenant)
+
+        # (4) after-state read from a FRESH connection; no cleanup has run
+        fresh = self._fresh()
+        with fresh.cursor() as cur:
+            cur.execute("SELECT limit_usd, reserved_usd, spent_usd"
+                        " FROM job_budgets WHERE job_id=%s", (job_a,))
+            after = cur.fetchone()
+            self.assertEqual(
+                after[1], before_reserved,
+                "reservation must be rolled back to its pre-call value")
+            self.assertEqual(after[0], before_limit)
+            self.assertEqual(after[2], Decimal(0))
+            cur.execute("SELECT count(*) FROM execution_attempts"
+                        " WHERE job_id=%s OR task_id=%s",
+                        (job_a, task_x))
+            self.assertEqual(
+                cur.fetchone()[0], 0,
+                "no attempt may be inserted by the failed call")
 
 
 if __name__ == "__main__":
