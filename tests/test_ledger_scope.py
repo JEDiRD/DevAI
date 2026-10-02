@@ -1469,9 +1469,7 @@ class LedgerDatabaseTests(unittest.TestCase):
                         (job_a, tenant))
             self.assertIsNotNone(cur.fetchone(),
                                  "job A must exist for the caller tenant")
-            cur.execute("SELECT limit_usd, reserved_usd, spent_usd,"
-                        " recovery_exposure_usd, unpriced_exposure_usd"
-                        " FROM job_budgets WHERE job_id=%s", (job_a,))
+            cur.execute(BUDGET_PRECONDITION_SELECT, (job_a,))
             before = cur.fetchone()
             self.assertIsNotNone(before, "budget row must exist")
             limit, reserved, spent, recovery, unpriced = before
@@ -1719,6 +1717,54 @@ class LedgerDatabaseTests(unittest.TestCase):
             self.sql("SELECT count(*) FROM metered_reconciliations"
                      " WHERE job_id=%s", (job_b,))[0][0],
             before_cases)
+
+
+class BudgetPreconditionProjectionTests(unittest.TestCase):
+    """The rollback funds precondition must select what it unpacks.
+
+    A four-column projection against a five-name unpack raises ValueError on
+    PostgreSQL and would additionally drop spent_usd from the funds proof, so
+    arity and order are pinned here rather than left to a DB run.
+    """
+
+    UNPACK = ("limit", "reserved", "spent", "recovery", "unpriced")
+
+    def test_projection_selects_exactly_five_columns(self):
+        self.assertEqual(len(BUDGET_PRECONDITION_COLUMNS), 5)
+
+    def test_projection_order_matches_unpack_semantics(self):
+        self.assertEqual(
+            BUDGET_PRECONDITION_COLUMNS,
+            ("limit_usd", "reserved_usd", "spent_usd",
+             "recovery_exposure_usd", "unpriced_exposure_usd"))
+
+    def test_spent_usd_is_present_in_the_funds_proof(self):
+        self.assertIn("spent_usd", BUDGET_PRECONDITION_COLUMNS)
+
+    def test_projection_has_no_duplicate_columns(self):
+        self.assertEqual(len(set(BUDGET_PRECONDITION_COLUMNS)),
+                         len(BUDGET_PRECONDITION_COLUMNS))
+
+    def test_both_rollback_callers_use_the_shared_projection(self):
+        """Both rollback callers must use the shared projection, not literals.
+
+        Both call sites unpack five names, so a literal projection selecting
+        only four would raise ValueError and drop spent_usd from the funds
+        proof. Deriving the projection from BUDGET_PRECONDITION_SELECT makes
+        that mismatch unrepresentable at both call sites.
+        """
+        for method in (LedgerDatabaseTests
+                       .test_start_metered_partial_rollback_is_load_bearing,
+                       StartMeteredRealTransactionTests
+                       .test_partial_rollback_is_real_and_load_bearing):
+            source = inspect.getsource(method)
+            self.assertIn(
+                "limit, reserved, spent, recovery, unpriced = before",
+                source, method.__name__)
+            self.assertEqual(
+                source.count("cur.execute(BUDGET_PRECONDITION_SELECT"), 1,
+                f"{method.__name__} must issue exactly one shared-projection"
+                " precondition read and no hand-rolled projection")
 
 
 def _neutralization_defects(sql):
@@ -2327,6 +2373,24 @@ class _Shared:
 
 ROLLBACK_PRICING_VERSION = 1
 
+# Budget columns for the rollback statement-A funds precondition, in the same
+# semantic order as production's reservation predicate
+# (reserved_usd+spent_usd+recovery_exposure_usd+unpriced_exposure_usd+amount
+# <=limit_usd). The projection is derived from this tuple so the selected
+# columns and the unpacked names can never drift apart in arity or order.
+BUDGET_PRECONDITION_COLUMNS = (
+    "limit_usd",
+    "reserved_usd",
+    "spent_usd",
+    "recovery_exposure_usd",
+    "unpriced_exposure_usd",
+)
+
+BUDGET_PRECONDITION_SELECT = (
+    "SELECT " + ", ".join(BUDGET_PRECONDITION_COLUMNS)
+    + " FROM job_budgets WHERE job_id=%s"
+)
+
 
 def _real_connection_factory(test_case, url=None):
     """A factory handing production a genuine Psycopg connection.
@@ -2452,9 +2516,10 @@ class StartMeteredRealTransactionTests(unittest.TestCase):
                         (job_a, tenant))
             self.assertIsNotNone(cur.fetchone(),
                                  "job A must exist for the caller tenant")
-            cur.execute("SELECT limit_usd, reserved_usd,"
-                        " recovery_exposure_usd, unpriced_exposure_usd"
-                        " FROM job_budgets WHERE job_id=%s", (job_a,))
+            # Five columns for five unpacked names, in the same semantic
+            # order as production's reservation predicate at
+            # reconciliation.py: reserved+spent+recovery+unpriced+amount<=limit.
+            cur.execute(BUDGET_PRECONDITION_SELECT, (job_a,))
             before = cur.fetchone()
             self.assertIsNotNone(before, "budget row must exist")
             limit, reserved, spent, recovery, unpriced = before
