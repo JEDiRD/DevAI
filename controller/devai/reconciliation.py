@@ -62,7 +62,7 @@ def _open(cur, attempt_id, *, result_success=False, tenant_id):
     # AUTHORIZATION uses the caller-supplied tenant_id only. The tenant_id read
     # from the attempt's job row below is ATTRIBUTION (which tenant the opened
     # case is recorded against) and must never stand in for authorization.
-    cur.execute('''SELECT id FROM metered_reconciliations m
+    cur.execute('''SELECT m.id FROM metered_reconciliations m
         JOIN execution_attempts a ON a.id = m.attempt_id
         JOIN jobs j ON j.id = a.job_id
         WHERE m.attempt_id=%s AND j.tenant_id=%s''', (attempt_id, tenant_id))
@@ -74,7 +74,12 @@ def _open(cur, attempt_id, *, result_success=False, tenant_id):
         FROM execution_attempts a JOIN jobs j ON j.id=a.job_id
         WHERE a.id=%s AND j.tenant_id=%s FOR UPDATE OF a''', (attempt_id, tenant_id))
     row = cur.fetchone()
-    cur.execute('''SELECT id FROM metered_reconciliations m
+    # Re-check for a concurrently opened case. The projected column is
+    # m.id: pre-B3 this query read metered_reconciliations alone and the
+    # value is the CASE identifier returned to the caller, so qualifying it
+    # to the cases table preserves the original meaning. Without the
+    # qualifier the projection is ambiguous across the joined id columns.
+    cur.execute('''SELECT m.id FROM metered_reconciliations m
         JOIN execution_attempts a ON a.id = m.attempt_id
         JOIN jobs j ON j.id = a.job_id
         WHERE m.attempt_id=%s AND j.tenant_id=%s''', (attempt_id, tenant_id))
@@ -87,12 +92,17 @@ def _open(cur, attempt_id, *, result_success=False, tenant_id):
     identifier = uuid4()
     # Case INSERT: attribution only, and only reached after the gate proved
     # the attempt belongs to tenant_id.
+    # Column/expression mapping (7 columns, 7 expressions):
+    #   id=%s tenant_id=%s job_id=%s attempt_id=%s status='recoverable'
+    #   exposure_usd=%s result_success=%s
+    # job_id is BOUND, never a bare SQL identifier: this SELECT has no FROM
+    # clause, so an unquoted `job` would be an undefined column reference.
     cur.execute(f'''INSERT INTO metered_reconciliations(id,tenant_id,job_id,attempt_id,status,exposure_usd,result_success)
-        SELECT %s,%s,job,%s,'recoverable',%s,%s
+        SELECT %s,%s,%s,%s,'recoverable',%s,%s
         WHERE EXISTS (SELECT 1 FROM execution_attempts a JOIN jobs j ON j.id=a.job_id
             WHERE a.id=%s AND a.job_id=%s AND j.tenant_id=%s)''',
-        (identifier, attributed_tenant, attempt_id, exposure, result_success,
-         attempt_id, job, tenant_id))
+        (identifier, attributed_tenant, job, attempt_id, exposure,
+         result_success, attempt_id, job, tenant_id))
     if cur.rowcount != 1:
         raise ReconciliationError('RECOVERY_CASE_SCOPE_INVALID')
     # Budget mutation: directly tenant-scoped, not job-id only.

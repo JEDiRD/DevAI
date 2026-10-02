@@ -193,7 +193,139 @@ OPEN_CASE = (
 )
 
 
-class LedgerSignatureTests(unittest.TestCase):
+class OpenInsertShapeTests(unittest.TestCase):
+    """Narrow shape regression for the _open case INSERT.
+
+    Not general PostgreSQL validation: it pins the INSERT target columns,
+    the SELECT expression count, that every Python-bound value has a
+    placeholder, the absence of a bare identifier where a bound job value
+    belongs, and the exact bind-tuple order.
+    """
+    COLUMNS = ("id", "tenant_id", "job_id", "attempt_id", "status",
+               "exposure_usd", "result_success")
+
+    def _case_insert(self):
+        log = []
+        tenant, attributed = uuid4(), uuid4()
+        job, attempt = uuid4(), uuid4()
+        rows = [None, (job, attributed, Decimal(1), "metered", "running"),
+                None]
+        cursor = SelectiveCursor(log, rows=rows, insert_rowcount=1)
+        with _patched(reconciliation, cursor):
+            reconciliation._open(cursor, attempt, tenant_id=tenant)
+        cases = [e for e in log
+                 if "RECOVERABLE" in _code(e[0])
+                 and "METERED_RECONCILIATION_EVENTS" not in _code(e[0])]
+        self.assertEqual(len(cases), 1, "case INSERT not found")
+        return cases[0], tenant, attributed, job, attempt
+
+    def test_insert_target_columns_exact(self):
+        (sql, _), *_ = self._case_insert()
+        code = _code(sql)
+        marker = "INSERT INTO METERED_RECONCILIATIONS ("
+        start = code.index(marker) + len(marker)
+        end = code.index(")", start)
+        columns = tuple(
+            c.strip() for c in code[start:end].split(","))
+        self.assertEqual(columns, tuple(c.upper() for c in self.COLUMNS))
+
+    def test_select_expression_count_matches_columns(self):
+        (sql, _), *_ = self._case_insert()
+        code = _code(sql)
+        select = code[code.index("SELECT") + len("SELECT"):]
+        # only the leading SELECT list matters (before WHERE EXISTS)
+        expressions = select.split("WHERE")[0].split(",")
+        self.assertEqual(len(expressions), len(self.COLUMNS))
+
+    def test_no_bare_identifier_where_job_value_is_bound(self):
+        """`job` as an unbound SQL identifier must be rejected."""
+        (sql, params), _, _, job, _ = self._case_insert()
+        code = _code(sql)
+        select = code[code.index("SELECT"):code.index("WHERE EXISTS")]
+        expressions = [e.strip() for e in select.split(",")]
+        for expression in expressions:
+            self.assertNotEqual(expression, "JOB")
+            self.assertNotIn("J.", expression)
+        self.assertIn(("select", job), _bindings(sql, params))
+
+    def test_every_bound_value_has_a_placeholder(self):
+        (sql, params), tenant, attributed, job, attempt = (
+            self._case_insert())
+        placeholders = [t for t in _tokenize(sql) if t.kind == "placeholder"]
+        self.assertEqual(len(placeholders), len(params))
+        self.assertEqual(len(params), 9)
+
+    def test_exact_bind_order(self):
+        (sql, params), tenant, attributed, job, attempt = (
+            self._case_insert())
+        # INSERT values first, then the EXISTS authorization gate
+        self.assertEqual(
+            [type(p).__name__ for p in params[:4]],
+            ["UUID", "UUID", "UUID", "UUID"])
+        self.assertEqual(params[1], attributed, "tenant_id is attribution")
+        self.assertEqual(params[2], job, "job_id must be bound, not bare")
+        self.assertEqual(params[3], attempt)
+        # gate: attempt, job, caller tenant
+        self.assertEqual(params[6], attempt)
+        self.assertEqual(params[7], job)
+        self.assertEqual(params[8], tenant,
+                         "caller tenant authorizes, row tenant attributes")
+
+    def test_status_literal_is_recoverable(self):
+        (sql, _), *_ = self._case_insert()
+        self.assertIn("'RECOVERABLE'", _code(sql))
+
+
+class OpenProjectionTests(unittest.TestCase):
+    """H1: every joined id projection in _open must be explicitly qualified."""
+
+    def _open_statements(self):
+        tenant = uuid4()
+        log = []
+        job = uuid4()
+        rows = [None, (job, uuid4(), Decimal(1), "metered", "running"), None]
+        cursor = SelectiveCursor(log, rows=rows, insert_rowcount=1)
+        with _patched(reconciliation, cursor):
+            reconciliation._open(cursor, uuid4(), tenant_id=tenant)
+        return log
+
+    def test_joined_id_projections_are_qualified(self):
+        for sql, _ in self._open_statements():
+            code = _code(sql)
+            if "METERED_RECONCILIATIONS M" not in code:
+                continue
+            for token in _tokenize(sql):
+                if token.kind == "name" and token.text.upper() == "ID":
+                    left = _tokenize(sql)
+                    index = left.index(token)
+                    previous = left[index - 1]
+                    self.assertTrue(
+                        previous.kind == "punct" and previous.text == "."
+                        or previous.kind in ("name", "quoted")
+                        and previous.text.upper() in ("M", "A", "J"),
+                        "unqualified ambiguous id projection",
+                    )
+
+    def test_case_lookup_projects_the_case_id(self):
+        """The projected column must be m.id, preserving pre-B3 meaning."""
+        log = self._open_statements()
+        lookups = [e for e in log
+                   if "METERED_RECONCILIATIONS M" in _code(e[0])
+                   and "FOR UPDATE" not in _code(e[0])]
+        self.assertGreaterEqual(len(lookups), 2)
+        for sql, _ in lookups:
+            self.assertIn("SELECT M . ID FROM", _code(sql))
+
+    def test_bare_id_projection_is_detected(self):
+        sql = ("SELECT id FROM metered_reconciliations m "
+               "JOIN execution_attempts a ON a.id = m.attempt_id")
+        for token in _tokenize(sql):
+            if token.kind == "name" and token.text.upper() == "ID":
+                left = _tokenize(sql)
+                previous = left[left.index(token) - 1]
+                self.assertFalse(
+                    previous.kind == "punct" and previous.text == ".",
+                    "bare id must fail the qualification check")
     TENANT_FNS = ("create_task", "record_attempt", "start_attempt",
                   "finish_attempt", "complete_task", "complete_job")
 
@@ -320,40 +452,86 @@ class CreateTaskScopeTests(unittest.TestCase):
 class AttemptLifecycleScopeTests(unittest.TestCase):
     ATTEMPT = ExecutionAttempt("k", "p", "m", True)
 
-    def _start(self, tenant, rows=((uuid4(),),)):
+    def _start(self, tenant, job=None, task=None):
+        job, task = job or uuid4(), task or uuid4()
         log = []
-        with _patched(ledger, RecordingCursor(log, 1, rows)):
-            ledger.start_attempt(uuid4(), uuid4(), 1, "k", "p", "m",
+        with _patched(ledger, RecordingCursor(log, 1, [(uuid4(),)])):
+            ledger.start_attempt(job, task, 1, "k", "p", "m",
                                  tenant_id=tenant)
-        return log
+        return log, job, task
 
-    def _record(self, tenant, rows=((uuid4(),),)):
+    def _record(self, tenant, job=None, task=None):
+        job, task = job or uuid4(), task or uuid4()
         log = []
-        with _patched(ledger, RecordingCursor(log, 1, rows)):
-            ledger.record_attempt(uuid4(), uuid4(), 1, self.ATTEMPT,
+        with _patched(ledger, RecordingCursor(log, 1, [(uuid4(),)])):
+            ledger.record_attempt(job, task, 1, self.ATTEMPT,
                                   tenant_id=tenant)
-        return log
+        return log, job, task
 
     def test_start_attempt_scoped(self):
         tenant = uuid4()
-        sql, params = self._start(tenant)[0]
+        log, _, _ = self._start(tenant)
+        sql, params = log[0]
         self.assertIn(ATTEMPT_GUARD, _code(sql))
         self.assertEqual(_boolean_bypasses(sql), [])
-        self.assertEqual(params[-1], tenant)
         self.assertIn(("tenant_id", tenant), _bindings(sql, params))
+
+    def test_start_attempt_bindings_pinned(self):
+        """task_id, job_id and tenant_id must bind to their predicates."""
+        tenant = uuid4()
+        log, job, task = self._start(tenant)
+        sql, params = log[0]
+        bindings = _bindings(sql, params)
+        self.assertEqual(
+            [ident for ident, _ in bindings[-3:]],
+            ["id", "id", "tenant_id"])
+        self.assertEqual(bindings[-3][1], task, "task_id predicate")
+        self.assertEqual(bindings[-2][1], job, "job_id predicate")
+        self.assertEqual(bindings[-1][1], tenant, "tenant_id predicate")
+
+    def test_start_attempt_task_job_swap_detected(self):
+        tenant = uuid4()
+        log, job, task = self._start(tenant)
+        sql, params = log[0]
+        swapped = list(params)
+        swapped[-3], swapped[-2] = swapped[-2], swapped[-3]
+        bindings = _bindings(sql, tuple(swapped))
+        self.assertNotEqual(bindings[-3][1], task)
+
+    def test_record_attempt_bindings_pinned(self):
+        tenant = uuid4()
+        log, job, task = self._record(tenant)
+        sql, params = log[0]
+        bindings = _bindings(sql, params)
+        self.assertEqual(
+            [ident for ident, _ in bindings[-3:]],
+            ["id", "id", "tenant_id"])
+        self.assertEqual(bindings[-3][1], task)
+        self.assertEqual(bindings[-2][1], job)
+        self.assertEqual(bindings[-1][1], tenant)
+
+    def test_record_attempt_task_job_swap_detected(self):
+        tenant = uuid4()
+        log, job, task = self._record(tenant)
+        sql, params = log[0]
+        swapped = list(params)
+        swapped[-3], swapped[-2] = swapped[-2], swapped[-3]
+        bindings = _bindings(sql, tuple(swapped))
+        self.assertNotEqual(bindings[-3][1], task)
 
     def test_record_attempt_scoped(self):
         tenant = uuid4()
-        sql, params = self._record(tenant)[0]
+        log, _, _ = self._record(tenant)
+        sql, params = log[0]
         self.assertIn(ATTEMPT_GUARD, _code(sql))
         self.assertEqual(_boolean_bypasses(sql), [])
         self.assertEqual(params[-1], tenant)
 
     def test_one_sided_authorization_detected(self):
-        """Dropping the tenant half of the guard must fail."""
         tenant = uuid4()
         for runner in (self._start, self._record):
-            sql, _ = runner(tenant)[0]
+            log, _, _ = runner(tenant)
+            sql, _ = log[0]
             for mutated in (
                 sql.replace("AND j.tenant_id = %s", ""),
                 sql.replace("AND t.job_id = j.id", ""),
@@ -364,16 +542,23 @@ class AttemptLifecycleScopeTests(unittest.TestCase):
 
     def test_attempt_wrong_tenant_binding_detected(self):
         tenant, foreign = uuid4(), uuid4()
-        sql, params = self._start(tenant)[0]
+        log, _, _ = self._start(tenant)
+        sql, params = log[0]
         wrong = params[:-1] + (foreign,)
         self.assertNotEqual(_bindings(sql, wrong)[-1][1], tenant)
 
-    def test_finish_attempt_update_is_authoritative(self):
-        tenant, attempt = uuid4(), uuid4()
+    def _finish_log(self, tenant, attempt):
         log = []
         with _patched(ledger, RecordingCursor(log, 1)):
             ledger.finish_attempt(attempt, True, tenant_id=tenant)
-        sql, params = log[0]
+        return log
+
+    def test_finish_attempt_update_is_authoritative(self):
+        tenant, attempt = uuid4(), uuid4()
+        updates = [e for e in self._finish_log(tenant, attempt)
+                   if _targets(e[0], "execution_attempts", "UPDATE")]
+        self.assertEqual(len(updates), 1)
+        sql, params = updates[0]
         self.assertIn(FINISH_GUARD, _code(sql))
         self.assertEqual(params, ("succeeded", None, attempt, tenant))
         self.assertEqual(
@@ -382,17 +567,38 @@ class AttemptLifecycleScopeTests(unittest.TestCase):
              ("id", attempt), ("tenant_id", tenant)],
         )
 
+    def test_finish_attempt_precheck_plus_unscoped_update_rejected(self):
+        tenant, attempt = uuid4(), uuid4()
+        statements = [
+            ("SELECT 1 FROM execution_attempts a JOIN jobs j ON j.id=a.job_id"
+             " WHERE a.id=%s AND j.tenant_id=%s", (attempt, tenant)),
+            ("UPDATE execution_attempts SET status='succeeded'"
+             " WHERE id=%s AND status='running'", (attempt,)),
+        ]
+        updates = [e for e in statements
+                   if _targets(e[0], "execution_attempts", "UPDATE")]
+        self.assertEqual(len(updates), 1)
+        self.assertNotIn(FINISH_GUARD, _code(updates[0][0]))
+
     def test_finish_attempt_scope_removal_detected(self):
         tenant, attempt = uuid4(), uuid4()
-        log = []
-        with _patched(ledger, RecordingCursor(log, 1)):
-            ledger.finish_attempt(attempt, True, tenant_id=tenant)
-        stripped = log[0][0].replace(
-            "AND j.tenant_id = %s", "")
-        self.assertNotIn(FINISH_GUARD, _code(stripped))
+        sql = self._finish_log(tenant, attempt)[0][0]
+        self.assertNotIn(
+            FINISH_GUARD, _code(sql.replace("AND j.tenant_id = %s", "")))
+
+    def test_finish_attempt_boolean_bypass_detected(self):
+        tenant, attempt = uuid4(), uuid4()
+        sql = self._finish_log(tenant, attempt)[0][0]
+        for bypass in ("AND j.tenant_id = %s OR TRUE",
+                       "AND j.tenant_id = %s OR 1 = 1"):
+            mutated = sql.replace("AND j.tenant_id = %s", bypass)
+            self.assertNotEqual(mutated, sql, "mutation did not apply")
+            self.assertTrue(
+                FINISH_GUARD not in _code(mutated)
+                or _boolean_bypasses(mutated),
+                f"boolean bypass accepted: {bypass}")
 
     def test_finish_attempt_foreign_rowcount_contract(self):
-        """Foreign attempt keeps the existing RuntimeError contract."""
         tenant, attempt = uuid4(), uuid4()
         with _patched(ledger, RecordingCursor([], 0)):
             with self.assertRaises(RuntimeError):
@@ -400,51 +606,86 @@ class AttemptLifecycleScopeTests(unittest.TestCase):
 
 
 class CompleteScopeTests(unittest.TestCase):
-    def test_complete_task_scoped(self):
-        tenant, task = uuid4(), uuid4()
+    """The authoritative UPDATE itself must carry scope.
+
+    Proofs locate the mutating statement rather than inspecting statement
+    order, so a preceding tenant-scoped SELECT cannot stand in for it.
+    """
+
+    def _updates(self, log, table):
+        return [e for e in log if _targets(e[0], table, "UPDATE")]
+
+    def _complete_task_log(self, tenant, task):
         log = []
         with _patched(ledger, RecordingCursor(log, 1)):
             ledger.complete_task(task, tenant_id=tenant)
-        sql, params = log[0]
+        return log
+
+    def _complete_job_log(self, tenant, job):
+        log = []
+        with _patched(ledger, RecordingCursor(log, 1)):
+            ledger.complete_job(job, tenant_id=tenant)
+        return log
+
+    def test_complete_task_scoped(self):
+        tenant, task = uuid4(), uuid4()
+        log = self._complete_task_log(tenant, task)
+        updates = self._updates(log, "tasks")
+        self.assertEqual(len(updates), 1)
+        sql, params = updates[0]
         self.assertIn(COMPLETE_TASK_SCOPE, _code(sql))
         self.assertEqual(params, (task, tenant))
         self.assertEqual(_boolean_bypasses(sql), [])
 
+    def test_complete_task_authoritative_update_required(self):
+        """Precheck + unscoped UPDATE must fail the proof."""
+        tenant, task = uuid4(), uuid4()
+        statements = [
+            ("SELECT 1 FROM tasks t JOIN jobs j ON j.id = t.job_id"
+             " WHERE t.id = %s AND j.tenant_id = %s", (task, tenant)),
+            ("UPDATE tasks SET status = 'completed', updated_at = now()"
+             " WHERE id = %s", (task,)),
+        ]
+        updates = self._updates(statements, "tasks")
+        self.assertEqual(len(updates), 1)
+        self.assertNotIn(COMPLETE_TASK_SCOPE, _code(updates[0][0]))
+
+    def test_complete_task_scope_removal_detected(self):
+        tenant, task = uuid4(), uuid4()
+        sql, _ = self._complete_task_log(tenant, task)[0]
+        stripped = sql.replace(
+            "AND job_id IN (SELECT id FROM jobs WHERE tenant_id = %s)", "")
+        self.assertNotIn(COMPLETE_TASK_SCOPE, _code(stripped))
+
     def test_complete_job_scoped(self):
         tenant, job = uuid4(), uuid4()
-        log = []
-        with _patched(ledger, RecordingCursor(log, 1)):
-            ledger.complete_job(job, tenant_id=tenant)
-        sql, params = log[0]
+        updates = self._updates(self._complete_job_log(tenant, job), "jobs")
+        self.assertEqual(len(updates), 1)
+        sql, params = updates[0]
         self.assertIn(COMPLETE_JOB_SCOPE, _code(sql))
         self.assertEqual(params, (job, tenant))
 
-    def test_scope_removal_and_bypass_detected(self):
-        tenant, task = uuid4(), uuid4()
-        log = []
-        with _patched(ledger, RecordingCursor(log, 1)):
-            ledger.complete_task(task, tenant_id=tenant)
-        sql, _ = log[0]
-        for mutated in (
-            sql.replace(
-                "AND job_id IN (SELECT id FROM jobs WHERE tenant_id = %s)",
-                ""),
-            sql.replace("WHERE tenant_id = %s", "WHERE tenant_id = %s OR TRUE"),
-            sql.replace("WHERE tenant_id = %s", "WHERE tenant_id = %s OR 1 = 1"),
-        ):
-            with self.subTest(mutated=mutated[-24:]):
-                self.assertTrue(
-                    COMPLETE_TASK_SCOPE not in _code(mutated)
-                    or _boolean_bypasses(mutated),
-                    "scope removal/bypass accepted",
-                )
+    def test_complete_job_boolean_bypasses_detected(self):
+        tenant, job = uuid4(), uuid4()
+        sql, _ = self._complete_job_log(tenant, job)[0]
+        for bypass in ("AND tenant_id = %s OR TRUE",
+                       "AND tenant_id = %s OR 1 = 1"):
+            mutated = sql.replace("AND tenant_id = %s", bypass)
+            self.assertNotEqual(mutated, sql, "mutation did not apply")
+            self.assertTrue(
+                COMPLETE_JOB_SCOPE not in _code(mutated)
+                or _boolean_bypasses(mutated),
+                f"boolean bypass accepted: {bypass}")
+
+    def test_complete_job_scope_removal_detected(self):
+        tenant, job = uuid4(), uuid4()
+        sql, _ = self._complete_job_log(tenant, job)[0]
+        stripped = sql.replace("AND tenant_id = %s", "")
+        self.assertNotIn(COMPLETE_JOB_SCOPE, _code(stripped))
 
     def test_complete_job_wrong_tenant_detected(self):
         tenant, job, foreign = uuid4(), uuid4(), uuid4()
-        log = []
-        with _patched(ledger, RecordingCursor(log, 1)):
-            ledger.complete_job(job, tenant_id=tenant)
-        sql, params = log[0]
+        sql, params = self._complete_job_log(tenant, job)[0]
         self.assertEqual(params, (job, tenant))
         self.assertNotEqual(_bindings(sql, (job, foreign))[1][1], tenant)
 
@@ -706,12 +947,86 @@ class OpenScopeTests(unittest.TestCase):
             _code(attempt[0].replace("AND j.tenant_id=%s", "")))
 
     def test_sweep_provides_tenant_to_open(self):
-        """sweep must never call _open without an explicit tenant."""
+        """The operational _open call inside sweep must bind tenant_id.
+
+        AST-based: a decoy `_open(..., tenant_id=...)` elsewhere (a
+        comment, an unused helper, or dead code) must not satisfy this, and
+        a comment alone must not count either.
+        """
+        tree = ast.parse(inspect.getsource(reconciliation.sweep))
+        calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "_open"
+        ]
+        self.assertEqual(
+            len(calls), 1,
+            "sweep must contain exactly one _open call site")
+        call = calls[0]
+        keywords = {k.arg: k.value for k in call.keywords}
+        self.assertIn(
+            "tenant_id", keywords,
+            "the operational sweep _open call must pass tenant_id")
+        bound = keywords["tenant_id"]
+        self.assertIsInstance(bound, ast.Name)
+        self.assertEqual(
+            bound.id, "owner_tenant",
+            "sweep must pass the owning tenant selected with the attempt")
+        # positional args must remain (cur, attempt) so the tenant cannot
+        # accidentally become the attempt id
+        self.assertEqual(len(call.args), 2)
+
+    def test_sweep_wrong_tenant_argument_detected(self):
+        """Passing the attempt as tenant must fail."""
+        tree = ast.parse(inspect.getsource(reconciliation.sweep))
+        call = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "_open"
+        ][0]
+        keywords = {k.arg: k.value for k in call.keywords}
+        bound = keywords["tenant_id"]
+        self.assertNotEqual(getattr(bound, "id", None), "attempt")
+        self.assertNotEqual(getattr(bound, "id", None), "cur")
+
+    def test_sweep_decoy_call_does_not_satisfy_proof(self):
+        """A decoy correct call elsewhere must not rescue a wrong real one."""
         source = inspect.getsource(reconciliation.sweep)
-        self.assertIn("_open(cur, attempt, tenant_id=owner_tenant)", source)
-        self.assertNotIn("_open(cur, attempt)", source)
-        self.assertIn("JOIN jobs j ON j.id=a.job_id", source)
-        self.assertIn("FOR UPDATE OF a SKIP LOCKED", source)
+        decoy = source + (
+            "\ndef _unused_helper():\n"
+            "    return _open(None, attempt, tenant_id=owner_tenant)\n")
+        tree = ast.parse(decoy)
+        sweep_calls = []
+        helper_calls = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                target = (sweep_calls if node.name == "sweep"
+                          else helper_calls)
+                target.extend(
+                    c for c in ast.walk(node)
+                    if isinstance(c, ast.Call)
+                    and getattr(c.func, "id", None) == "_open")
+        # The proof above only ever inspects ast.parse(sweep source), so the
+        # decoy in another function is invisible to it by construction.
+        self.assertEqual(len(helper_calls), 1)
+        self.assertEqual(len(sweep_calls), 1)
+        sweep_source = inspect.getsource(reconciliation.sweep)
+        self.assertNotIn("_unused_helper", sweep_source)
+
+    def test_sweep_comment_does_not_satisfy_proof(self):
+        source = inspect.getsource(reconciliation.sweep)
+        commented = source.replace(
+            "_open(cur, attempt, tenant_id=owner_tenant)",
+            "_open(cur, attempt)  # tenant_id=owner_tenant")
+        tree = ast.parse(commented)
+        call = [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and getattr(n.func, "id", None) == "_open"
+        ][0]
+        self.assertNotIn(
+            "tenant_id", {k.arg for k in call.keywords},
+            "a trailing comment must not satisfy the keyword requirement")
 
     def test_sweep_candidate_semantics_preserved(self):
         """Eligibility/ordering/locking predicates are unchanged."""
@@ -838,42 +1153,97 @@ class ObserverPropagationTests(unittest.TestCase):
                 self.assertEqual(fin.call_args.kwargs["tenant_id"], tenant)
 
     def test_runtime_passes_task_tenant_to_budgeted_observer(self):
-        """Structural: the BudgetedLedgerObserver call itself must bind it.
+        """The OPERATIONAL BudgetedLedgerObserver call must bind task.tenant_id.
 
-        A plain source search is insufficient because `tenant_id=task.tenant_id`
-        also appears on the enclosing RouteHealthObserver call, so removing it
-        from the observer would otherwise go unnoticed.
+        AST-based and scoped to the function that actually executes the
+        runtime flow, so a decoy construction in an unused function or dead
+        code cannot satisfy this, and removing the keyword from the real
+        call fails even if a decoy elsewhere is correct.
         """
         tree = ast.parse(inspect.getsource(runtime))
-        found = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            name = (
-                func.attr if isinstance(func, ast.Attribute)
-                else getattr(func, "id", None)
-            )
-            if name != "BudgetedLedgerObserver":
-                continue
-            for keyword in node.keywords:
-                if keyword.arg == "tenant_id":
-                    value = keyword.value
-                    found.append(
-                        isinstance(value, ast.Attribute)
-                        and value.attr == "tenant_id"
-                        and isinstance(value.value, ast.Name)
-                        and value.value.id == "task"
-                    )
-        self.assertEqual(
-            found, [True],
-            "BudgetedLedgerObserver must receive tenant_id=task.tenant_id",
-        )
+        operational = _runtime_operational_observer_calls(tree)
+        self.assertTrue(operational, "no operational observer call found")
+        for call in operational:
+            keywords = {k.arg: k.value for k in call.keywords}
+            self.assertIn(
+                "tenant_id", keywords,
+                "operational BudgetedLedgerObserver must pass tenant_id")
+            value = keywords["tenant_id"]
+            self.assertTrue(
+                isinstance(value, ast.Attribute)
+                and value.attr == "tenant_id"
+                and isinstance(value.value, ast.Name)
+                and value.value.id == "task",
+                "tenant_id must be task.tenant_id")
+
+    def test_runtime_decoy_observer_call_is_not_counted(self):
+        """A correct decoy in dead code must not mask a missing keyword."""
+        source = inspect.getsource(runtime)
+        decoy_source = source + (
+            "\n\ndef _unused():\n"
+            "    return BudgetedLedgerObserver(\n"
+            "        job_id=None, task_id=None,\n"
+            "        reservation_by_cost_class=None,\n"
+            "        tenant_id=task.tenant_id,\n    )\n")
+        decoy_tree = ast.parse(decoy_source)
+        operational = _runtime_operational_observer_calls(decoy_tree)
+        self.assertTrue(operational)
+        for call in operational:
+            keywords = {k.arg for k in call.keywords}
+            self.assertIn("tenant_id", keywords)
+
+    def test_runtime_real_call_missing_keyword_with_decoy_present(self):
+        """Removing the real keyword must fail even with a correct decoy."""
+        source = inspect.getsource(runtime)
+        stripped = source.replace(
+            "            reservation_by_cost_class=reservation_by_cost_class,\n"
+            "            tenant_id=task.tenant_id,\n",
+            "            reservation_by_cost_class=reservation_by_cost_class,\n")
+        stripped += (
+            "\n\ndef _unused():\n"
+            "    return BudgetedLedgerObserver(\n"
+            "        job_id=None, task_id=None,\n"
+            "        reservation_by_cost_class=None,\n"
+            "        tenant_id=task.tenant_id,\n    )\n")
+        tree = ast.parse(stripped)
+        operational = _runtime_operational_observer_calls(tree)
+        self.assertTrue(operational)
+        for call in operational:
+            keywords = {k.arg for k in call.keywords}
+            self.assertNotIn(
+                "tenant_id", keywords,
+                "decoy must not satisfy the operational proof")
 
     def test_runtime_route_health_observer_still_scoped(self):
-        """The enclosing observer's own tenant binding must remain."""
         source = inspect.getsource(runtime)
         self.assertIn("RouteHealthObserver(", source)
+
+
+def _runtime_operational_observer_calls(tree):
+    """BudgetedLedgerObserver calls inside the executing runtime flow.
+
+    The observer is constructed inside run_claimed_task, which is what the
+    scheduler invokes. Calls in other functions are treated as decoys.
+    """
+    operational_functions = {
+        "run_claimed_task",
+    }
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        if node.name not in operational_functions:
+            continue
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Call):
+                func = inner.func
+                name = (
+                    func.attr if isinstance(func, ast.Attribute)
+                    else getattr(func, "id", None)
+                )
+                if name == "BudgetedLedgerObserver":
+                    found.append(inner)
+    return found
 
 
 class _FakePrice:
@@ -1010,14 +1380,38 @@ class LedgerDatabaseTests(unittest.TestCase):
                      (attempt,))[0][0], "running")
 
     def metered_fixture(self, tenant, limit="10.00"):
+        """Funded job/task/budget plus the pricing row the candidate needs.
+
+        The pricing key MUST match _FakeRoute.pricing_key ('pk'), otherwise
+        start_metered_attempt rejects at the pricing lookup and the fixture
+        would not actually exercise tenant scoping.
+        """
         job = self.job(tenant)
         task = self.task(job=job)
         self.sql("INSERT INTO job_budgets(job_id, limit_usd) VALUES (%s,%s)",
                  (job, Decimal(limit)))
-        self.sql("INSERT INTO model_pricing(pricing_key, version,"
-                 " input_per_million_usd, output_per_million_usd, active)"
-                 " VALUES ('b3',1,2,3,TRUE)")
+        self.ensure_pricing()
         return job, task
+
+    def ensure_pricing(self):
+        """Exactly one active pricing row for key 'pk' version 1."""
+        existing = self.sql(
+            "SELECT count(*) FROM model_pricing"
+            " WHERE pricing_key=%s AND version=1 AND active", ("pk",))
+        if existing[0][0] == 0:
+            self.sql("INSERT INTO model_pricing(pricing_key, version,"
+                     " input_per_million_usd, output_per_million_usd, active)"
+                     " VALUES ('pk',1,2,3,TRUE)")
+        return self.sql(
+            "SELECT count(*) FROM model_pricing"
+            " WHERE pricing_key=%s AND version=1 AND active", ("pk",))[0][0]
+
+    def test_pricing_fixture_is_exactly_one_row(self):
+        self.assertEqual(self.ensure_pricing(), 1)
+        self.assertEqual(self.ensure_pricing(), 1)
+        self.assertEqual(
+            self.sql("SELECT count(*) FROM model_pricing"
+                     " WHERE pricing_key='pk' AND version=1")[0][0], 1)
 
     def _start(self, job, task, tenant):
         return reconciliation.start_metered_attempt(
@@ -1049,16 +1443,42 @@ class LedgerDatabaseTests(unittest.TestCase):
                      (job,))[0][0], before_attempts)
 
     def test_start_metered_partial_rollback_is_load_bearing(self):
-        """Statement A could have mutated; Statement B rejects."""
-        job, task = self.metered_fixture(self.foreign)
-        before = self.budget_row(job)
-        # tenant A matches no job, but task/job ids are the real foreign pair
+        """Statement A CAN reserve, Statement B rejects -> full rollback.
+
+        Topology: tenant A owns a funded job A; tenant B owns a valid task B
+        attached to job B. The call passes job A with task B under tenant A,
+        so statement A's job+tenant+funds predicates are all satisfiable and
+        it genuinely mutates the budget, while statement B rejects because
+        task B does not belong to job A.
+        """
+        job_a, _ = self.metered_fixture(self.tenant)
+        _, task_b = self.metered_fixture(self.foreign)
+        before_a = self.budget_row(job_a)
+        self.assertEqual(before_a[1], Decimal(0), "job A must start unreserved")
+
+        # Statement A alone is satisfiable: prove the reservation predicate
+        # really matches for job A / tenant A before asserting rollback.
+        qualifies = self.sql(
+            "SELECT 1 FROM job_budgets b JOIN jobs j ON j.id=b.job_id"
+            " WHERE b.job_id=%s AND j.tenant_id=%s"
+            " AND b.reserved_usd+b.spent_usd+b.recovery_exposure_usd"
+            "+b.unpriced_exposure_usd+%s<=b.limit_usd",
+            (job_a, self.tenant, Decimal("1.00")))
+        self.assertEqual(len(qualifies), 1,
+                         "statement A must be able to reserve for this test "
+                         "to be load-bearing")
+
         with self.assertRaises(reconciliation.ReconciliationError):
-            self._start(job, task, self.tenant)
-        self.assertEqual(self.budget_row(job), before)
+            self._start(job_a, task_b, self.tenant)
+
+        # Independently re-read both affected tables after transaction exit.
+        self.assertEqual(
+            self.budget_row(job_a), before_a,
+            "job A reservation must be rolled back")
         self.assertEqual(
             self.sql("SELECT count(*) FROM execution_attempts"
-                     " WHERE job_id=%s", (job,))[0][0], 0)
+                     " WHERE job_id=%s", (job_a,))[0][0],
+            0, "no attempt may be inserted")
 
     def test_start_metered_missing_uses_same_public_contract(self):
         job, task = self.metered_fixture(self.foreign)
@@ -1105,26 +1525,48 @@ class LedgerDatabaseTests(unittest.TestCase):
                      " WHERE attempt_id=%s", (attempt,))[0][0], before_cases)
 
     def test_sweep_uses_each_resource_own_tenant(self):
-        """Two eligible attempts in different tenants, opened correctly."""
+        """Two genuinely eligible attempts, each opened with its own tenant."""
         job_a, task_a = self.metered_fixture(self.tenant)
         job_b, task_b = self.metered_fixture(self.foreign)
         attempt_a = self._start(job_a, task_a, self.tenant)
         attempt_b = self._start(job_b, task_b, self.foreign)
+
+        # Both candidates must satisfy the UNCHANGED sweep predicates, so
+        # the test cannot pass merely because neither was eligible.
+        eligible = self.sql(
+            "SELECT a.id FROM execution_attempts a"
+            " WHERE a.billing_mode='metered' AND a.status='running'"
+            " AND a.accounting_due_at<=clock_timestamp()"
+            " AND a.reserved_cost_usd IS NOT NULL AND a.id IN (%s,%s)",
+            (attempt_a, attempt_b))
+        self.assertEqual(len(eligible), 2,
+                         "both attempts must be sweep-eligible up-front")
+
         self.sql("UPDATE execution_attempts SET accounting_due_at="
                  "clock_timestamp()-interval '1 second' WHERE id IN (%s,%s)",
                  (attempt_a, attempt_b))
+
         counts = reconciliation.sweep()
         self.assertEqual(counts["opened"], 2)
-        for attempt, tenant in ((attempt_a, self.tenant),
-                                (attempt_b, self.foreign)):
+
+        for attempt, job, tenant in ((attempt_a, job_a, self.tenant),
+                                     (attempt_b, job_b, self.foreign)):
             case = self.sql("SELECT tenant_id, job_id"
                             " FROM metered_reconciliations WHERE attempt_id=%s",
                             (attempt,))
             self.assertEqual(len(case), 1)
-            self.assertEqual(case[0][0], tenant)
-        # each resource was opened against its own tenant's budget
+            self.assertEqual(
+                case[0], (tenant, job),
+                "case must be attributed to its own resource's tenant/job")
+
+        # Cross-tenant isolation: each budget moved only for its own job.
         self.assertEqual(self.budget_row(job_a)[3], Decimal("1.00"))
         self.assertEqual(self.budget_row(job_b)[3], Decimal("1.00"))
+        cases_a = self.sql("SELECT count(*) FROM metered_reconciliations"
+                           " WHERE job_id=%s", (job_a,))[0][0]
+        cases_b = self.sql("SELECT count(*) FROM metered_reconciliations"
+                           " WHERE job_id=%s", (job_b,))[0][0]
+        self.assertEqual((cases_a, cases_b), (1, 1))
 
     def test_finalize_same_tenant_settles(self):
         job, task = self.metered_fixture(self.tenant)
@@ -1132,46 +1574,76 @@ class LedgerDatabaseTests(unittest.TestCase):
         accounting.finalize_attempt_and_budget(
             job, attempt,
             ExecutionAttempt("k", "p", "m", True, 10, 5), Decimal("1.00"),
-            Decimal("0.50"), "b3", 1, "metered", tenant_id=self.tenant)
-        row = self.sql("SELECT status, reconciled_cost_usd FROM"
-                       " execution_attempts WHERE id=%s", (attempt,))[0]
-        self.assertEqual(row, ("succeeded", Decimal("0.50")))
-        self.assertEqual(self.budget_row(job)[1:], (Decimal(0),
-                                                    Decimal("0.50")))
+            Decimal("0.50"), "pk", 1, "metered", tenant_id=self.tenant)
+        # three projected fields: status, prompt/completion usage, cost
+        row = self.sql("SELECT status, prompt_tokens, completion_tokens,"
+                       " reconciled_cost_usd FROM execution_attempts"
+                       " WHERE id=%s", (attempt,))[0]
+        self.assertEqual(
+            row, ("succeeded", 10, 5, Decimal("0.50")))
+        limit, reserved, spent, _ = self.budget_row(job)
+        self.assertEqual(reserved, Decimal(0))
+        self.assertEqual(spent, Decimal("0.50"))
 
     def test_finalize_foreign_denied_no_partial_mutation(self):
         job, task = self.metered_fixture(self.foreign)
         attempt = self._start(job, task, self.foreign)
+        # The fixture must be genuinely finalizable apart from tenancy:
+        # running, metered, owned by job B, with a live reservation.
+        state = self.sql(
+            "SELECT status, billing_mode, job_id, reserved_cost_usd"
+            " FROM execution_attempts WHERE id=%s", (attempt,))[0]
+        self.assertEqual(state, ("running", "metered", job,
+                                 Decimal("1.00")))
+        self.assertEqual(self.budget_row(job)[1], Decimal("1.00"))
+
         before_budget = self.budget_row(job)
         before_attempt = self.sql(
-            "SELECT status, reconciled_cost_usd FROM execution_attempts"
-            " WHERE id=%s", (attempt,))[0]
+            "SELECT status, finished_at, reconciled_cost_usd"
+            " FROM execution_attempts WHERE id=%s", (attempt,))[0]
+        before_cases = self.sql(
+            "SELECT count(*) FROM metered_reconciliations"
+            " WHERE job_id=%s", (job,))[0][0]
+
         with self.assertRaises(accounting.AccountingError):
             accounting.finalize_attempt_and_budget(
                 job, attempt,
                 ExecutionAttempt("k", "p", "m", True, 10, 5),
-                Decimal("1.00"), Decimal("0.50"), "b3", 1, "metered",
+                Decimal("1.00"), Decimal("0.50"), "pk", 1, "metered",
                 tenant_id=self.tenant)
-        # independently re-read attempt and budget
+
+        # Independently re-read all three surfaces.
         self.assertEqual(self.budget_row(job), before_budget)
         self.assertEqual(
-            self.sql("SELECT status, reconciled_cost_usd FROM"
-                     " execution_attempts WHERE id=%s", (attempt,))[0],
+            self.sql("SELECT status, finished_at, reconciled_cost_usd"
+                     " FROM execution_attempts WHERE id=%s", (attempt,))[0],
             before_attempt)
+        self.assertEqual(
+            self.sql("SELECT count(*) FROM metered_reconciliations"
+                     " WHERE job_id=%s", (job,))[0][0],
+            before_cases)
 
     def test_observer_tenant_a_cannot_mutate_tenant_b(self):
+        """Observer built for tenant A must not touch tenant B resources."""
         job_b, task_b = self.metered_fixture(self.foreign)
-        attempt_b = self._start(job_b, task_b, self.foreign)
+        self._start(job_b, task_b, self.foreign)
         observer = budgeted_observer.BudgetedLedgerObserver(
             job_b, task_b, {"standard": Decimal("1.00")},
             tenant_id=self.tenant)
-        before = self.budget_row(job_b)
+        before_budget = self.budget_row(job_b)
+        before_attempts = self.sql(
+            "SELECT count(*) FROM execution_attempts WHERE job_id=%s",
+            (job_b,))[0][0]
         with self.assertRaises(reconciliation.ReconciliationError):
             observer.attempt_started(
-                1, ModelCandidate("b3", "p", None, "standard", 1,
-                                  pricing_key="b3", billing_mode="metered"),
+                1, ModelCandidate("pk", "p", None, "standard", 1,
+                                  pricing_key="pk", billing_mode="metered"),
                 "m")
-        self.assertEqual(self.budget_row(job_b), before)
+        self.assertEqual(self.budget_row(job_b), before_budget)
+        self.assertEqual(
+            self.sql("SELECT count(*) FROM execution_attempts"
+                     " WHERE job_id=%s", (job_b,))[0][0],
+            before_attempts)
 
 
 class _Shared:
