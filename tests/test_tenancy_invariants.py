@@ -23,8 +23,30 @@ executable position is located and its SET clause parsed structurally:
 Python sources are scanned through their AST so that ``#`` comments can never
 match and docstrings (which may legitimately *discuss* the forbidden shape)
 are skipped. Concatenation, f-strings, ``%``-formatting and ``.format()`` are
-reconstructed, and simple module/function constant assignments are
-inlined, so assembling SQL at runtime does not evade the scan.
+reconstructed -- including ``{}``/``{0}``/``{name}`` substitution when the
+arguments are statically resolvable -- and simple module/function constant
+assignments are inlined, so assembling SQL at runtime does not evade the
+scan.
+
+Executable dollar-quoted bodies (DO / CREATE FUNCTION / CREATE PROCEDURE /
+EXECUTE) are scanned as a whole: statement splitting never breaks inside a
+dollar body, so an UPDATE hidden after a harmless first statement is still
+in executable context. A dollar-quoted value in a plain VALUES list is data
+and is ignored.
+
+Historical exemptions are pinned to the exact (migration path, normalised
+statement) pair and are value sensitive: string literals keep their value in
+the canonical form, so the same statement shape carrying a different UUID is
+a violation. Each approved statement is authorised once; a duplicate copy
+does not inherit the permission.
+
+RESIDUAL LIMITATION: SQL whose text is not statically derivable -- for
+example ``"UPDATE {} SET tenant_id=%s".format(cfg.table)`` -- cannot be
+proven. Rather than pass silently, the detector fails closed by probing the
+template with each unresolved field bound to ``jobs`` and to ``tenant_id``
+and reporting a finding if either probe looks like a reassignment. This
+yields a possible false positive on non-literal table selection and no proof
+of the runtime value; it is a re-audit trigger, not a guarantee.
 
 Scope decisions:
 
@@ -50,6 +72,7 @@ part of the detector, not a writer whitelist.
 import ast
 import bisect
 import re
+import string
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,26 +81,55 @@ ROOT = Path(__file__).resolve().parent.parent
 SELF = Path("tests/test_tenancy_invariants.py")
 
 # --- Pinned historical exceptions -----------------------------------------
-# Canonical statement text. Never a line number: an appended second mutation
-# in migration 007 canonicalises differently and therefore fails.
-APPROVED_WRITES = frozenset(
+# Exemptions are keyed by (exact historical migration path, exact normalised
+# statement text) and are VALUE SENSITIVE: string literals are preserved in
+# the canonical form, so the historical tenant UUID stays pinned. The same
+# statement shape carrying a different UUID is a violation, and a second
+# occurrence of an approved statement does not inherit the exemption.
+HISTORICAL_TENANT_UUID = "00000000-0000-4000-8000-000000000001"
+
+APPROVED = frozenset(
     {
-        "UPDATE JOBS SET TENANT_ID = ? WHERE TENANT_ID IS NULL",
+        (
+            "migrations/007_tenants.sql",
+            "UPDATE JOBS SET TENANT_ID = "
+            f"'{HISTORICAL_TENANT_UUID}' WHERE TENANT_ID IS NULL",
+        ),
+        (
+            "migrations/007_tenants.sql",
+            "ALTER TABLE JOBS ADD COLUMN IF NOT EXISTS TENANT_ID UUID",
+        ),
+        (
+            "migrations/007_tenants.sql",
+            "ALTER TABLE JOBS ALTER COLUMN TENANT_ID SET NOT NULL",
+        ),
+        (
+            "migrations/007_tenants.sql",
+            "ALTER TABLE JOBS ALTER COLUMN TENANT_ID SET DEFAULT "
+            f"'{HISTORICAL_TENANT_UUID}'",
+        ),
+        (
+            "migrations/008_explicit_tenant_isolation.sql",
+            "ALTER TABLE JOBS ALTER COLUMN TENANT_ID DROP DEFAULT",
+        ),
+        (
+            # migration 007 creates the jobs tenant FK inside a DO block; with
+            # executable-body scanning this is a real DDL hit and must be
+            # pinned explicitly rather than silently tolerated.
+            "migrations/007_tenants.sql",
+            "DO BEGIN IF NOT EXISTS ( SELECT 1 FROM PG_CONSTRAINT"
+            " WHERE CONNAME = 'jobs_tenant_fk' ) THEN ALTER TABLE JOBS"
+            " ADD CONSTRAINT JOBS_TENANT_FK FOREIGN KEY ( TENANT_ID )"
+            " REFERENCES TENANTS ( ID ) ON DELETE RESTRICT ; END IF ; END",
+        ),
     }
 )
-APPROVED_DDL = frozenset(
-    {
-        # migration 007: introduce the column and its historical guarantees.
-        "ALTER TABLE JOBS ADD COLUMN IF NOT EXISTS TENANT_ID UUID",
-        "ALTER TABLE JOBS ALTER COLUMN TENANT_ID SET NOT NULL",
-        "ALTER TABLE JOBS ALTER COLUMN TENANT_ID SET DEFAULT ?",
-        # migration 008: remove the bootstrap default (tightens isolation).
-        "ALTER TABLE JOBS ALTER COLUMN TENANT_ID DROP DEFAULT",
-    }
-)
+APPROVED_CANONICALS = frozenset(statement for _, statement in APPROVED)
 
 WRITE = "write"
 DDL = "ddl"
+
+_FORMATTER = string.Formatter()
 
 _SQL_TOKEN_RE = re.compile(
     r"""
@@ -152,10 +204,6 @@ def _tokenize(text):
             i = m.end()
             continue
         body = dollar_stack[-1][1] if dollar_stack else None
-        if kind == "string" and body is not None:
-            # quoted text inside a dollar block: data, not code
-            i = m.end()
-            continue
         if kind == "punct":
             if value == "(":
                 toks.append(_Tok("punct", value, line, depth, body))
@@ -173,12 +221,20 @@ def _tokenize(text):
 
 
 def _canon_token(tok: _Tok) -> str:
+    """Canonical text for comparison.
+
+    Keywords/identifiers are case-folded and string literals are whitespace
+    normalised but their VALUE is preserved, so historical exemptions cannot
+    be inherited by the same statement shape carrying a different UUID.
+    """
     if tok.kind == "name":
         return tok.text.upper()
-    if tok.kind == "string":
-        return "?"
     if tok.kind == "quoted":
-        return tok.text.replace('""', '"').upper()
+        return '"' + tok.text.strip('"').replace('""', '"').upper() + '"'
+    if tok.kind == "string":
+        body = tok.text.replace("''", "'").strip("'")
+        body = re.sub(r"\s+", " ", body).strip()
+        return f"'{body}'"
     return tok.text
 
 
@@ -216,10 +272,17 @@ def _qualified_name(toks, i):
 
 
 def _split_statements(toks):
+    """Split on ';' but never inside a dollar-quoted body.
+
+    A plpgsql body such as ``DO $$ BEGIN PERFORM 1; UPDATE jobs ...; END $$``
+    must stay a single statement, otherwise the executable context (DO /
+    CREATE FUNCTION) is lost after the first inner ';' and later statements
+    would be scanned as if they were data.
+    """
     statements = []
     current = []
     for tok in toks:
-        if tok.kind == "punct" and tok.text == ";":
+        if tok.kind == "punct" and tok.text == ";" and tok.body is None:
             if current:
                 statements.append(current)
             current = []
@@ -341,41 +404,40 @@ def _update_writes_jobs_tenant(toks):
 
 
 def _ddl_alters_jobs_tenant(toks):
-    """True if this statement is ALTER TABLE jobs ... touching tenant semantics.
+    """True if the token stream contains ALTER TABLE jobs touching tenant_id.
 
-    Covers direct tenant_id references (ALTER COLUMN / DROP / RENAME / TYPE
-    USING / DEFAULT) and tenant constraint changes, which never spell the
-    column name but still change what tenant_id guarantees.
+    Scans for ALTER anywhere rather than only at statement start, so DDL
+    wrapped in an executable dollar-quoted body (DO / CREATE FUNCTION /
+    CREATE PROCEDURE) is still evaluated.
     """
-    if not toks or not _is_name(toks[0], "ALTER"):
-        return False
-    i = 1
-    if i < len(toks) and _is_name(toks[i], "TABLE"):
-        i += 1
-    else:
-        return False
-    while i < len(toks):
-        if _is_name(toks[i], "IF"):
-            i += 2  # IF EXISTS / IF NOT EXISTS
-        elif _is_name(toks[i], "ONLY"):
-            i += 1  # ALTER TABLE ONLY <table>
-        else:
-            break
-    target, after = _qualified_name(toks, i)
-    if target.split(".")[-1] != "jobs":
-        return False
-    rest = toks[after:]
-    names = [t for t in rest if t.kind in ("name", "quoted")]
-    segments = [_identifier_name(t).split(".")[-1] for t in names]
-    if any(seg == "tenant_id" for seg in segments):
-        return True
-    # constraint-level changes to tenant isolation, e.g. DROP CONSTRAINT
-    # jobs_tenant_fk, which never mention the column name directly.
-    mentions_constraint = any(
-        _is_name(t, "CONSTRAINT") for t in rest
-    )
-    if mentions_constraint and any("tenant" in seg for seg in segments):
-        return True
+    for i, tok in enumerate(toks):
+        if not _is_name(tok, "ALTER"):
+            continue
+        if i + 1 >= len(toks) or not _is_name(toks[i + 1], "TABLE"):
+            continue
+        j = i + 2
+        while j < len(toks):
+            if _is_name(toks[j], "IF"):
+                j += 2  # IF EXISTS / IF NOT EXISTS
+            elif _is_name(toks[j], "ONLY"):
+                j += 1
+            else:
+                break
+        target, after = _qualified_name(toks, j)
+        if target.split(".")[-1] != "jobs":
+            continue
+        rest = toks[after:]
+        segments = [
+            _identifier_name(t).split(".")[-1]
+            for t in rest
+            if t.kind in ("name", "quoted")
+        ]
+        if any(seg == "tenant_id" for seg in segments):
+            return True
+        if any(_is_name(t, "CONSTRAINT") for t in rest) and any(
+            "tenant" in seg for seg in segments
+        ):
+            return True
     return False
 
 
@@ -399,8 +461,13 @@ def _dollar_bodies_are_code(stmt) -> bool:
     return False
 
 
-def scan_sql(text):
-    """Yield Findings for one SQL source text."""
+def scan_sql(text, path=None):
+    """Yield Findings for one SQL source text.
+
+    `path` scopes historical exemptions to the exact migration that owns
+    them; without it, exemption is decided on canonical text alone (used by
+    the standalone controls).
+    """
     findings = []
     for stmt in _split_statements(_tokenize(text)):
         if not stmt:
@@ -417,13 +484,16 @@ def scan_sql(text):
             continue
         line = stmt[0].line
         if _update_writes_jobs_tenant(code):
-            findings.append(
-                Finding(line, WRITE, canon[:200], canon in APPROVED_WRITES)
-            )
+            kind = WRITE
         elif _ddl_alters_jobs_tenant(code):
-            findings.append(
-                Finding(line, DDL, canon[:200], canon in APPROVED_DDL)
-            )
+            kind = DDL
+        else:
+            continue
+        if path is None:
+            approved = canon in APPROVED_CANONICALS
+        else:
+            approved = (path, canon) in APPROVED
+        findings.append(Finding(line, kind, canon[:200], approved))
     return findings
 
 
@@ -493,13 +563,76 @@ def _reconstruct(node, consts, docs):
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "format"
     ):
-        base = _reconstruct(node.func.value, consts, docs)
-        if base:
-            return [(node.lineno, base[0][1])]
+        return _reconstruct_format(node, consts, docs)
     if isinstance(node, ast.Name):
         if node.id in consts:
             return [(node.lineno, consts[node.id])]
     return []
+
+
+class _Unresolved:
+    """Marker for a format field whose argument is not statically known."""
+
+
+def _reconstruct_format(node, consts, docs):
+    """Reconstruct ``"...".format(...)`` when arguments are resolvable.
+
+    If any argument is not statically resolvable, fail closed: the template
+    is additionally probed with every unresolved field bound to ``jobs`` and
+    to ``tenant_id``. If either probe looks like a jobs tenant reassignment,
+    the statement is reported so the change gets human review. This cannot
+    prove the runtime value, and that residual limitation is documented in
+    the module docstring.
+    """
+    base = _reconstruct(node.func.value, consts, docs)
+    if not base:
+        return []
+    lineno, template = base[0]
+    values = {}
+    positional = []
+    unresolved = False
+    for index, arg in enumerate(node.args):
+        sub = _reconstruct(arg, consts, docs)
+        if sub:
+            values[index] = sub[0][1]
+            positional.append(sub[0][1])
+        else:
+            unresolved = True
+    for kw in node.keywords:
+        sub = _reconstruct(kw.value, consts, docs)
+        if sub:
+            values[kw.arg] = sub[0][1]
+        else:
+            unresolved = True
+    if not unresolved:
+        return [(lineno, _apply_format(template, values))]
+
+    probes = []
+    for probe_value in ("jobs", "tenant_id"):
+        probe_values = dict(values)
+        probe_values.setdefault(0, probe_value)
+        probes.append((lineno, _apply_format(template, probe_values)))
+    return [(lineno, _apply_format(template, values))] + probes
+
+
+def _apply_format(template, values):
+    """Substitute {}/ {0}/ {name} fields. Unresolved fields -> _Unresolved."""
+    out = []
+    auto = 0
+    for literal, field, spec, conv in _FORMATTER.parse(template):
+        out.append(literal)
+        if field is None:
+            continue
+        if field == "":
+            value = values[auto] if auto < len(values) else _Unresolved
+            auto += 1
+        elif field.isdigit():
+            idx = int(field)
+            value = values[idx] if idx < len(values) else _Unresolved
+        else:
+            value = values[field] if field in values else _Unresolved
+        out.append("" if value is _Unresolved else str(value))
+    return "".join(out)
 
 
 def scan_python(text):
@@ -554,10 +687,36 @@ def scan_repository(root=ROOT, extra=None):
     if extra:
         entries.update(extra)
     for rel, text in entries.items():
-        hits = scan_sql(text) if rel.endswith(".sql") else scan_python(text)
+        if rel.endswith(".sql"):
+            hits = scan_sql(text, path=rel)
+        else:
+            # Python never owns a historical exemption, but a synthetic SQL
+            # blob pasted into a .py file must not inherit one either.
+            try:
+                hits = [
+                    Finding(f.line, f.kind, f.statement, False)
+                    for f in scan_python(text)
+                ]
+            except SyntaxError as exc:
+                # Fail loudly: an unparseable source must never be silently
+                # treated as "scanned and clean".
+                violations.append(
+                    f"{rel}:1: [unscannable source] {exc.msg}"
+                )
+                continue
+        # Multiplicity: a historical statement is authorised once. A second
+        # occurrence does not inherit the exemption.
+        consumed = set()
         for f in hits:
-            if not f.approved:
-                kind = "tenant_id write" if f.kind == WRITE else "tenant_id DDL"
+            approved = f.approved
+            if approved:
+                if f.statement in consumed:
+                    approved = False
+                consumed.add(f.statement)
+            if not approved:
+                kind = (
+                    "tenant_id write" if f.kind == WRITE else "tenant_id DDL"
+                )
                 violations.append(f"{rel}:{f.line}: [{kind}] {f.statement}")
     return violations
 
@@ -599,6 +758,15 @@ POSITIVE_SQL = [
     "CREATE FUNCTION f() RETURNS trigger AS $$ BEGIN "
     "UPDATE jobs SET tenant_id = NEW.tenant_id; RETURN NEW; END $$ "
     "LANGUAGE plpgsql",
+    # multi-statement executable bodies: the escape only needs a harmless
+    # first statement inside the body.
+    "DO $$\nBEGIN\n    PERFORM 1;\n    UPDATE jobs SET tenant_id = %s;\nEND\n$$;",
+    "CREATE FUNCTION reassign() RETURNS trigger AS $$\nBEGIN\n"
+    "    PERFORM 1;\n    UPDATE jobs SET tenant_id = NEW.tenant_id;\n"
+    "    RETURN NEW;\nEND\n$$ LANGUAGE plpgsql",
+    "CREATE PROCEDURE reassign() AS $$\nBEGIN\n    PERFORM 1;\n"
+    "    UPDATE jobs SET tenant_id = %s;\nEND\n$$ LANGUAGE plpgsql",
+    "EXECUTE $body$ BEGIN PERFORM 1; UPDATE jobs SET tenant_id = %s; END $body$",
     # comment noise around a real write
     "UPDATE jobs SET tenant_id = %s -- reassign\nWHERE id = %s",
     "UPDATE jobs /* reassign */ SET tenant_id = %s WHERE id = %s",
@@ -621,6 +789,12 @@ POSITIVE_PYTHON = [
     'sql = "WITH x AS (SELECT 1) " + "UPDATE jobs SET tenant_id = %s"',
     # constant table name inlined into an f-string
     'TABLE = "jobs"\nsql = f"UPDATE {TABLE} SET tenant_id = %s WHERE id = %s"',
+    # .format() substitution (original reproduction)
+    'cur.execute("UPDATE {} SET tenant_id=%s".format("jobs"), (tenant,))',
+    'sql = "UPDATE {} SET {}=%s WHERE id=%s".format("jobs", "tenant_id")',
+    'sql = "UPDATE {table} SET tenant_id=%s".format(table="jobs")',
+    # .format() whose argument is not statically resolvable must fail closed
+    'sql = "UPDATE {} SET tenant_id=%s".format(config.table)',
 ]
 
 # Negative: legitimate statements and decoys that must not fire.
@@ -671,7 +845,149 @@ POSITIVE_DDL = [
 ]
 
 
+# Positive: DDL re-audit tripwire, including inside executable bodies.
+POSITIVE_DDL_BODY = [
+    "DO $$ BEGIN PERFORM 1; ALTER TABLE jobs ALTER COLUMN tenant_id "
+    "DROP NOT NULL; END $$;",
+    "DO $$ BEGIN PERFORM 1; ALTER TABLE jobs DROP COLUMN tenant_id; END $$;",
+    "DO $$ BEGIN PERFORM 1; ALTER TABLE jobs RENAME COLUMN tenant_id "
+    "TO owner_id; END $$;",
+    "DO $$ BEGIN PERFORM 1; ALTER TABLE jobs ALTER COLUMN tenant_id "
+    "TYPE text USING tenant_id::text; END $$;",
+    "CREATE FUNCTION d() RETURNS void AS $$ BEGIN PERFORM 1; "
+    "ALTER TABLE jobs ALTER COLUMN tenant_id SET DEFAULT 'x'; END $$ "
+    "LANGUAGE plpgsql",
+    "CREATE PROCEDURE d() AS $$ BEGIN PERFORM 1; "
+    "ALTER TABLE jobs ALTER COLUMN tenant_id DROP DEFAULT; END $$ "
+    "LANGUAGE plpgsql",
+]
+
+
 class TenantImmutabilitySentinelTests(unittest.TestCase):
+    def test_positive_ddl_inside_executable_body(self):
+        for sql in POSITIVE_DDL_BODY:
+            with self.subTest(sql=sql[:50]):
+                hits = scan_sql(sql)
+                self.assertTrue(
+                    [f for f in hits if f.kind == DDL],
+                    f"DDL-in-body missed: {sql[:80]}",
+                )
+
+    def test_data_dollar_literal_stays_non_executable(self):
+        for sql in (
+            "INSERT INTO audit_log (note) VALUES "
+            "($tag$ UPDATE jobs SET tenant_id = 'x' $tag$)",
+            "INSERT INTO audit_log (note) VALUES "
+            "($tag$ ALTER TABLE jobs DROP COLUMN tenant_id $tag$)",
+            "SELECT $tag$ BEGIN UPDATE jobs SET tenant_id = 1; END $tag$",
+        ):
+            with self.subTest(sql=sql[:50]):
+                self.assertEqual(scan_sql(sql), [], sql[:80])
+
+    def test_format_reconstruction_resolves_table_and_column(self):
+        self.assertTrue(
+            scan_python('cur.execute("UPDATE {} SET {}=%s".format("jobs",'
+                        ' "tenant_id"), (t,))')
+        )
+        self.assertTrue(
+            scan_python('cur.execute("UPDATE {} SET tenant_id=%s"'
+                        '.format("jobs"), (t,))')
+        )
+
+    def test_format_with_unresolvable_argument_fails_closed(self):
+        """Documented residual limitation: probed, not proven."""
+        hits = scan_python('sql = "UPDATE {} SET tenant_id=%s".format(cfg.t)')
+        self.assertTrue(
+            hits,
+            "unresolvable format argument must fail closed, not pass silently",
+        )
+
+    def test_historical_exemption_is_value_sensitive(self):
+        """Same shape, different UUID => violation."""
+        other = "11111111-0000-4000-8000-000000000002"
+        tampered = (
+            "UPDATE jobs\nSET tenant_id = "
+            f"'{other}'\nWHERE tenant_id IS NULL;\n"
+        )
+        violations = scan_repository(
+            extra={"migrations/007_tenants.sql": tampered}
+        )
+        self.assertTrue(violations, "different UUID must not inherit exemption")
+
+    def test_second_historical_shape_mutation_is_caught(self):
+        other = "11111111-0000-4000-8000-000000000003"
+        original = (ROOT / "migrations" / "007_tenants.sql").read_text(
+            encoding="utf-8-sig"
+        )
+        tampered = (
+            original
+            + "\nUPDATE jobs\nSET tenant_id = "
+            f"'{other}'\nWHERE tenant_id IS NULL;\n"
+        )
+        violations = scan_repository(
+            extra={"migrations/007_tenants.sql": tampered}
+        )
+        self.assertTrue(
+            violations,
+            "a second historical-shape mutation must not inherit permission",
+        )
+
+    def test_identical_historical_statement_twice_is_caught(self):
+        """Multiplicity matters: one authorisation, not unlimited copies."""
+        original = (ROOT / "migrations" / "007_tenants.sql").read_text(
+            encoding="utf-8-sig"
+        )
+        duplicate = (
+            "UPDATE jobs\nSET tenant_id = "
+            f"'{HISTORICAL_TENANT_UUID}'\nWHERE tenant_id IS NULL;\n"
+        )
+        violations = scan_repository(
+            extra={"migrations/007_tenants.sql": original + "\n" + duplicate}
+        )
+        self.assertTrue(
+            violations, "a duplicated approved statement must still be flagged"
+        )
+
+    def test_008_future_default_with_different_uuid_is_caught(self):
+        other = "11111111-0000-4000-8000-000000000004"
+        original = (
+            ROOT / "migrations" / "008_explicit_tenant_isolation.sql"
+        ).read_text(encoding="utf-8-sig")
+        tampered = (
+            original
+            + "\nALTER TABLE jobs\nALTER COLUMN tenant_id\nSET DEFAULT "
+            f"'{other}';\n"
+        )
+        violations = scan_repository(
+            extra={
+                "migrations/008_explicit_tenant_isolation.sql": tampered
+            }
+        )
+        self.assertTrue(
+            violations, "a new SET DEFAULT with another UUID must be flagged"
+        )
+
+    def test_exemption_does_not_travel_to_another_file(self):
+        """Exemptions are scoped to the exact historical migration."""
+        backfill = (
+            "UPDATE jobs\nSET tenant_id = "
+            f"'{HISTORICAL_TENANT_UUID}'\nWHERE tenant_id IS NULL;\n"
+        )
+        violations = scan_repository(
+            extra={"migrations/016_synthetic_probe.sql": backfill}
+        )
+        self.assertTrue(
+            violations,
+            "the historical backfill statement is only exempt in migration 007",
+        )
+
+    def test_unparseable_source_fails_loudly(self):
+        violations = scan_repository(
+            extra={"controller/devai/_synthetic_probe.py": "def (:\n"}
+        )
+        self.assertTrue(
+            violations, "an unparseable source must not be silently skipped"
+        )
     def test_positive_ddl_controls(self):
         for sql in POSITIVE_DDL:
             with self.subTest(sql=sql[:50]):

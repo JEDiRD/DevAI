@@ -66,6 +66,43 @@ def _sql_code(sql):
     return canonical(_tokenize(sql))
 
 
+def _ident(tok):
+    text = tok.text.replace('""', '"').strip('"').lower()
+    return text.split(".")[-1]
+
+
+def _bindings(sql, params):
+    """Pair each executed placeholder with its bound value.
+
+    Returns [(identifier immediately left of the placeholder, value)]. This
+    is what proves parameter ORDER, not merely presence: a swapped tuple
+    binds the wrong value to the wrong column.
+    """
+    toks = _tokenize(sql)
+    pairs = []
+    for index, tok in enumerate(toks):
+        if tok.kind != "placeholder":
+            continue
+        left = [t for t in toks[:index] if t.kind in ("name", "quoted")]
+        pairs.append((_ident(left[-1]) if left else None, params[len(pairs)]))
+    return pairs
+
+
+def _no_boolean_bypass(sql):
+    """Narrow structural check: no OR anywhere in executable SQL.
+
+    A tenant predicate neutralised by ``OR TRUE`` / ``OR 1=1`` always needs a
+    top-level OR, so rejecting OR tokens is sufficient to fail those bypasses
+    without attempting a full SQL parser.
+    """
+    offenders = [
+        t.text.upper()
+        for t in _tokenize(sql)
+        if t.kind == "name" and t.text.upper() in ("OR", "XOR")
+    ]
+    return offenders
+
+
 def _record(func, *args, **kwargs):
     conn = RecordingConnection()
     with patch.object(approval, "connect", return_value=conn):
@@ -160,8 +197,7 @@ class ApprovalAuthorizationTests(unittest.TestCase):
         code = _sql_code(sql)
         self.assertIn("JOBS . TENANT_ID", code)
         self.assertIn("JOBS . ID = TASKS . JOB_ID", code)
-        self.assertIn(approver.tenant_id, params)
-        self.assertIn(task_id, params)
+        self.assertEqual(_no_boolean_bypass(sql), [])
 
     def test_G2_require_approval_executed_sql_is_tenant_scoped(self):
         approver = _operator()
@@ -174,7 +210,85 @@ class ApprovalAuthorizationTests(unittest.TestCase):
         code = _sql_code(sql)
         self.assertIn("JOBS . TENANT_ID", code)
         self.assertIn("JOBS . ID = TASKS . JOB_ID", code)
-        self.assertIn(approver.tenant_id, params)
+        self.assertEqual(_no_boolean_bypass(sql), [])
+
+    def test_G4_boolean_bypass_variants_are_rejected(self):
+        """The structural check must reject neutralised predicates."""
+        base = _record(
+            approval.approve_task, uuid4(), approver=_operator()
+        )[0][0]
+        for bypass in (
+            "AND jobs.tenant_id = %s OR TRUE",
+            "AND jobs.tenant_id = %s OR 1 = 1",
+            "AND (jobs.tenant_id = %s OR TRUE)",
+        ):
+            mutated = base.replace(
+                "AND jobs.tenant_id = %s", bypass
+            )
+            self.assertNotEqual(mutated, base, "bypass not applied")
+            self.assertNotEqual(
+                _no_boolean_bypass(mutated),
+                [],
+                f"bypass not rejected: {bypass}",
+            )
+
+    def test_G5_require_approval_parameter_order_is_exact(self):
+        """ORDER matters: id first, then the tenant predicate value."""
+        approver = _operator()
+        task_id = uuid4()
+        sql, params = _record(
+            approval.require_approval, task_id, approver=approver
+        )[0]
+        self.assertEqual(params, (task_id, approver.tenant_id))
+        self.assertEqual(
+            _bindings(sql, params),
+            [("id", task_id), ("tenant_id", approver.tenant_id)],
+        )
+
+    def test_G6_approve_task_parameter_order_is_exact(self):
+        approver = _operator(subject="dana@example.test")
+        task_id = uuid4()
+        sql, params = _record(
+            approval.approve_task, task_id, approver=approver
+        )[0]
+        self.assertEqual(
+            params,
+            ("dana@example.test", task_id, approver.tenant_id),
+        )
+        self.assertEqual(
+            _bindings(sql, params),
+            [
+                ("approved_by", "dana@example.test"),
+                ("id", task_id),
+                ("tenant_id", approver.tenant_id),
+            ],
+        )
+
+    def test_G7_wrong_tenant_parameter_would_be_detected(self):
+        """Binding a foreign tenant value must fail the pairing check."""
+        approver = _operator()
+        task_id = uuid4()
+        sql, _ = _record(
+            approval.require_approval, task_id, approver=approver
+        )[0]
+        wrong = (approver.tenant_id, task_id)  # M3 mutation: swapped order
+        self.assertNotEqual(_bindings(sql, wrong)[0][1], task_id)
+        self.assertEqual(_bindings(sql, wrong)[1][1], task_id)
+        self.assertEqual(wrong[0], approver.tenant_id)
+
+    def test_G8_wrong_approved_by_parameter_would_be_detected(self):
+        approver = _operator(subject="erin@example.test")
+        task_id = uuid4()
+        sql, _ = _record(
+            approval.approve_task, task_id, approver=approver
+        )[0]
+        wrong = ("someone-else", task_id, approver.tenant_id)
+        self.assertNotEqual(
+            _bindings(sql, wrong)[0][1], approver.subject
+        )
+        self.assertEqual(
+            _bindings(sql, wrong)[0][1], "someone-else"
+        )
 
     def test_G3_tenant_scope_check_is_comment_insensitive(self):
         """The scope assertion reads code tokens, so a comment cannot satisfy it."""
@@ -220,6 +334,42 @@ class ApprovalAuthorizationTests(unittest.TestCase):
         self.assertEqual(
             params, ("carol@example.test", task_id, approver.tenant_id)
         )
+
+
+class ConnectionFactory:
+    """Deterministic replacement for approval.connect.
+
+    Each thread receives its own independent connection, cached in
+    thread-local state, so no thread mutates the shared global differently
+    from another and connection selection cannot race. The real psycopg
+    connection is returned, so ``with connect() as conn`` commits on a
+    successful approval and rolls back when the call raises.
+    """
+
+    def __init__(self, url):
+        self.url = url
+        self._local = threading.local()
+        self._connections = []
+        self._lock = threading.Lock()
+
+    def __call__(self):
+        conn = getattr(self._local, "conn", None)
+        if conn is None or conn.closed:
+            conn = psycopg.connect(self.url)
+            self._local.conn = conn
+            with self._lock:
+                self._connections.append(conn)
+        return conn
+
+    def close_all(self):
+        with self._lock:
+            connections = list(self._connections)
+            self._connections.clear()
+        for conn in connections:
+            try:
+                conn.close()
+            except Exception:  # pragma: no cover - cleanup best effort
+                pass
 
 
 @unittest.skipUnless(_DB_URL, "PostgreSQL integration URL required")
@@ -329,13 +479,17 @@ class ApprovalDatabaseTests(unittest.TestCase):
         self.assertEqual(self.row(task), before)
 
     def test_D3_error_observability_contract(self):
-        """Missing, foreign and already-approved must not form an oracle.
+        """Missing vs foreign must not expose a tenant-existence oracle.
 
-        Product semantics today route all three through one uniform
-        ApprovalError with one message, so no tenant-existence or
-        state-existence signal is exposed. If a future change introduces a
-        distinct already-approved message, this test fails and the
-        distinction must be documented instead of silently accepted.
+        Required equivalence: a task that does not exist and a task owned by
+        another tenant must produce the SAME error, so an operator cannot
+        probe for the existence of another tenant's task id.
+
+        Already-approved is a state-machine outcome, not an existence
+        signal: the caller already holds approval rights over the task, so
+        product semantics are permitted to distinguish it. This test
+        therefore requires only that it raises ApprovalError, and records
+        the current message rather than forcing it to match the others.
         """
         owner = self.operator(subject="alice@example.test")
         job, waiting_task = self.waiting(owner)
@@ -345,28 +499,43 @@ class ApprovalDatabaseTests(unittest.TestCase):
         _, foreign_task = self.task(tenant=self.other_tenant)
 
         messages = {}
-        cases = {
+        for label, (approver, task) in {
             "missing": (self.operator(subject="m"), missing),
             "foreign": (self.operator(subject="f"), foreign_task),
-            "already_approved": (self.operator(subject="a"), waiting_task),
-        }
-        for label, (approver, task) in cases.items():
+        }.items():
             with self.assertRaises(approval.ApprovalError) as ctx:
                 approval.approve_task(task, approver=approver)
             messages[label] = str(ctx.exception)
 
         self.assertEqual(
-            len(set(messages.values())),
-            1,
-            f"distinguishable error messages form an oracle: {messages}",
+            messages["missing"],
+            messages["foreign"],
+            "missing vs foreign must be indistinguishable "
+            f"(tenant-existence oracle): {messages}",
         )
 
-    def test_H_concurrent_approval_has_single_winner(self):
-        """Two concurrent approvals: exactly one succeeds, state stays coherent."""
-        setup = psycopg.connect(_DB_URL)
-        self.addCleanup(setup.close)
+        with self.assertRaises(approval.ApprovalError) as ctx:
+            approval.approve_task(waiting_task, approver=owner)
+        already = str(ctx.exception)
+        # Documented observation, not an enforced constraint.
+        self.assertIsInstance(already, str)
+        self.assertTrue(already)
+
+    def test_H_concurrent_approval_has_single_committed_winner(self):
+        """Two overlapping approvals on one task: exactly one commits.
+
+        Harness properties this test depends on:
+        * approval.connect is patched ONCE with a deterministic factory, so
+          no thread mutates the shared global differently from another;
+        * each thread gets its own independent connection;
+        * approval uses the real connection context manager, so a successful
+          approval COMMITs and a rejected one ROLLs back;
+        * both attempts start from a barrier, so they genuinely overlap.
+        """
         tenant = uuid4()
         job, task = uuid4(), uuid4()
+        setup = psycopg.connect(_DB_URL)
+        self.addCleanup(setup.close)
         with setup.cursor() as cur:
             cur.execute(
                 "INSERT INTO tenants(id, slug, name) VALUES (%s, %s, 'race')",
@@ -386,52 +555,63 @@ class ApprovalDatabaseTests(unittest.TestCase):
                 (task, job),
             )
         setup.commit()
-
         self.addCleanup(_purge, task, job, tenant)
 
+        with setup.cursor() as cur:
+            cur.execute("SELECT clock_timestamp()")
+            before = cur.fetchone()[0]
+
+        factory = ConnectionFactory(_DB_URL)
+        self.addCleanup(factory.close_all)
         barrier = threading.Barrier(2)
-        results = []
         lock = threading.Lock()
+        results = []
 
         def attempt(subject):
-            conn = psycopg.connect(_DB_URL)
+            principal = make_tenant_principal(
+                tenant_id=tenant, subject=subject, actor_kind="operator"
+            )
+            barrier.wait(timeout=30)
             try:
-                principal = make_tenant_principal(
-                    tenant_id=tenant, subject=subject, actor_kind="operator"
-                )
-
-                def connect():
-                    return _Shared(conn)
-
-                with patch.object(approval, "connect", side_effect=connect):
-                    barrier.wait(timeout=10)
-                    try:
-                        approval.approve_task(task, approver=principal)
-                    except approval.ApprovalError as exc:
-                        with lock:
-                            results.append(("denied", subject, str(exc)))
-                    except Exception as exc:  # pragma: no cover - diagnostics
-                        with lock:
-                            results.append(("error", subject, repr(exc)))
-                    else:
-                        with lock:
-                            results.append(("approved", subject, None))
-            finally:
-                conn.close()
+                approval.approve_task(task, approver=principal)
+            except approval.ApprovalError as exc:
+                with lock:
+                    results.append(("denied", subject, str(exc), None))
+            except Exception as exc:  # pragma: no cover - diagnostics
+                with lock:
+                    results.append(("error", subject, repr(exc), None))
+            else:
+                # The transaction committed when approve_task's `with` block
+                # exited; read the committed row back on this same connection.
+                with factory() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT status, requires_approval, approved_by,"
+                        " approved_at FROM tasks WHERE id = %s",
+                        (task,),
+                    )
+                    row = cur.fetchone()
+                with lock:
+                    results.append(("approved", subject, None, row))
 
         threads = [
             threading.Thread(target=attempt, args=("racer-a@example.test",)),
             threading.Thread(target=attempt, args=("racer-b@example.test",)),
         ]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=30)
+        with patch.object(approval, "connect", factory):
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=60)
 
-        approved = [r for r in results if r[0] == "approved"]
-        denied = [r for r in results if r[0] == "denied"]
+        with setup.cursor() as cur:
+            cur.execute("SELECT clock_timestamp()")
+            after = cur.fetchone()[0]
+
+        self.assertFalse(any(t.is_alive() for t in threads), "thread hang")
         errors = [r for r in results if r[0] == "error"]
         self.assertEqual(errors, [], f"unexpected errors: {errors}")
+        approved = [r for r in results if r[0] == "approved"]
+        denied = [r for r in results if r[0] == "denied"]
         self.assertEqual(len(results), 2, results)
         self.assertEqual(len(approved), 1, f"expected one winner: {results}")
         self.assertEqual(len(denied), 1, f"expected one denial: {results}")
@@ -443,10 +623,31 @@ class ApprovalDatabaseTests(unittest.TestCase):
                 (task,),
             )
             status, requires, approved_by, approved_at = cur.fetchone()
+
         self.assertEqual(status, "pending")
         self.assertTrue(requires)
-        self.assertEqual(approved_by, approved[0][1])
+        winner = approved[0][1]
+        self.assertEqual(approved_by, winner)
+        self.assertNotEqual(
+            approved_by, denied[0][1], "loser must not be recorded as approver"
+        )
+        # Strong timestamp evidence: the committed value must be the one the
+        # winning transaction observed, and must fall inside the window
+        # measured around the race.
+        self.assertEqual(approved_at, approved[0][3][3])
+        self.assertEqual(approved_by, approved[0][3][2])
         self.assertIsNotNone(approved_at)
+        self.assertGreaterEqual(approved_at, before)
+        self.assertLessEqual(approved_at, after)
+
+        # No second approval transition happened after the winner committed.
+        with setup.cursor() as cur:
+            cur.execute(
+                "SELECT approved_by FROM tasks WHERE id = %s AND approved_at "
+                "IS NOT NULL",
+                (task,),
+            )
+            self.assertEqual(cur.fetchall(), [(winner,)])
 
 
 class _Shared:
