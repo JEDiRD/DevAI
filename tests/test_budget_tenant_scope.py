@@ -111,6 +111,240 @@ def _boolean_bypasses(sql):
 
 JOB_SCOPE_CODE = _code(f"SELECT 1 FROM job_budgets WHERE {JOB_SCOPE}")
 
+# Canonical form of the reservation funds condition, pinned exactly as
+# implemented. Comparators, operator order and the exposure terms are all
+# part of the assertion, so flipping <=, dropping the condition or
+# neutralising it with OR is detected.
+RESERVE_FUNDS_CODE = (
+    "( RESERVED_USD + SPENT_USD + RECOVERY_EXPOSURE_USD + "
+    "UNPRICED_EXPOSURE_USD + %S ) <= LIMIT_USD"
+)
+
+
+class ScriptedCursor:
+    """Fake cursor returning a scripted fetchone() result per execute()."""
+
+    def __init__(self, log, rows, rowcount=0):
+        self._log = log
+        self._rows = list(rows)
+        self.rowcount = rowcount
+
+    def execute(self, sql, params=()):
+        self._log.append((sql, tuple(params or ())))
+
+    def fetchone(self):
+        return self._rows.pop(0) if self._rows else None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+
+class ScriptedConnection:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def cursor(self):
+        return self._cursor
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+
+class ReserveFallbackScopeTests(unittest.TestCase):
+    """The reserve fallback probe must be fully tenant scoped.
+
+    This probe is what distinguishes "exceeded" from "not configured", so a
+    weakened predicate here would either leak the existence of a foreign
+    budget or mis-report it as missing.
+    """
+
+    def _fallback(self, job, tenant, row=None):
+        log = []
+        conn = ScriptedConnection(ScriptedCursor(log, rows=[None, row]))
+        with patch.object(budget, "connect", return_value=conn):
+            with self.assertRaises(budget.BudgetError):
+                budget.reserve_budget(job, Decimal("1"), tenant_id=tenant)
+        self.assertEqual(len(log), 2, "expected mutation then fallback probe")
+        return log[1]
+
+    def _assert_scope(self, sql, params, job, tenant):
+        code = _code(sql)
+        # queries the budget table
+        self.assertIn("FROM JOB_BUDGETS", code)
+        # scopes by exact job equality, not inequality or a trivial test
+        self.assertIn("JOB_ID = %S", code)
+        self.assertNotIn("<>", code)
+        self.assertNotIn("IS NOT NULL", code)
+        self.assertNotIn("IS NOT DISTINCT FROM", code)
+        # applies tenant ownership through jobs / JOB_SCOPE
+        self.assertIn(
+            "JOB_ID IN ( SELECT ID FROM JOBS WHERE TENANT_ID = %S )", code
+        )
+        # no unconditional boolean branch neutralises the scope
+        self.assertEqual(_boolean_bypasses(sql), [])
+        # both values bound, in order, to the right placeholders
+        self.assertEqual(params, (job, tenant))
+        self.assertEqual(
+            _bindings(sql, params),
+            [("job_id", job), ("tenant_id", tenant)],
+        )
+
+    def test_fallback_is_fully_tenant_scoped(self):
+        job, tenant = uuid4(), uuid4()
+        sql, params = self._fallback(job, tenant)
+        self._assert_scope(sql, params, job, tenant)
+
+    def test_fallback_weakening_variants_are_rejected(self):
+        """Each reproduced weakening must fail the structural proof."""
+        job, tenant = uuid4(), uuid4()
+        sql, params = self._fallback(job, tenant, row=(1,))
+        weak = {
+            "OR TRUE": sql.replace(f"AND {JOB_SCOPE}", f"AND {JOB_SCOPE} OR TRUE"),
+            "OR 1=1": sql.replace(f"AND {JOB_SCOPE}", f"AND {JOB_SCOPE} OR 1 = 1"),
+            "job_id <> %s": sql.replace("WHERE job_id = %s", "WHERE job_id <> %s"),
+            "trivial uuid truth": sql.replace(
+                f"AND {JOB_SCOPE}", "AND %s::uuid IS NOT NULL"
+            ),
+            "tenant predicate removed": sql.replace(f"AND {JOB_SCOPE}\n", ""),
+        }
+        for label, mutated in weak.items():
+            with self.subTest(weakening=label):
+                self.assertNotEqual(mutated, sql, "mutation did not apply")
+                code = _code(mutated)
+                self.assertTrue(
+                    "JOB_ID = %S" not in code
+                    or "JOB_ID IN ( SELECT ID FROM JOBS WHERE TENANT_ID = %S )"
+                    not in code
+                    or _boolean_bypasses(mutated)
+                    or "IS NOT NULL" in code
+                    or "<>" in code,
+                    f"weakening accepted by structural proof: {label}",
+                )
+
+    def test_fallback_branch_budget_exceeded_is_load_bearing(self):
+        """CASE A: authorized budget exists but funds are exhausted."""
+        job, tenant = uuid4(), uuid4()
+        log = []
+        conn = ScriptedConnection(ScriptedCursor(log, rows=[None, (1,)]))
+        with patch.object(budget, "connect", return_value=conn):
+            with self.assertRaises(budget.BudgetExceeded):
+                budget.reserve_budget(job, Decimal("1"), tenant_id=tenant)
+
+    def test_fallback_branch_not_configured_is_load_bearing(self):
+        """CASE B: no authorized budget row exists."""
+        job, tenant = uuid4(), uuid4()
+        log = []
+        conn = ScriptedConnection(ScriptedCursor(log, rows=[None, None]))
+        with patch.object(budget, "connect", return_value=conn):
+            with self.assertRaises(budget.BudgetNotConfigured):
+                budget.reserve_budget(job, Decimal("1"), tenant_id=tenant)
+
+    def test_branch_outcomes_differ(self):
+        """The two branches must not collapse into one exception."""
+        job, tenant = uuid4(), uuid4()
+
+        def outcome(row):
+            log = []
+            conn = ScriptedConnection(ScriptedCursor(log, rows=[None, row]))
+            with patch.object(budget, "connect", return_value=conn):
+                try:
+                    budget.reserve_budget(
+                        job, Decimal("1"), tenant_id=tenant
+                    )
+                except budget.BudgetError as exc:
+                    return type(exc)
+            return None
+
+        self.assertIs(outcome((1,)), budget.BudgetExceeded)
+        self.assertIs(outcome(None), budget.BudgetNotConfigured)
+        self.assertIsNot(outcome((1,)), outcome(None))
+
+    def test_successful_reserve_never_reaches_the_fallback(self):
+        job, tenant = uuid4(), uuid4()
+        log = []
+        conn = ScriptedConnection(ScriptedCursor(log, rows=[(job,)]))
+        with patch.object(budget, "connect", return_value=conn):
+            budget.reserve_budget(job, Decimal("1"), tenant_id=tenant)
+        self.assertEqual(len(log), 1, "fallback must not run on success")
+
+
+def _funds_defects(sql):
+    """Reasons the reservation funds condition is not intact."""
+    code = _code(sql)
+    defects = []
+    if RESERVE_FUNDS_CODE not in code:
+        defects.append("condition missing or altered")
+    if ">= LIMIT_USD" in code:
+        defects.append("comparator inverted")
+    if _boolean_bypasses(sql):
+        defects.append("boolean neutralisation")
+    return defects
+
+
+class ReserveFundsPredicateTests(unittest.TestCase):
+    """Pin the reservation funds condition exactly as implemented."""
+
+    def _reserve(self, job, tenant):
+        return _record(
+            budget.reserve_budget,
+            job,
+            Decimal("1"),
+            tenant_id=tenant,
+            row=(job,),
+        )[0]
+
+    def test_funds_condition_present_and_correct(self):
+        job, tenant = uuid4(), uuid4()
+        sql, _ = self._reserve(job, tenant)
+        code = _code(sql)
+        self.assertIn(RESERVE_FUNDS_CODE, code)
+        self.assertIn("<= LIMIT_USD", code)
+        self.assertNotIn(">= LIMIT_USD", code)
+        self.assertEqual(_funds_defects(sql), [])
+
+    def test_funds_condition_mutations_are_rejected(self):
+        job, tenant = uuid4(), uuid4()
+        sql, _ = self._reserve(job, tenant)
+        self.assertEqual(_funds_defects(sql), [])
+        for label, mutated in {
+            "comparator inverted": sql.replace(
+                "<= limit_usd", ">= limit_usd"
+            ),
+            "condition removed": sql.replace(
+                "AND (\n                      reserved_usd +\n"
+                "                      spent_usd +\n"
+                "                      recovery_exposure_usd +\n"
+                "                      unpriced_exposure_usd +\n"
+                "                      %s\n"
+                "                  ) <= limit_usd\n",
+                "",
+            ),
+            "OR TRUE neutralised": sql.replace(
+                ") <= limit_usd", ") <= limit_usd OR TRUE"
+            ),
+            "OR 1=1 neutralised": sql.replace(
+                ") <= limit_usd", ") <= limit_usd OR 1 = 1"
+            ),
+            "exposure term dropped": sql.replace(
+                "recovery_exposure_usd +", ""
+            ),
+        }.items():
+            with self.subTest(mutation=label):
+                self.assertNotEqual(
+                    mutated, sql, f"mutation did not apply: {label}"
+                )
+                self.assertNotEqual(
+                    _funds_defects(mutated),
+                    [],
+                    f"funds condition mutation accepted: {label}",
+                )
+
 
 class BudgetSignatureTests(unittest.TestCase):
     """All five operations require a keyword-only tenant_id."""
@@ -447,14 +681,54 @@ class BudgetTenantScopeDatabaseTests(unittest.TestCase):
         self.assertEqual(self.budget_row(job)[1], Decimal("0.30"))
 
     def test_release_foreign_leaves_row_unchanged(self):
+        """Tenancy must be the load-bearing reason for rejection.
+
+        The foreign budget is deliberately made eligible for the release:
+        a legitimate same-tenant reservation for the owning tenant puts
+        reserved_usd above the amount we then try to release from the wrong
+        tenant. Without the tenant predicate the UPDATE would succeed, so
+        the observed rejection can only come from tenant scope.
+        """
         foreign_job = self.job(tenant=self.foreign)
         budget.configure_budget(foreign_job, Decimal("2.00"), tenant_id=self.foreign)
-        before = self.budget_row(foreign_job)
+        budget.reserve_budget(
+            foreign_job, Decimal("0.50"), tenant_id=self.foreign
+        )
+        eligible = self.budget_row(foreign_job)
+        release_amount = Decimal("0.20")
+        self.assertGreaterEqual(
+            eligible[1], release_amount,
+            "fixture must be eligible so tenancy is the only blocker",
+        )
+        before = eligible
         with self.assertRaises(budget.BudgetError):
             budget.release_budget(
-                foreign_job, Decimal("0.20"), tenant_id=self.tenant
+                foreign_job, release_amount, tenant_id=self.tenant
             )
         self.assertEqual(self.budget_row(foreign_job), before)
+
+    def test_configure_existing_foreign_budget_is_denied(self):
+        """ON CONFLICT must not fire for an unauthorized candidate.
+
+        Tenant B configures a budget on its own job; tenant A then attempts
+        to configure the same job with a different limit. The upsert must not
+        execute and the foreign budget must be field-equivalent afterwards.
+        """
+        foreign_job = self.job(tenant=self.foreign)
+        budget.configure_budget(
+            foreign_job, Decimal("2.00"), tenant_id=self.foreign
+        )
+        before = self.budget_row(foreign_job)
+        self.assertEqual(before[0], Decimal("2.00"))
+
+        with self.assertRaises(budget.BudgetNotConfigured):
+            budget.configure_budget(
+                foreign_job, Decimal("9.99"), tenant_id=self.tenant
+            )
+
+        after = self.budget_row(foreign_job)
+        self.assertEqual(after, before)
+        self.assertEqual(after[0], Decimal("2.00"))
 
     def test_settle_same_tenant_mutates(self):
         job = self.job()
