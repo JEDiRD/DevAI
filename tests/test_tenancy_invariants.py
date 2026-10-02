@@ -223,17 +223,24 @@ def _tokenize(text):
 def _canon_token(tok: _Tok) -> str:
     """Canonical text for comparison.
 
-    Keywords/identifiers are case-folded and string literals are whitespace
-    normalised but their VALUE is preserved, so historical exemptions cannot
-    be inherited by the same statement shape carrying a different UUID.
+    Keywords and identifiers are case-folded. Whitespace normalisation
+    applies ONLY outside literals; comments are removed by the lexer.
+
+    String literal payloads are preserved byte-for-byte, with one SQL
+    semantic step: a doubled quote is unescaped to the single quote it
+    denotes, so 'it''s' and 'it's' fingerprint identically (they are the
+    same value) while 'it''''s' stays distinct. Interior whitespace is
+    NEVER collapsed or stripped, because 'jobs_tenant_fk ' is a materially
+    different constraint name from 'jobs_tenant_fk' -- it would match a
+    different (or no) constraint and is not harmless formatting.
     """
     if tok.kind == "name":
         return tok.text.upper()
     if tok.kind == "quoted":
         return '"' + tok.text.strip('"').replace('""', '"').upper() + '"'
     if tok.kind == "string":
-        body = tok.text.replace("''", "'").strip("'")
-        body = re.sub(r"\s+", " ", body).strip()
+        # tok.text includes the surrounding quotes; '' inside denotes one '.
+        body = tok.text[1:-1].replace("''", "'")
         return f"'{body}'"
     return tok.text
 
@@ -861,6 +868,95 @@ POSITIVE_DDL_BODY = [
     "ALTER TABLE jobs ALTER COLUMN tenant_id DROP DEFAULT; END $$ "
     "LANGUAGE plpgsql",
 ]
+
+
+def _seven_text():
+    return (ROOT / "migrations" / "007_tenants.sql").read_text(
+        encoding="utf-8-sig"
+    )
+
+
+def _seven_with_conname(value):
+    """Migration 007 with ONLY the conname literal value changed."""
+    return _seven_text().replace("'jobs_tenant_fk'", f"'{value}'")
+
+
+class StringLiteralFingerprintTests(unittest.TestCase):
+    """M2: literal payload must survive canonicalisation exactly."""
+
+    def test_interior_whitespace_is_preserved(self):
+        canon = canonical(_tokenize("SELECT 'jobs_tenant_fk '"))
+        self.assertIn("'jobs_tenant_fk '", canon)
+        canon = canonical(_tokenize("SELECT ' jobs_tenant_fk'"))
+        self.assertIn("' jobs_tenant_fk'", canon)
+        self.assertNotEqual(
+            canonical(_tokenize("SELECT 'jobs_tenant_fk'")),
+            canonical(_tokenize("SELECT 'jobs_tenant_fk '")),
+        )
+        self.assertNotEqual(
+            canonical(_tokenize("SELECT ' jobs_tenant_fk'")),
+            canonical(_tokenize("SELECT 'jobs_tenant_fk'")),
+        )
+
+    def test_intentional_interior_spaces_retained(self):
+        canon = canonical(_tokenize("SELECT 'a  b   c'"))
+        self.assertIn("'a  b   c'", canon)
+
+    def test_doubled_quotes_are_logically_distinguishable(self):
+        # '' denotes one literal quote: the fingerprint is the logical value.
+        self.assertEqual(
+            canonical(_tokenize("SELECT 'it''s'")), "SELECT 'it's'"
+        )
+        # ''''' denotes two quotes, i.e. a materially different value.
+        self.assertEqual(
+            canonical(_tokenize("SELECT 'it''''s'")), "SELECT 'it''s'"
+        )
+        self.assertNotEqual(
+            canonical(_tokenize("SELECT 'it''s'")),
+            canonical(_tokenize("SELECT 'it''''s'")),
+        )
+
+    def test_historical_conname_is_approved_at_its_exact_location(self):
+        self.assertEqual(
+            scan_repository(extra={"migrations/007_tenants.sql": _seven_text()}),
+            [],
+        )
+
+    def test_constraint_name_variants_are_violations(self):
+        for value in (
+            "jobs_tenant_fk ",   # trailing space
+            " jobs_tenant_fk",   # leading space
+            "jobs_tenant_fk2",   # different name
+            "jobs_tenant_fk\t",
+            "JOBs_tenant_fk",
+        ):
+            with self.subTest(value=value):
+                violations = scan_repository(
+                    extra={
+                        "migrations/007_tenants.sql": _seven_with_conname(value)
+                    }
+                )
+                self.assertTrue(
+                    violations,
+                    f"changed constraint name must be flagged: {value!r}",
+                )
+
+    def test_innocuous_exterior_changes_still_recognised(self):
+        """Comments and exterior spacing are harmless; content is not."""
+        spaced = (
+            _seven_text()
+            .replace(
+                "    IF NOT EXISTS (\n        SELECT 1",
+                "    -- historical guard\n    IF   NOT   EXISTS (\n        SELECT   1",
+            )
+        )
+        self.assertNotEqual(spaced, _seven_text())
+        self.assertEqual(
+            scan_repository(
+                extra={"migrations/007_tenants.sql": spaced}
+            ),
+            [],
+        )
 
 
 class TenantImmutabilitySentinelTests(unittest.TestCase):
