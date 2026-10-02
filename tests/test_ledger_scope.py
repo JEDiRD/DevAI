@@ -25,6 +25,7 @@ from devai import (
     budgeted_observer,
     ledger,
     ledger_observer,
+    pricing,
     reconciliation,
     runtime,
 )
@@ -1268,7 +1269,7 @@ class LedgerDatabaseTests(unittest.TestCase):
         self.conn = psycopg.connect(_DB_URL)
         self.addCleanup(self.conn.close)
         self.addCleanup(self.conn.rollback)
-        for mod in (ledger, accounting, reconciliation):
+        for mod in (ledger, accounting, reconciliation, pricing):
             patcher = patch.object(mod, "connect",
                                     return_value=_Shared(self.conn))
             patcher.start()
@@ -1444,42 +1445,70 @@ class LedgerDatabaseTests(unittest.TestCase):
                      (job,))[0][0], before_attempts)
 
     def test_start_metered_partial_rollback_is_load_bearing(self):
-        """Statement A CAN reserve, Statement B rejects -> full rollback.
+        """Statement A CAN reserve, statement B rejects -> real rollback.
 
-        Topology: tenant A owns a funded job A; tenant B owns a valid task B
-        attached to job B. The call passes job A with task B under tenant A,
-        so statement A's job+tenant+funds predicates are all satisfiable and
-        it genuinely mutates the budget, while statement B rejects because
-        task B does not belong to job A.
+        Runs production on a REAL Psycopg connection so the connection
+        context manager supplies genuine commit/rollback semantics, and
+        reads the after-state from a DIFFERENT fresh connection before any
+        cleanup, so an aborted transaction cannot mask a leaked reservation.
+
+        Topology: tenant owns a funded job A plus a second job B carrying
+        task X. The call pairs job A with task X, so statement A's
+        job+tenant+funds predicates qualify while statement B rejects
+        because task X does not belong to job A.
         """
-        job_a, _ = self.metered_fixture(self.tenant)
-        _, task_b = self.metered_fixture(self.foreign)
-        before_a = self.budget_row(job_a)
-        self.assertEqual(before_a[1], Decimal(0), "job A must start unreserved")
+        tenant = uuid4()
+        job_a, job_b, task_x = _build_rollback_fixture(self, tenant)
+        amount = Decimal("1.00")
 
-        # Statement A alone is satisfiable: prove the reservation predicate
-        # really matches for job A / tenant A before asserting rollback.
-        qualifies = self.sql(
-            "SELECT 1 FROM job_budgets b JOIN jobs j ON j.id=b.job_id"
-            " WHERE b.job_id=%s AND j.tenant_id=%s"
-            " AND b.reserved_usd+b.spent_usd+b.recovery_exposure_usd"
-            "+b.unpriced_exposure_usd+%s<=b.limit_usd",
-            (job_a, self.tenant, Decimal("1.00")))
-        self.assertEqual(len(qualifies), 1,
-                         "statement A must be able to reserve for this test "
-                         "to be load-bearing")
+        probe = psycopg.connect(_DB_URL)
+        self.addCleanup(probe.close)
+        with probe.cursor() as cur:
+            # preconditions: statement A is genuinely load-bearing
+            cur.execute("SELECT 1 FROM jobs WHERE id=%s AND tenant_id=%s",
+                        (job_a, tenant))
+            self.assertIsNotNone(cur.fetchone(),
+                                 "job A must exist for the caller tenant")
+            cur.execute("SELECT limit_usd, reserved_usd, spent_usd,"
+                        " recovery_exposure_usd, unpriced_exposure_usd"
+                        " FROM job_budgets WHERE job_id=%s", (job_a,))
+            before = cur.fetchone()
+            self.assertIsNotNone(before, "budget row must exist")
+            limit, reserved, spent, recovery, unpriced = before
+            self.assertGreater(amount, Decimal(0))
+            self.assertLessEqual(
+                reserved + spent + recovery + unpriced + amount, limit,
+                "funds must be sufficient so statement A qualifies")
+            cur.execute("SELECT job_id FROM tasks WHERE id=%s", (task_x,))
+            self.assertEqual(cur.fetchone()[0], job_b,
+                             "task X must not belong to job A")
+        before_reserved = before[1]
+        before_limit = before[0]
 
-        with self.assertRaises(reconciliation.ReconciliationError):
-            self._start(job_a, task_b, self.tenant)
+        with patch.object(reconciliation, "connect",
+                          _real_connection_factory(self)):
+            with self.assertRaises(reconciliation.ReconciliationError):
+                reconciliation.start_metered_attempt(
+                    job_id=job_a, task_id=task_x, number=1,
+                    route=_FakeRoute(), model="m", price=_FakePrice(),
+                    reservation=amount, tenant_id=tenant)
 
-        # Independently re-read both affected tables after transaction exit.
-        self.assertEqual(
-            self.budget_row(job_a), before_a,
-            "job A reservation must be rolled back")
-        self.assertEqual(
-            self.sql("SELECT count(*) FROM execution_attempts"
-                     " WHERE job_id=%s", (job_a,))[0][0],
-            0, "no attempt may be inserted")
+        # fresh, different connection; no cleanup has run
+        fresh = psycopg.connect(_DB_URL)
+        self.addCleanup(fresh.close)
+        with fresh.cursor() as cur:
+            cur.execute("SELECT limit_usd, reserved_usd, spent_usd"
+                        " FROM job_budgets WHERE job_id=%s", (job_a,))
+            after = cur.fetchone()
+            self.assertEqual(
+                after[1], before_reserved,
+                "reservation must be rolled back to its pre-call value")
+            self.assertEqual(after[0], before_limit)
+            self.assertEqual(after[2], Decimal(0))
+            cur.execute("SELECT count(*) FROM execution_attempts"
+                        " WHERE job_id=%s OR task_id=%s", (job_a, task_x))
+            self.assertEqual(cur.fetchone()[0], 0,
+                             "no attempt may be inserted")
 
     def test_start_metered_missing_uses_same_public_contract(self):
         job, task = self.metered_fixture(self.foreign)
@@ -1586,16 +1615,27 @@ class LedgerDatabaseTests(unittest.TestCase):
     def test_finalize_same_tenant_settles(self):
         job, task = self.metered_fixture(self.tenant)
         attempt = self._start(job, task, self.tenant)
+        # Explicit keyword construction: the ExecutionAttempt field order is
+        # route_key, provider, gateway_model, success, error,
+        # prompt_tokens, completion_tokens, so positional accounting fields
+        # would silently bind 10 to `error` and 5 to `prompt_tokens`.
+        attempt_result = ExecutionAttempt(
+            route_key="k",
+            provider="p",
+            gateway_model="m",
+            success=True,
+            error=None,
+            prompt_tokens=10,
+            completion_tokens=5,
+        )
         accounting.finalize_attempt_and_budget(
-            job, attempt,
-            ExecutionAttempt("k", "p", "m", True, 10, 5), Decimal("1.00"),
+            job, attempt, attempt_result, Decimal("1.00"),
             Decimal("0.50"), "pk", 1, "metered", tenant_id=self.tenant)
-        # three projected fields: status, prompt/completion usage, cost
+        # full after-state: status, usage tokens, reconciled cost
         row = self.sql("SELECT status, prompt_tokens, completion_tokens,"
                        " reconciled_cost_usd FROM execution_attempts"
                        " WHERE id=%s", (attempt,))[0]
-        self.assertEqual(
-            row, ("succeeded", 10, 5, Decimal("0.50")))
+        self.assertEqual(row, ("succeeded", 10, 5, Decimal("0.50")))
         limit, reserved, spent, _ = self.budget_row(job)
         self.assertEqual(reserved, Decimal(0))
         self.assertEqual(spent, Decimal("0.50"))
@@ -1623,7 +1663,10 @@ class LedgerDatabaseTests(unittest.TestCase):
         with self.assertRaises(accounting.AccountingError):
             accounting.finalize_attempt_and_budget(
                 job, attempt,
-                ExecutionAttempt("k", "p", "m", True, 10, 5),
+                ExecutionAttempt(
+                    route_key="k", provider="p", gateway_model="m",
+                    success=True, error=None,
+                    prompt_tokens=10, completion_tokens=5),
                 Decimal("1.00"), Decimal("0.50"), "pk", 1, "metered",
                 tenant_id=self.tenant)
 
@@ -1649,16 +1692,33 @@ class LedgerDatabaseTests(unittest.TestCase):
         before_attempts = self.sql(
             "SELECT count(*) FROM execution_attempts WHERE job_id=%s",
             (job_b,))[0][0]
+        before_cases = self.sql(
+            "SELECT count(*) FROM metered_reconciliations"
+            " WHERE job_id=%s", (job_b,))[0][0]
+
+        # The pricing lookup must succeed against tenant B's real pricing row
+        # so the denial below comes from the tenancy/budget path, not from an
+        # unconfigured-price short circuit.
+        self.ensure_pricing()
+        price = pricing.get_active_price("pk", 1)
+        self.assertIsNotNone(price)
+
         with self.assertRaises(reconciliation.ReconciliationError):
             observer.attempt_started(
                 1, ModelCandidate("pk", "p", None, "standard", 1,
                                   pricing_key="pk", billing_mode="metered"),
                 "m")
+
+        # Independently re-read all three affected surfaces.
         self.assertEqual(self.budget_row(job_b), before_budget)
         self.assertEqual(
             self.sql("SELECT count(*) FROM execution_attempts"
                      " WHERE job_id=%s", (job_b,))[0][0],
             before_attempts)
+        self.assertEqual(
+            self.sql("SELECT count(*) FROM metered_reconciliations"
+                     " WHERE job_id=%s", (job_b,))[0][0],
+            before_cases)
 
 
 def _neutralization_defects(sql):
@@ -2265,11 +2325,82 @@ class _Shared:
         return False
 
 
+ROLLBACK_PRICING_VERSION = 1
+
+
+def _real_connection_factory(test_case, url=None):
+    """A factory handing production a genuine Psycopg connection.
+
+    Test-only plumbing: the returned callable caches one real connection per
+    thread and registers it for cleanup, so ``with connect() as conn``
+    performs real commit/rollback semantics. Production connect behaviour is
+    not modified; this is applied with a scoped patch at the call site.
+    """
+    url = url or _DB_URL
+
+    class RealConnections:
+        def __init__(self):
+            self.url = url
+            self._local = threading.local()
+
+        def __call__(self):
+            conn = getattr(self._local, "conn", None)
+            if conn is None or conn.closed:
+                conn = psycopg.connect(self.url)
+                self._local.conn = conn
+                test_case.addCleanup(conn.close)
+            return conn
+
+    return RealConnections()
+
+
+def _build_rollback_fixture(test_case, tenant):
+    """Committed rollback fixtures: funded job A plus task X on job B.
+
+    Returns (job_a, job_b, task_x). Statement A qualifies on job A; statement
+    B rejects because task X belongs to job B, not job A.
+    """
+    job_a, job_b, task_x = uuid4(), uuid4(), uuid4()
+    # A per-test pricing key, so two rollback tests can never contend on the
+    # same unique key or observe each other's committed pricing row.
+    pricing_key = "pk-rollback-" + str(task_x)[:8]
+    setup = psycopg.connect(_DB_URL)
+    test_case.addCleanup(setup.close)
+    with setup.cursor() as cur:
+        cur.execute("INSERT INTO tenants(id, slug, name)"
+                    " VALUES (%s,%s,'rollback test')",
+                    (tenant, str(tenant)))
+        for job in (job_a, job_b):
+            cur.execute("INSERT INTO jobs(id, tenant_id, objective, status)"
+                        " VALUES (%s,%s,'rollback','running')",
+                        (job, tenant))
+        cur.execute(
+            "INSERT INTO tasks(id, job_id, external_id, title, description,"
+            " capability, risk, status)"
+            " VALUES (%s,%s,%s,'t','d','basic','low','pending')",
+            (task_x, job_b, str(task_x)))
+        cur.execute("INSERT INTO job_budgets(job_id, limit_usd)"
+                    " VALUES (%s,%s)", (job_a, Decimal("10.00")))
+        # The key is unique to this fixture, so ownership is unambiguous: this
+        # test always creates and always removes the row.
+        cur.execute("INSERT INTO model_pricing(pricing_key, version,"
+                    " input_per_million_usd, output_per_million_usd, active)"
+                    " VALUES (%s,%s,2,3,TRUE)",
+                    (pricing_key, ROLLBACK_PRICING_VERSION))
+    setup.commit()
+    test_case.addCleanup(_purge_rollback,
+                         (task_x, job_a, job_b, tenant, pricing_key))
+    return job_a, job_b, task_x
+
+
 def _purge_rollback(ids):
-    task_x, job_a, job_b, tenant = ids
+    task_x, job_a, job_b, tenant, pricing_key = ids
     conn = psycopg.connect(_DB_URL)
     try:
         with conn.cursor() as cur:
+            cur.execute("DELETE FROM metered_reconciliations"
+                        " WHERE attempt_id IN (SELECT id FROM"
+                        " execution_attempts WHERE task_id=%s)", (task_x,))
             cur.execute("DELETE FROM execution_attempts WHERE task_id=%s",
                         (task_x,))
             cur.execute("DELETE FROM task_dependencies WHERE task_id=%s"
@@ -2279,6 +2410,13 @@ def _purge_rollback(ids):
                         (job_a, job_b))
             cur.execute("DELETE FROM jobs WHERE id IN (%s,%s)", (job_a, job_b))
             cur.execute("DELETE FROM tenants WHERE id=%s", (tenant,))
+            # Remove the pricing row this fixture committed, so no later test
+            # can depend on it by execution order. The key is unique to this
+            # fixture, so no concurrently-owned row is destroyed.
+            cur.execute(
+                "DELETE FROM model_pricing WHERE pricing_key=%s"
+                " AND version=%s",
+                (pricing_key, ROLLBACK_PRICING_VERSION))
         conn.commit()
     finally:
         conn.close()
@@ -2301,31 +2439,12 @@ class StartMeteredRealTransactionTests(unittest.TestCase):
 
     def test_partial_rollback_is_real_and_load_bearing(self):
         tenant = uuid4()
-        job_a, job_b, task_x = uuid4(), uuid4(), uuid4()
         amount = Decimal("1.00")
 
-        # (1) fixtures on their own committed connection
+        # (1) committed fixtures, with cleanup registered for every row
+        # created -- including the committed pricing row.
+        job_a, job_b, task_x = _build_rollback_fixture(self, tenant)
         setup = self._fresh()
-        with setup.cursor() as cur:
-            cur.execute("INSERT INTO tenants(id, slug, name)"
-                        " VALUES (%s,%s,'rollback test')",
-                        (tenant, str(tenant)))
-            for job in (job_a, job_b):
-                cur.execute("INSERT INTO jobs(id, tenant_id, objective,"
-                            " status) VALUES (%s,%s,'rollback','running')",
-                            (job, tenant))
-            cur.execute(
-                "INSERT INTO tasks(id, job_id, external_id, title,"
-                " description, capability, risk, status)"
-                " VALUES (%s,%s,%s,'t','d','basic','low','pending')",
-                (task_x, job_b, str(task_x)))
-            cur.execute("INSERT INTO job_budgets(job_id, limit_usd)"
-                        " VALUES (%s,%s)", (job_a, Decimal("10.00")))
-            cur.execute("INSERT INTO model_pricing(pricing_key, version,"
-                        " input_per_million_usd, output_per_million_usd,"
-                        " active) VALUES ('pk',1,2,3,TRUE)")
-        setup.commit()
-        self.addCleanup(_purge_rollback, (task_x, job_a, job_b, tenant))
 
         # (2) mechanical preconditions: statement A is genuinely load-bearing
         with setup.cursor() as cur:
@@ -2333,7 +2452,7 @@ class StartMeteredRealTransactionTests(unittest.TestCase):
                         (job_a, tenant))
             self.assertIsNotNone(cur.fetchone(),
                                  "job A must exist for the caller tenant")
-            cur.execute("SELECT limit_usd, reserved_usd, spent_usd,"
+            cur.execute("SELECT limit_usd, reserved_usd,"
                         " recovery_exposure_usd, unpriced_exposure_usd"
                         " FROM job_budgets WHERE job_id=%s", (job_a,))
             before = cur.fetchone()
@@ -2352,22 +2471,8 @@ class StartMeteredRealTransactionTests(unittest.TestCase):
         before_limit = before[0]
 
         # (3) invoke through a REAL psycopg connection factory
-        test_case = self
-
-        class RealConnections:
-            def __init__(self, url):
-                self.url = url
-                self._local = threading.local()
-
-            def __call__(self):
-                conn = getattr(self._local, "conn", None)
-                if conn is None or conn.closed:
-                    conn = psycopg.connect(self.url)
-                    self._local.conn = conn
-                    test_case.addCleanup(conn.close)
-                return conn
-
-        with patch.object(reconciliation, "connect", RealConnections(_DB_URL)):
+        with patch.object(reconciliation, "connect",
+                          _real_connection_factory(self)):
             with self.assertRaises(reconciliation.ReconciliationError):
                 reconciliation.start_metered_attempt(
                     job_id=job_a, task_id=task_x, number=1,
