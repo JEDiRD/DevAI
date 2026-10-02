@@ -118,6 +118,7 @@ def run_claimed_task(
             job_id=task.job_id,
             task_id=task.id,
             reservation_by_cost_class=reservation_by_cost_class,
+            tenant_id=task.tenant_id,
         ),
         tenant_id=task.tenant_id,
     )

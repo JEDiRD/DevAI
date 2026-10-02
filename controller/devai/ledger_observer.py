@@ -16,9 +16,15 @@ class LedgerExecutionObserver:
         self,
         job_id: UUID,
         task_id: UUID,
+        *,
+        tenant_id: UUID,
     ):
         self.job_id = job_id
         self.task_id = task_id
+        # Immutable execution context. Every ledger mutation this observer
+        # performs uses this value; it is never taken from a route, payload
+        # or database row.
+        self.tenant_id = tenant_id
         self._attempt_ids: dict[int, UUID] = {}
 
     def attempt_started(
@@ -34,6 +40,7 @@ class LedgerExecutionObserver:
             route_key=route.key,
             provider=route.provider,
             gateway_model=gateway_model,
+            tenant_id=self.tenant_id,
         )
 
         self._attempt_ids[number] = attempt_id
@@ -54,4 +61,5 @@ class LedgerExecutionObserver:
             attempt_id=attempt_id,
             success=attempt.success,
             error=attempt.error,
+            tenant_id=self.tenant_id,
         )

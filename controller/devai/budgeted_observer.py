@@ -36,9 +36,15 @@ class BudgetedLedgerObserver:
         task_id: UUID,
         reservation_by_cost_class:
             dict[str, Decimal],
+        *,
+        tenant_id: UUID,
     ):
         self.job_id = job_id
         self.task_id = task_id
+        # Immutable execution context from the already-authorized RuntimeTask.
+        # The same value is used for the whole lifecycle: it is never derived
+        # from a mutable payload field and cannot be overridden per invocation.
+        self.tenant_id = tenant_id
         self.reservation_by_cost_class = (
             reservation_by_cost_class
         )
@@ -58,7 +64,8 @@ class BudgetedLedgerObserver:
         if mode != 'metered':
             attempt_id = start_attempt(job_id=self.job_id, task_id=self.task_id,
                 attempt_number=number, route_key=route.key, provider=route.provider,
-                gateway_model=gateway_model, billing_mode=mode)
+                gateway_model=gateway_model, billing_mode=mode,
+                tenant_id=self.tenant_id)
             self._state[number] = (attempt_id, Decimal(0), None, mode)
             return
         reservation = (
@@ -83,7 +90,8 @@ class BudgetedLedgerObserver:
         )
 
         attempt_id = start_metered_attempt(job_id=self.job_id,task_id=self.task_id,
-            number=number,route=route,model=gateway_model,price=price,reservation=reservation)
+            number=number,route=route,model=gateway_model,price=price,reservation=reservation,
+            tenant_id=self.tenant_id)
 
         self._state[number] = (
             attempt_id,
@@ -111,7 +119,8 @@ class BudgetedLedgerObserver:
             attempt.prompt_tokens is None
             or attempt.completion_tokens is None
         ):
-            defer_missing_usage(attempt_id=attempt_id,result_success=attempt.success)
+            defer_missing_usage(attempt_id=attempt_id,result_success=attempt.success,
+            tenant_id=self.tenant_id)
             raise UsageMissing('METERED_USAGE_REQUIRED')
 
         else:
@@ -130,4 +139,5 @@ class BudgetedLedgerObserver:
             pricing_key=price.pricing_key if price else None,
             pricing_version=price.version if price else None,
             billing_mode=billing_mode,
+            tenant_id=self.tenant_id,
         )

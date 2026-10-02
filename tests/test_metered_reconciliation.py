@@ -16,12 +16,12 @@ class MeteredReconciliationTests(unittest.TestCase):
     sql=foundation.AdapterFoundationTests.sql
     def _case(self):
         job=ledger.create_job('reconciliation test',self.tenant)
-        task=ledger.create_task(job,'a','a','a','basic','low',False)
+        task=ledger.create_task(job,'a','a','a','basic','low',False,tenant_id=self.tenant)
         budget.configure_budget(job,Decimal('.02'),tenant_id=self.tenant)
         key=str(uuid4())
         self.sql('INSERT INTO model_pricing(pricing_key,version,input_per_million_usd,output_per_million_usd,active) VALUES (%s,1,2,3,TRUE)',(key,))
         route=ModelCandidate(key,'test',Capability.BASIC,'standard',1,pricing_key=key,billing_mode='metered')
-        observer=BudgetedLedgerObserver(job,task,{'standard':Decimal('.01')})
+        observer=BudgetedLedgerObserver(job,task,{'standard':Decimal('.01')},tenant_id=self.tenant)
         observer.attempt_started(1,route,'model')
         with self.assertRaises(UsageMissing):
             observer.attempt_finished(1,ExecutionAttempt(key,'test','model',True))
@@ -56,12 +56,12 @@ class MeteredReconciliationTests(unittest.TestCase):
 
     def test_controller_crash_reservation_expires_to_recovery(self):
         job=ledger.create_job('crash test',self.tenant)
-        task=ledger.create_task(job,'a','a','a','basic','low',False)
+        task=ledger.create_task(job,'a','a','a','basic','low',False,tenant_id=self.tenant)
         budget.configure_budget(job,Decimal('.02'),tenant_id=self.tenant)
         key=str(uuid4())
         self.sql('INSERT INTO model_pricing(pricing_key,version,input_per_million_usd,output_per_million_usd,active) VALUES (%s,1,2,3,TRUE)',(key,))
         route=ModelCandidate(key,'test',Capability.BASIC,'standard',1,pricing_key=key,billing_mode='metered')
-        observer=BudgetedLedgerObserver(job,task,{'standard':Decimal('.01')})
+        observer=BudgetedLedgerObserver(job,task,{'standard':Decimal('.01')},tenant_id=self.tenant)
         observer.attempt_started(1,route,'model')
         self.sql("UPDATE execution_attempts SET accounting_due_at=clock_timestamp()-interval '1 second' WHERE id=%s",(observer._state[1][0],))
         self.assertEqual(rec.sweep()['opened'],1)

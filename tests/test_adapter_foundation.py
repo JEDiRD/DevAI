@@ -121,8 +121,8 @@ class AdapterFoundationTests(unittest.TestCase):
 
     def test_non_metered_zero_cost_no_pricing_or_usage_requirement(self):
         job=ledger.create_job('test',self.tenant)
-        task=ledger.create_task(job,'a','a','a','basic','low',False)
-        observer=BudgetedLedgerObserver(job,task,{})
+        task=ledger.create_task(job,'a','a','a','basic','low',False,tenant_id=self.tenant)
+        observer=BudgetedLedgerObserver(job,task,{},tenant_id=self.tenant)
         for number,mode in enumerate(('free','subscription','local'),1):
             route=ModelCandidate('test/'+mode,'test',Capability.BASIC,'free',1,billing_mode=mode)
             with patch('devai.budgeted_observer.get_active_price',side_effect=AssertionError('must not price')):
@@ -136,10 +136,10 @@ class AdapterFoundationTests(unittest.TestCase):
 
     def test_metered_fails_closed_even_when_cost_class_free(self):
         job=ledger.create_job('test',self.tenant)
-        task=ledger.create_task(job,'a','a','a','basic','low',False)
+        task=ledger.create_task(job,'a','a','a','basic','low',False,tenant_id=self.tenant)
         budget.configure_budget(job,Decimal('.1'),tenant_id=self.tenant)
         route=ModelCandidate('missing','test',Capability.BASIC,'free',1,pricing_key='missing',billing_mode='metered')
-        observer=BudgetedLedgerObserver(job,task,{'free':Decimal('.01')})
+        observer=BudgetedLedgerObserver(job,task,{'free':Decimal('.01')},tenant_id=self.tenant)
         with self.assertRaises(PricingNotConfigured): observer.attempt_started(1,route,'model')
         self.assertEqual(budget.get_budget(job,tenant_id=self.tenant)[1],Decimal(0))
         self.sql("INSERT INTO model_pricing(pricing_key,version,input_per_million_usd,output_per_million_usd,active) VALUES ('foundation-test',1,2,3,TRUE)")
@@ -147,7 +147,8 @@ class AdapterFoundationTests(unittest.TestCase):
         observer.attempt_started(1,route,'model')
         with self.assertRaises(accounting.AccountingError),self.conn.transaction():
             accounting.finalize_attempt_and_budget(job,observer._state[1][0],
-                ExecutionAttempt('metered','test','model',True),Decimal(0),Decimal(0),None,None,'local')
+                ExecutionAttempt('metered','test','model',True),Decimal(0),Decimal(0),None,None,'local',
+                tenant_id=self.tenant)
         with self.assertRaises(UsageMissing): observer.attempt_finished(1,ExecutionAttempt('metered','test','model',True))
         self.assertEqual(budget.get_budget(job,tenant_id=self.tenant)[1:],(Decimal(0),Decimal(0)))
         case=self.sql('SELECT id FROM metered_reconciliations WHERE attempt_id=%s',(observer._state[1][0],))[0][0]
