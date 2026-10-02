@@ -137,11 +137,11 @@ class AdapterFoundationTests(unittest.TestCase):
     def test_metered_fails_closed_even_when_cost_class_free(self):
         job=ledger.create_job('test',self.tenant)
         task=ledger.create_task(job,'a','a','a','basic','low',False)
-        budget.configure_budget(job,Decimal('.1'))
+        budget.configure_budget(job,Decimal('.1'),tenant_id=self.tenant)
         route=ModelCandidate('missing','test',Capability.BASIC,'free',1,pricing_key='missing',billing_mode='metered')
         observer=BudgetedLedgerObserver(job,task,{'free':Decimal('.01')})
         with self.assertRaises(PricingNotConfigured): observer.attempt_started(1,route,'model')
-        self.assertEqual(budget.get_budget(job)[1],Decimal(0))
+        self.assertEqual(budget.get_budget(job,tenant_id=self.tenant)[1],Decimal(0))
         self.sql("INSERT INTO model_pricing(pricing_key,version,input_per_million_usd,output_per_million_usd,active) VALUES ('foundation-test',1,2,3,TRUE)")
         route=ModelCandidate('metered','test',Capability.BASIC,'free',1,pricing_key='foundation-test',billing_mode='metered')
         observer.attempt_started(1,route,'model')
@@ -149,8 +149,8 @@ class AdapterFoundationTests(unittest.TestCase):
             accounting.finalize_attempt_and_budget(job,observer._state[1][0],
                 ExecutionAttempt('metered','test','model',True),Decimal(0),Decimal(0),None,None,'local')
         with self.assertRaises(UsageMissing): observer.attempt_finished(1,ExecutionAttempt('metered','test','model',True))
-        self.assertEqual(budget.get_budget(job)[1:],(Decimal(0),Decimal(0)))
+        self.assertEqual(budget.get_budget(job,tenant_id=self.tenant)[1:],(Decimal(0),Decimal(0)))
         case=self.sql('SELECT id FROM metered_reconciliations WHERE attempt_id=%s',(observer._state[1][0],))[0][0]
         reconciliation.resolve_case(tenant_id=self.tenant,case_id=case,actor='operator',
             usage=(1000,500),evidence_sha256='1'*64)
-        self.assertEqual(budget.get_budget(job)[1:],(Decimal(0),Decimal('.0035')))
+        self.assertEqual(budget.get_budget(job,tenant_id=self.tenant)[1:],(Decimal(0),Decimal('.0035')))

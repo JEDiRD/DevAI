@@ -17,7 +17,7 @@ class MeteredReconciliationTests(unittest.TestCase):
     def _case(self):
         job=ledger.create_job('reconciliation test',self.tenant)
         task=ledger.create_task(job,'a','a','a','basic','low',False)
-        budget.configure_budget(job,Decimal('.02'))
+        budget.configure_budget(job,Decimal('.02'),tenant_id=self.tenant)
         key=str(uuid4())
         self.sql('INSERT INTO model_pricing(pricing_key,version,input_per_million_usd,output_per_million_usd,active) VALUES (%s,1,2,3,TRUE)',(key,))
         route=ModelCandidate(key,'test',Capability.BASIC,'standard',1,pricing_key=key,billing_mode='metered')
@@ -30,9 +30,9 @@ class MeteredReconciliationTests(unittest.TestCase):
 
     def test_recoverable_review_final_without_inventing_cost(self):
         job,case,attempt=self._case()
-        self.assertEqual(budget.get_budget(job)[1:],(Decimal(0),Decimal(0)))
+        self.assertEqual(budget.get_budget(job,tenant_id=self.tenant)[1:],(Decimal(0),Decimal(0)))
         self.assertEqual(self.sql('SELECT recovery_exposure_usd FROM job_budgets WHERE job_id=%s',(job,))[0][0],Decimal('.01'))
-        with self.assertRaises(budget.BudgetExceeded):budget.reserve_budget(job,Decimal('.02'))
+        with self.assertRaises(budget.BudgetExceeded):budget.reserve_budget(job,Decimal('.02'),tenant_id=self.tenant)
         self.sql("UPDATE metered_reconciliations SET recover_until=clock_timestamp()-interval '1 second' WHERE id=%s",(case,))
         self.assertEqual(rec.sweep()['review_required'],1)
         self.sql("UPDATE metered_reconciliations SET resolve_by=clock_timestamp()-interval '1 second' WHERE id=%s",(case,))
@@ -52,12 +52,12 @@ class MeteredReconciliationTests(unittest.TestCase):
         with self.assertRaises(rec.ReconciliationError):
             rec.resolve_case(tenant_id=self.tenant,case_id=case,actor='operator',statement_cost=Decimal('.005'))
         self.assertTrue(rec.resolve_case(tenant_id=self.tenant,case_id=case,actor='operator',statement_cost=Decimal('.005'),evidence_sha256='3'*64))
-        self.assertEqual(budget.get_budget(job)[2],Decimal('.005'))
+        self.assertEqual(budget.get_budget(job,tenant_id=self.tenant)[2],Decimal('.005'))
 
     def test_controller_crash_reservation_expires_to_recovery(self):
         job=ledger.create_job('crash test',self.tenant)
         task=ledger.create_task(job,'a','a','a','basic','low',False)
-        budget.configure_budget(job,Decimal('.02'))
+        budget.configure_budget(job,Decimal('.02'),tenant_id=self.tenant)
         key=str(uuid4())
         self.sql('INSERT INTO model_pricing(pricing_key,version,input_per_million_usd,output_per_million_usd,active) VALUES (%s,1,2,3,TRUE)',(key,))
         route=ModelCandidate(key,'test',Capability.BASIC,'standard',1,pricing_key=key,billing_mode='metered')
@@ -65,7 +65,7 @@ class MeteredReconciliationTests(unittest.TestCase):
         observer.attempt_started(1,route,'model')
         self.sql("UPDATE execution_attempts SET accounting_due_at=clock_timestamp()-interval '1 second' WHERE id=%s",(observer._state[1][0],))
         self.assertEqual(rec.sweep()['opened'],1)
-        self.assertEqual(budget.get_budget(job)[1],Decimal(0))
+        self.assertEqual(budget.get_budget(job,tenant_id=self.tenant)[1],Decimal(0))
 
     def test_audit_events_are_append_only_and_actor_rejects_secrets(self):
         job,case,_=self._case()
