@@ -1,12 +1,31 @@
 from uuid import UUID
 
 from .db import connect
+from .tenancy import TenantScopeError
 
 
 def add_dependency(
     task_id: UUID,
     depends_on_task_id: UUID,
+    *,
+    tenant_id: UUID,
 ) -> None:
+    """Record a dependency edge between two tasks of ``tenant_id``.
+
+    ``tenant_id`` is expected to come from an already-authorized job or
+    boundary context; this layer does not authenticate request input.
+
+    No same-job restriction is imposed: cross-job dependencies are a valid
+    domain shape and remain permitted when both tasks belong to the same
+    tenant.
+
+    The insert is tenant-scoped through two independent EXISTS branches, one
+    per task, so neither side can be satisfied by a foreign task. A losing
+    concurrent duplicate then re-checks the edge with a SECOND statement on
+    the SAME connection, which under READ COMMITTED takes a fresh snapshot
+    after the winner commits. Denials raise one uniform TenantScopeError and
+    never reveal whether a foreign or missing task exists.
+    """
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -15,11 +34,64 @@ def add_dependency(
                     task_id,
                     depends_on_task_id
                 )
-                VALUES (%s, %s)
+                SELECT %s, %s
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM tasks a
+                    JOIN jobs ja ON ja.id = a.job_id
+                    WHERE a.id = %s
+                      AND ja.tenant_id = %s
+                )
+                AND EXISTS (
+                    SELECT 1
+                    FROM tasks b
+                    JOIN jobs jb ON jb.id = b.job_id
+                    WHERE b.id = %s
+                      AND jb.tenant_id = %s
+                )
                 ON CONFLICT DO NOTHING
+                RETURNING task_id
                 """,
-                (task_id, depends_on_task_id),
+                (
+                    task_id,
+                    depends_on_task_id,
+                    task_id,
+                    tenant_id,
+                    depends_on_task_id,
+                    tenant_id,
+                ),
             )
+
+            if cur.fetchone() is not None:
+                return
+
+            # Second statement, same connection/transaction: a concurrent
+            # winner's row must be visible here.
+            cur.execute(
+                """
+                SELECT 1
+                FROM task_dependencies d
+                JOIN tasks a ON a.id = d.task_id
+                JOIN jobs ja ON ja.id = a.job_id
+                JOIN tasks b ON b.id = d.depends_on_task_id
+                JOIN jobs jb ON jb.id = b.job_id
+                WHERE d.task_id = %s
+                  AND d.depends_on_task_id = %s
+                  AND ja.tenant_id = %s
+                  AND jb.tenant_id = %s
+                """,
+                (
+                    task_id,
+                    depends_on_task_id,
+                    tenant_id,
+                    tenant_id,
+                ),
+            )
+
+            if cur.fetchone() is None:
+                raise TenantScopeError(
+                    "Dependency is not in tenant scope"
+                )
 
 
 def list_ready_tasks(
@@ -70,7 +142,17 @@ def list_ready_tasks(
 def set_task_status(
     task_id: UUID,
     status: str,
+    *,
+    tenant_id: UUID,
 ) -> None:
+    """Set a task's status, scoped to the owning tenant.
+
+    The UPDATE itself proves task.id == task_id AND that the task's job
+    belongs to ``tenant_id``; no prior pre-check is relied upon. The
+    existing ``rowcount != 1`` RuntimeError contract is preserved exactly,
+    so a missing task and a foreign task take the same observable path and
+    no tenant-existence oracle is created.
+    """
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -79,8 +161,14 @@ def set_task_status(
                 SET status = %s,
                     updated_at = now()
                 WHERE id = %s
+                  AND EXISTS (
+                      SELECT 1
+                      FROM jobs
+                      WHERE jobs.id = tasks.job_id
+                        AND jobs.tenant_id = %s
+                  )
                 """,
-                (status, task_id),
+                (status, task_id, tenant_id),
             )
 
             if cur.rowcount != 1:
