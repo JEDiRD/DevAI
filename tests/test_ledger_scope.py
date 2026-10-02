@@ -1801,6 +1801,173 @@ class ActualEmittedStatementTests(unittest.TestCase):
             "OR TRUE on the emitted UPDATE was not detected")
 
 
+def _lookup_indices(log):
+    """Indices, in emission order, of the reconciliation-lookup statements.
+
+    Both occurrences carry identical SQL text and identical parameters, so
+    they can only be distinguished by position.
+    """
+    return [
+        index for index, (sql, _) in enumerate(log)
+        if _code(sql).startswith(
+            "SELECT M . ID FROM METERED_RECONCILIATIONS M")
+    ]
+
+
+def _lookup_occurrences(log):
+    """The _open reconciliation-lookup statements in EMISSION order."""
+    return [log[index] for index in _lookup_indices(log)]
+
+
+def _lookup_defects(entry, tenant):
+    """Defects in ONE reconciliation-lookup statement.
+
+    Applied to a single occurrence so the initial lookup can never satisfy
+    the assertions aimed at the race recheck.
+    """
+    sql, params = entry
+    code = _code(sql)
+    defects = []
+    if not code.startswith("SELECT M . ID FROM METERED_RECONCILIATIONS M"):
+        defects.append("unexpected lookup shape")
+    if "M . ATTEMPT_ID = %S" not in code:
+        defects.append("missing attempt correlation")
+    if "A . ID = M . ATTEMPT_ID" not in code:
+        defects.append("missing attempt join")
+    if "J . TENANT_ID = %S" not in code:
+        defects.append("missing tenant scope predicate")
+    if ("tenant_id", tenant) not in _bindings(sql, params):
+        defects.append("tenant not bound to the tenant predicate")
+    if not code.startswith("SELECT M . ID"):
+        defects.append("case-id projection is not qualified as m.id")
+    defects.extend(_neutralization_defects(sql))
+    return defects
+
+
+class OpenLookupOccurrenceTests(unittest.TestCase):
+    """Per-occurrence validation of _open's two reconciliation lookups."""
+
+    def _log(self, tenant=None):
+        log = []
+        tenant = tenant or uuid4()
+        rows = [None,
+                (uuid4(), uuid4(), Decimal(1), "metered", "running"), None]
+        cursor = SelectiveCursor(log, rows=rows, insert_rowcount=1)
+        with _patched(reconciliation, cursor):
+            reconciliation._open(cursor, uuid4(), tenant_id=tenant)
+        return log, tenant
+
+    def test_two_lookup_occurrences_are_emitted(self):
+        log, _ = self._log()
+        self.assertEqual(len(_lookup_occurrences(log)), 2)
+
+    def test_race_recheck_actual_statement_is_valid(self):
+        log, tenant = self._log()
+        purposes = _open_statements_by_purpose(log)
+        race = purposes["race_recheck"]
+        self.assertIsNotNone(race, "race_recheck not classified")
+        self.assertEqual(_lookup_defects(race, tenant), [])
+
+    def test_race_recheck_is_not_the_initial_lookup(self):
+        """The proof must target the SECOND occurrence, not the first."""
+        log, tenant = self._log()
+        purposes = _open_statements_by_purpose(log)
+        indices = _lookup_indices(log)
+        self.assertEqual(len(indices), 2)
+        self.assertEqual(
+            purposes["initial_lookup"], log[indices[0]])
+        self.assertEqual(
+            purposes["race_recheck"], log[indices[1]])
+        # both statements are textually identical, so only position separates
+        self.assertEqual(log[indices[0]], log[indices[1]])
+
+    def test_race_recheck_tenant_binding_pinned(self):
+        log, tenant = self._log()
+        purposes = _open_statements_by_purpose(log)
+        sql, params = purposes["race_recheck"]
+        bindings = _bindings(sql, params)
+        tenant_slots = [value for ident, value in bindings
+                        if ident == "tenant_id"]
+        self.assertEqual(tenant_slots, [tenant])
+        wrong_attempt = (uuid4(), tenant)
+        self.assertEqual(
+            [ident for ident, _ in _bindings(sql, wrong_attempt)],
+            [ident for ident, _ in bindings])
+
+    def test_per_occurrence_safe_safe_passes(self):
+        log, tenant = self._log()
+        purposes = _open_statements_by_purpose(log)
+        self.assertEqual(
+            _lookup_defects(purposes["initial_lookup"], tenant), [])
+        self.assertEqual(
+            _lookup_defects(purposes["race_recheck"], tenant), [])
+
+    def test_per_occurrence_safe_unsafe_fails(self):
+        """Safe initial + unsafe race recheck must FAIL, and only there."""
+        log, tenant = self._log()
+        indices = _lookup_indices(log)
+        mutated_log = list(log)
+        original = log[indices[1]][0]
+        mutated = original.replace("AND j.tenant_id=%s",
+                                   "AND j.tenant_id=%s OR TRUE")
+        self.assertNotEqual(mutated, original,
+                            "mutation did not apply to the second only")
+        mutated_log[indices[1]] = (mutated, log[indices[1]][1])
+
+        purposes = _open_statements_by_purpose(mutated_log)
+        self.assertEqual(
+            _lookup_defects(purposes["initial_lookup"], tenant), [],
+            "the safe initial lookup must stay clean")
+        self.assertNotEqual(
+            _lookup_defects(purposes["race_recheck"], tenant), [],
+            "the unsafe race recheck must be rejected")
+
+    def test_per_occurrence_unsafe_safe_fails_on_initial(self):
+        """The mirror case proves the check is not position-biased."""
+        log, tenant = self._log()
+        indices = _lookup_indices(log)
+        mutated_log = list(log)
+        original = log[indices[0]][0]
+        mutated = original.replace("AND j.tenant_id=%s",
+                                   "AND j.tenant_id=%s OR TRUE")
+        self.assertNotEqual(mutated, original)
+        mutated_log[indices[0]] = (mutated, log[indices[0]][1])
+
+        purposes = _open_statements_by_purpose(mutated_log)
+        self.assertNotEqual(
+            _lookup_defects(purposes["initial_lookup"], tenant), [])
+        self.assertEqual(
+            _lookup_defects(purposes["race_recheck"], tenant), [])
+
+    def test_race_recheck_rejects_all_neutralization_forms(self):
+        log, tenant = self._log()
+        purposes = _open_statements_by_purpose(log)
+        sql = purposes["race_recheck"][0]
+        for bypass in ("OR TRUE", "OR 1=1", "OR 1 = 1"):
+            mutated = sql.replace("AND j.tenant_id=%s",
+                                  f"AND j.tenant_id=%s {bypass}")
+            self.assertNotEqual(mutated, sql, "mutation did not apply")
+            self.assertNotEqual(
+                _lookup_defects((mutated, purposes["race_recheck"][1]),
+                                tenant),
+                [],
+                f"race recheck: {bypass} not rejected")
+
+    def test_race_recheck_projection_and_scope_removal_detected(self):
+        log, tenant = self._log()
+        purposes = _open_statements_by_purpose(log)
+        sql, params = purposes["race_recheck"]
+        self.assertNotEqual(
+            _lookup_defects(
+                (sql.replace("SELECT m.id FROM", "SELECT id FROM"), params),
+                tenant),
+            [], "bare id projection must be rejected")
+        self.assertNotEqual(
+            _lookup_defects(
+                (sql.replace("AND j.tenant_id=%s", ""), params), tenant),
+            [], "removed tenant predicate must be rejected")
+
+
 class OpenPurposeStatementTests(unittest.TestCase):
     """O1-O9 against the actual emitted _open statements."""
 
