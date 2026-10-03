@@ -883,15 +883,35 @@ class F08DatabaseTests(unittest.TestCase):
     def test_rotation_remains_the_replacement_path(self):
         with self.share():
             old = worker_identity.issue_worker_token(self.tenant, self.worker)
+            with self.admin.cursor() as cur:
+                # Exactly one live credential must exist BEFORE rotation, so
+                # the after-state below cannot pass merely because rotation
+                # did nothing.
+                self.assertEqual(self.live_count(cur), 1)
             new = worker_identity.rotate_worker_token(self.tenant,
                                                        self.worker, old.id)
         self.assertNotEqual(old.token, new.token)
+        # F08 corrective #1. share() binds worker_identity to self.admin and
+        # does not commit, so an independent connection cannot see the issued
+        # or rotated rows. Without this boundary the replacement credential
+        # was invisible to the authenticating connection and this test failed
+        # for the wrong reason, while the retired credential was rejected
+        # only because it was invisible too -- a vacuous pass. Committing
+        # first makes the new-token assertion below the primary proof that
+        # the replacement state is visible, which is what gives the
+        # retired-token rejection its meaning.
+        self.admin.commit()
         with patch.object(worker_identity, "connect", self.real_connect()):
-            with self.assertRaises(worker_identity.WorkerAuthenticationError):
-                worker_identity.authenticate_worker_token(old.token)
+            # Replacement FIRST. Proving the new credential authenticates is
+            # what establishes that this independent connection can see the
+            # committed rotation at all. Only then does the retired
+            # credential's rejection mean anything -- asserted second, it can
+            # no longer pass merely because both credentials were invisible.
             principal = worker_identity.authenticate_worker_token(new.token)
             self.assertEqual(principal.worker_node_id, self.worker)
             self.assertEqual(principal.tenant_id, self.tenant)
+            with self.assertRaises(worker_identity.WorkerAuthenticationError):
+                worker_identity.authenticate_worker_token(old.token)
             with self.admin.cursor() as cur:
                 self.assertEqual(self.live_count(cur), 1)
 
