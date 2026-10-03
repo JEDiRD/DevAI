@@ -367,9 +367,24 @@ class C2SignatureTests(unittest.TestCase):
             ["lease", "reservation_by_cost_class", "gateway"])
 
     def test_load_runtime_task_unchanged(self):
-        self.assertEqual(
-            list(inspect.signature(runtime.load_runtime_task).parameters),
-            ["task_id"])
+        """C2->C3 handoff marker for the runtime loader signature.
+
+        Was an absence marker pinning ``load_runtime_task(task_id)``. Group C3
+        adds mandatory caller tenant authority, so this now records the
+        positive contract: ``task_id`` positional, ``tenant_id`` mandatory
+        keyword-only with no default and no Optional escape. No Group-B or C2
+        API gained a tenant argument.
+
+        Behavioural and authority proof remains owned by
+        tests/test_group_c3_runtime_scope.py.
+        """
+        params = inspect.signature(runtime.load_runtime_task).parameters
+        self.assertEqual(list(params), ["task_id", "tenant_id"])
+        tenant = params["tenant_id"]
+        self.assertEqual(tenant.kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIs(tenant.default, inspect.Parameter.empty,
+                      "tenant_id must have no default")
+        self.assertNotIn("None", str(tenant.annotation))
 
 
 # ===========================================================================

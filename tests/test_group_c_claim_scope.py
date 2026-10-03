@@ -849,9 +849,26 @@ class C2BoundaryTests(unittest.TestCase):
                              f"{name} must not use an unscoped VALUES insert")
 
     def test_load_runtime_task_and_run_claimed_task_unchanged(self):
-        self.assertEqual(
-            list(inspect.signature(runtime.load_runtime_task).parameters),
-            ["task_id"])
+        """C1->C2->C3 handoff marker for the runtime entry points.
+
+        Originally pinned ``load_runtime_task(task_id)`` -- an absence marker
+        recording that runtime authority had not been hardened. Group C3 now
+        implements exactly that, so this records the resulting contract:
+        ``load_runtime_task`` takes a mandatory keyword-only ``tenant_id``
+        because it receives no TaskLease, while ``run_claimed_task`` keeps its
+        lease-based signature unchanged.
+
+        The authoritative C3 authority proof, including the tenant predicate,
+        the mismatch barrier and the mutation matrix, lives in
+        tests/test_group_c3_runtime_scope.py; this stays a narrow sentinel.
+        """
+        params = inspect.signature(runtime.load_runtime_task).parameters
+        self.assertEqual(list(params), ["task_id", "tenant_id"])
+        tenant = params["tenant_id"]
+        self.assertEqual(tenant.kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIs(tenant.default, inspect.Parameter.empty,
+                      "tenant_id must be mandatory")
+        self.assertNotIn("None", str(tenant.annotation))
         self.assertEqual(
             list(inspect.signature(runtime.run_claimed_task).parameters),
             ["lease", "reservation_by_cost_class", "gateway"])

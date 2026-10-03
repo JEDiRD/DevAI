@@ -1156,12 +1156,23 @@ class ObserverPropagationTests(unittest.TestCase):
                 self.assertEqual(fin.call_args.kwargs["tenant_id"], tenant)
 
     def test_runtime_passes_task_tenant_to_budgeted_observer(self):
-        """The OPERATIONAL BudgetedLedgerObserver call must bind task.tenant_id.
+        """The OPERATIONAL BudgetedLedgerObserver call must bind lease.tenant_id.
+
+        Group C3 transition. Group B originally pinned ``task.tenant_id`` here,
+        which was a DB-row-derived value. C3 re-points the SOURCE of the
+        observer's tenant context to ``lease.tenant_id`` -- the caller
+        authority acquired through the C1 tenant-scoped claim. Group B's actual
+        security property is preserved and strengthened: the tenant is still
+        explicit, immutable constructor context and is still never derived
+        from mutable payload, response or adapter data. Only the source
+        changed; no Group-B production API, SQL or semantics changed.
 
         AST-based and scoped to the function that actually executes the
         runtime flow, so a decoy construction in an unused function or dead
         code cannot satisfy this, and removing the keyword from the real
-        call fails even if a decoy elsewhere is correct.
+        call fails even if a decoy elsewhere is correct. The tenant argument
+        is read from the ACTUAL construction site, not from any other
+        occurrence of the literal in the same function.
         """
         tree = ast.parse(inspect.getsource(runtime))
         operational = _runtime_operational_observer_calls(tree)
@@ -1176,8 +1187,9 @@ class ObserverPropagationTests(unittest.TestCase):
                 isinstance(value, ast.Attribute)
                 and value.attr == "tenant_id"
                 and isinstance(value.value, ast.Name)
-                and value.value.id == "task",
-                "tenant_id must be task.tenant_id")
+                and value.value.id == "lease",
+                "tenant_id must be lease.tenant_id, the authoritative "
+                "caller tenant acquired at claim time")
 
     def test_runtime_decoy_observer_call_is_not_counted(self):
         """A correct decoy in dead code must not mask a missing keyword."""
@@ -1196,12 +1208,27 @@ class ObserverPropagationTests(unittest.TestCase):
             self.assertIn("tenant_id", keywords)
 
     def test_runtime_real_call_missing_keyword_with_decoy_present(self):
-        """Removing the real keyword must fail even with a correct decoy."""
+        """Removing the real keyword must fail even with a correct decoy.
+
+        Group C3 transition. The authoritative call under test is still the real
+        ``BudgetedLedgerObserver(...)`` construction inside
+        ``run_claimed_task``, and the keyword stripped from it is now the
+        ``tenant_id=lease.tenant_id`` that C3 introduced. The decoy deliberately
+        uses the OLD ``task.tenant_id`` source, so this proves the specific
+        failure mode C3 already hit once: authority text existing elsewhere in
+        the same function is NOT the same as authority reaching the intended
+        call. A decoy -- whether it carries the old row-derived tenant, the new
+        lease tenant, or merely the keyword -- must never satisfy the
+        operational proof.
+        """
         source = inspect.getsource(runtime)
         stripped = source.replace(
             "            reservation_by_cost_class=reservation_by_cost_class,\n"
-            "            tenant_id=task.tenant_id,\n",
+            "            tenant_id=lease.tenant_id,\n",
             "            reservation_by_cost_class=reservation_by_cost_class,\n")
+        # The decoy must not rescue the real call.
+        self.assertNotEqual(stripped, source,
+                            "the real observer keyword must be present to strip")
         stripped += (
             "\n\ndef _unused():\n"
             "    return BudgetedLedgerObserver(\n"

@@ -34,7 +34,19 @@ class RuntimeTask:
     needs_review: bool
 
 
-def load_runtime_task(task_id: UUID) -> RuntimeTask:
+def load_runtime_task(task_id: UUID, *, tenant_id: UUID) -> RuntimeTask:
+    """Load a task for ``tenant_id``, the caller's tenant authority.
+
+    The CALLER tenant is the authority; ``jobs.tenant_id`` is ownership
+    evidence only, proven atomically inside the authoritative SELECT through
+    ``tasks -> jobs``. ``jobs.tenant_id`` is therefore deliberately absent from
+    the projection, so no row-derived tenant can ever be adopted, and the
+    returned RuntimeTask carries the caller's tenant.
+
+    A task owned by another tenant and a task that does not exist both produce
+    no row and therefore raise the same pre-existing error, so this exposes no
+    tenant-existence oracle.
+    """
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -42,7 +54,6 @@ def load_runtime_task(task_id: UUID) -> RuntimeTask:
                 SELECT
                     t.id,
                     t.job_id,
-                    j.tenant_id,
                     t.external_id,
                     t.title,
                     t.description,
@@ -53,8 +64,9 @@ def load_runtime_task(task_id: UUID) -> RuntimeTask:
                 JOIN jobs j
                   ON j.id = t.job_id
                 WHERE t.id = %s
+                  AND j.tenant_id = %s
                 """,
-                (task_id,),
+                (task_id, tenant_id),
             )
             row = cur.fetchone()
 
@@ -64,13 +76,13 @@ def load_runtime_task(task_id: UUID) -> RuntimeTask:
     return RuntimeTask(
         id=row[0],
         job_id=row[1],
-        tenant_id=row[2],
-        external_id=row[3],
-        title=row[4],
-        description=row[5],
-        capability=Capability[row[6].upper()],
-        risk=row[7],
-        needs_review=row[8],
+        tenant_id=tenant_id,
+        external_id=row[2],
+        title=row[3],
+        description=row[4],
+        capability=Capability[row[5].upper()],
+        risk=row[6],
+        needs_review=row[7],
     )
 
 
@@ -79,7 +91,18 @@ def run_claimed_task(
     reservation_by_cost_class: dict[str, Decimal],
     gateway: GatewayClient | None = None,
 ):
-    task = load_runtime_task(lease.task_id)
+    task = load_runtime_task(
+        lease.task_id,
+        tenant_id=lease.tenant_id,
+    )
+
+    # Defensive authority invariant. The loader already proved the caller
+    # tenant against DB ownership, so a disagreement here means the runtime
+    # was handed an inconsistent pair. Fail closed BEFORE any downstream
+    # operation: no checkpoint read or write, no routing, no observer
+    # construction, no gateway resolution and no adapter execution may occur.
+    if task.tenant_id != lease.tenant_id:
+        raise RuntimeError("RUNTIME_AUTHORITY_MISMATCH")
 
     previous = load_latest_checkpoint(task.id, tenant_id=lease.tenant_id)
 
@@ -103,7 +126,7 @@ def run_claimed_task(
     )
 
     candidates = list_available_routes(
-        task.tenant_id
+        lease.tenant_id
     )
 
     try:
@@ -120,9 +143,9 @@ def run_claimed_task(
             job_id=task.job_id,
             task_id=task.id,
             reservation_by_cost_class=reservation_by_cost_class,
-            tenant_id=task.tenant_id,
+            tenant_id=lease.tenant_id,
         ),
-        tenant_id=task.tenant_id,
+        tenant_id=lease.tenant_id,
     )
 
     try:
@@ -142,7 +165,7 @@ def run_claimed_task(
                 routes=routes,
                 gateway_resolver=lambda route:
                     build_gateway_for_route(
-                        task.tenant_id,
+                        lease.tenant_id,
                         route.key,
                     ),
                 observer=observer,
