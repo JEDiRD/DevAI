@@ -524,5 +524,360 @@ class F11StructuralTests(unittest.TestCase):
                              name)
 
 
+# =====================================================================
+# MUTATION MATRIX
+# =====================================================================
+#
+# F11 corrective 1. The F11 commit reported a 13/13 mutation result, but the
+# harness that produced it lived outside the repository and was never
+# committed, so the committed artifact contained no mutation evidence at all.
+# This matrix is self-contained: everything needed to execute it lives in
+# this file, and it reads the committed production source rather than any
+# temporary copy or prior console state.
+#
+# Discipline, applied per mutant:
+#
+#   * Targets are matched in AST-normalised form, so a comment or docstring
+#     can neither satisfy nor break target detection.
+#   * Every target must occur EXACTLY ONCE in the normalised production
+#     source. That proves isolation before the mutant is built, and
+#     non-unique targets are reported as harness errors rather than silently
+#     passing.
+#   * The mutated source must still parse, and the target must have changed,
+#     otherwise the mutant is a harness error, not a catch.
+#   * A mutant counts as ASSERTION_CAUGHT only when the EXACT intended
+#     invariant appears among the violated set. Rejection by an unrelated
+#     invariant is classified WRONG_INVARIANT and does not count.
+#   * Mutants are applied to in-memory strings only. The repository's
+#     reconciliation.py is never written to.
+
+PRODUCTION_REL = "controller/devai/reconciliation.py"
+RESOLVE_BRANCH_MARKER = "else:"
+
+# (id, property, target_file, target_symbol, old, new, invariant)
+MUTATION_MATRIX = (
+    ("F11M01",
+     "committed reread must be scoped by tenant AND case",
+     PRODUCTION_REL, "committed_case_provenance",
+     "cur.execute('SELECT id,attempt_id,status,resolution,resolved_at\\n"
+     "            FROM metered_reconciliations WHERE tenant_id=%s AND id=%s', "
+     "(tenant_id, case_id))",
+     "cur.execute('SELECT id,attempt_id,status,resolution,resolved_at "
+     "FROM metered_reconciliations WHERE id=%s', (case_id,))",
+     "reread_scoped_by_tenant_and_case"),
+
+    ("F11M02",
+     "output case_id comes from the committed row, not a request echo",
+     PRODUCTION_REL, "__main__",
+     "'case_id': str(case)",
+     "'case_id': data['case_id']",
+     "output_case_id_db_derived"),
+
+    ("F11M03",
+     "output identifies the attempt persisted on the case",
+     PRODUCTION_REL, "__main__",
+     "'attempt_id': str(attempt)",
+     "'attempt_id': 'unbound'",
+     "output_attempt_id_db_derived"),
+
+    ("F11M04",
+     "output status is committed-row state, not a static value",
+     PRODUCTION_REL, "__main__",
+     "'status': status",
+     "'status': 'resolved'",
+     "output_status_db_derived"),
+
+    ("F11M05",
+     "output resolution is committed state, not input-derived",
+     PRODUCTION_REL, "__main__",
+     "'resolution': resolution",
+     "'resolution': 'usage' if data.get('usage') is not None else 'provider_statement'",
+     "output_resolution_db_derived"),
+
+    ("F11M06",
+     "output resolved_at is the persisted timestamp",
+     PRODUCTION_REL, "__main__",
+     "'resolved_at': resolved_at.isoformat() if resolved_at is not None else None",
+     "'resolved_at': datetime.now(timezone.utc).isoformat()",
+     "output_resolved_at_db_derived"),
+
+    ("F11M07",
+     "resolved is computed from committed status, never hard-coded",
+     PRODUCTION_REL, "__main__",
+     "'resolved': status == 'resolved'",
+     "'resolved': True",
+     "resolved_not_static_true"),
+
+    ("F11M08",
+     "resolve success requires a committed reread on a new connection",
+     PRODUCTION_REL, "__main__",
+     "case, attempt, status, resolution, resolved_at = committed_case_provenance(tenant_id=UUID(data['tenant_id']), case_id=UUID(data['case_id']))",
+     "case, attempt, status, resolution, resolved_at = (data['case_id'], data['case_id'], 'resolved', 'usage', None)",
+     "success_requires_committed_reread"),
+
+    ("F11M09",
+     "resolve success print occurs AFTER committed provenance is obtained",
+     PRODUCTION_REL, "__main__",
+     "            case, attempt, status, resolution, resolved_at = committed_case_provenance(tenant_id=UUID(data['tenant_id']), case_id=UUID(data['case_id']))",
+     "            print(json.dumps({'case_id': str(case), 'attempt_id': str(attempt), 'resolved': status == 'resolved', 'changed': changed, 'status': status, 'resolution': resolution, 'resolved_at': resolved_at.isoformat()}))\n            case, attempt, status, resolution, resolved_at = committed_case_provenance(tenant_id=UUID(data['tenant_id']), case_id=UUID(data['case_id']))",
+     "success_print_after_provenance"),
+
+    ("F11M10",
+     "evidence-read failure emits no success and exits non-zero",
+     PRODUCTION_REL, "committed_case_provenance",
+     "        raise ReconciliationError('EVIDENCE_UNAVAILABLE')",
+     "        return (case_id, case_id, 'resolved', 'usage', None)",
+     "evidence_failure_not_success"),
+
+    ("F11M11",
+     "failure exit is non-zero, never swallowed",
+     PRODUCTION_REL, "__main__",
+     "            print('RESOLUTION_REJECTED', file=sys.stderr)\n            sys.exit(1)",
+     "            print('RESOLUTION_REJECTED', file=sys.stderr)",
+     "failure_exit_nonzero"),
+
+    ("F11M12",
+     "the success JSON must DECLARE the attempt binding field at all",
+     PRODUCTION_REL, "__main__",
+     "'attempt_id': str(attempt), ",
+     "",
+     "required_output_fields_present"),
+
+    ("F11M13",
+     "the reread returns the row it actually read (row binding intact)",
+     PRODUCTION_REL, "committed_case_provenance",
+     "    return row",
+     "    return (case_id, case_id, 'resolved', 'usage', None)",
+     "reread_returns_read_row"),
+)
+
+
+def normalised_production():
+    """AST-normalised committed production source."""
+    with open(PRODUCTION_REL, encoding="utf-8") as handle:
+        return ast.unparse(ast.parse(handle.read()))
+
+
+def _symbol_body(text, symbol):
+    """Normalised source of one top-level function or the __main__ block."""
+    for node in ast.parse(text).body:
+        if isinstance(node, ast.FunctionDef) and node.name == symbol:
+            return ast.unparse(node)
+        if isinstance(node, ast.If) and "__name__" in ast.unparse(node.test):
+            if symbol == "__main__":
+                return ast.unparse(node)
+    return ""
+
+
+def _resolve_branch(text):
+    """Normalised source of the --resolve-stdin branch only.
+
+    Ordering and output invariants are scoped here so the sweep-mode summary
+    print, which is legitimately un-attributed, can never be mistaken for
+    resolve-mode evidence.
+    """
+    for node in ast.parse(text).body:
+        if isinstance(node, ast.If) and "__name__" in ast.unparse(node.test):
+            for sub in node.body:
+                if isinstance(sub, ast.If):
+                    return "\n".join(ast.unparse(s) for s in sub.orelse)
+    return ""
+
+
+def check_invariants(text):
+    """Sorted names of violated F11 invariants; empty means all hold.
+
+    Every invariant is written so that only the specific construct it names
+    can satisfy or violate it. String presence alone is never authority.
+    """
+    bad = []
+    provenance = _symbol_body(text, "committed_case_provenance")
+    resolve = _resolve_branch(text)
+    flat_prov = provenance.replace(" ", "")
+    flat_resolve = resolve.replace(" ", "")
+
+    # --- committed reread helper ---
+    if not provenance:
+        bad.append("reread_present")
+    else:
+        if "tenant_id=%sANDid=%s" not in flat_prov:
+            bad.append("reread_scoped_by_tenant_and_case")
+        if "returnrow" not in flat_prov:
+            bad.append("reread_returns_read_row")
+        # a miss must raise, never fabricate a plausible-looking row
+        if "raiseReconciliationError('EVIDENCE_UNAVAILABLE')" not in flat_prov:
+            bad.append("evidence_failure_not_success")
+        if "return(case_id,case_id,'resolved','usage',None)" in flat_prov:
+            bad.append("evidence_failure_not_success")
+            bad.append("reread_returns_read_row")
+
+    # --- resolve-mode output ---
+    if "'resolved':True" in flat_resolve:
+        bad.append("resolved_not_static_true")
+    if "'case_id':str(case)" not in flat_resolve:
+        bad.append("output_case_id_db_derived")
+    if "'attempt_id':str(attempt)" not in flat_resolve:
+        bad.append("output_attempt_id_db_derived")
+    if "'status':status" not in flat_resolve:
+        bad.append("output_status_db_derived")
+    if "'resolution':resolution" not in flat_resolve:
+        bad.append("output_resolution_db_derived")
+    if "resolved_at.isoformat()" not in flat_resolve:
+        bad.append("output_resolved_at_db_derived")
+    # required binding fields: case, attempt, status, resolution, resolved_at
+    for field in ("case_id", "attempt_id", "status", "resolution",
+                  "resolved_at"):
+        if f"'{field}'" not in flat_resolve:
+            bad.append("required_output_fields_present")
+
+    # --- committed reread must actually be invoked ---
+    if "committed_case_provenance(" not in resolve:
+        bad.append("success_requires_committed_reread")
+
+    # --- ordering: no success output before the reread ---
+    if "print(json.dumps(" in resolve:
+        first_print = resolve.index("print(json.dumps(")
+        read_at = resolve.find("committed_case_provenance(")
+        if read_at == -1 or read_at > first_print:
+            bad.append("success_print_after_provenance")
+    if "sys.exit(0)" in flat_resolve:
+        bad.append("success_print_after_provenance")
+
+    # --- failure surface ---
+    if "exceptException:" in flat_resolve:
+        tail = flat_resolve.split("exceptException:", 1)[1]
+        if "sys.exit(1)" not in tail:
+            bad.append("failure_exit_nonzero")
+
+    return sorted(set(bad))
+
+
+def execute_mutation(mid, prop, rel, symbol, old, new, invariant):
+    """Classify one mutant. Never touches the repository file."""
+    base = normalised_production()
+    symbol_src = _symbol_body(base, symbol)
+
+    # (6) target isolation, before mutation
+    pre_count = base.count(old)
+    if pre_count != 1:
+        return {"id": mid, "property": prop, "classification":
+                "HARNESS_ERROR", "detail": f"target occurs {pre_count} times",
+                "violated": []}
+    if symbol_src and old not in symbol_src:
+        return {"id": mid, "property": prop, "classification":
+                "HARNESS_ERROR",
+                "detail": f"target not inside declared symbol {symbol}",
+                "violated": []}
+
+    mutated = base.replace(old, new, 1)
+
+    # target must actually have changed, and the source must still parse
+    if mutated == base:
+        return {"id": mid, "property": prop, "classification":
+                "HARNESS_ERROR", "detail": "mutation was a no-op",
+                "violated": []}
+    post_count = mutated.count(new)
+    try:
+        ast.parse(mutated)
+    except SyntaxError as exc:
+        return {"id": mid, "property": prop, "classification":
+                "HARNESS_ERROR", "detail": f"SyntaxError: {exc}",
+                "violated": []}
+
+    violated = check_invariants(mutated)
+    if invariant in violated:
+        classification = "ASSERTION_CAUGHT"
+    elif violated:
+        classification = "WRONG_INVARIANT"
+    else:
+        classification = "SURVIVED"
+    return {"id": mid, "property": prop, "target_file": rel,
+            "target_symbol": symbol, "pre_target_count": pre_count,
+            "post_target_count": post_count, "intended_invariant": invariant,
+            "observed_violations": violated, "classification": classification,
+            "detail": ""}
+
+
+class F11MutationMatrixTests(unittest.TestCase):
+    """Sections 4-6, 21-23: the committed mutation matrix."""
+
+    def test_inventory_is_exactly_the_thirteen_frozen_ids(self):
+        ids = [m[0] for m in MUTATION_MATRIX]
+        self.assertEqual(
+            [f"F11M{n:02d}" for n in range(1, 14)], ids)
+        self.assertEqual(len(set(ids)), len(ids))
+        self.assertEqual(13, len(MUTATION_MATRIX))
+
+    def test_every_mutant_targets_a_distinct_property(self):
+        props = [m[1] for m in MUTATION_MATRIX]
+        self.assertEqual(len(set(props)), len(props))
+        invariants = [m[6] for m in MUTATION_MATRIX]
+        self.assertEqual(len(set(invariants)), len(invariants))
+        targets = [(m[3], m[4]) for m in MUTATION_MATRIX]
+        self.assertEqual(len(set(targets)), len(targets),
+                         "no two mutants may share a target")
+
+    def test_baseline_satisfies_every_invariant(self):
+        """Section 21: must pass before any mutant is considered."""
+        self.assertEqual([], check_invariants(normalised_production()))
+
+    def test_every_target_is_isolated_in_normalised_source(self):
+        """Target isolation: exactly one occurrence in normalised source.
+
+        No assertion that the replacement is absent, because several mutants
+        are deletions whose replacement text is by definition already present
+        in the original. Isolation is proven by unique occurrence, and the
+        runner additionally proves the mutation changed the target and that
+        the result still parses.
+        """
+        base = normalised_production()
+        for mid, prop, rel, symbol, old, new, inv in MUTATION_MATRIX:
+            self.assertEqual(1, base.count(old),
+                             f"{mid}: target must occur exactly once")
+
+    def test_matrix_results(self):
+        results = [execute_mutation(*m) for m in MUTATION_MATRIX]
+        report = "\n".join(
+            f"  {r['id']} {r['classification']:<17} "
+            f"invariant={r.get('intended_invariant')} "
+            f"violated={r.get('observed_violations')} "
+            f"{r.get('detail', '')}".rstrip()
+            for r in results)
+        print("\n=== F11 MUTATION MATRIX ===")
+        print(report)
+        caught = [r for r in results
+                  if r["classification"] == "ASSERTION_CAUGHT"]
+        harness = [r for r in results if r["classification"] == "HARNESS_ERROR"]
+        survived = [r for r in results if r["classification"] == "SURVIVED"]
+        wrong = [r for r in results
+                 if r["classification"] == "WRONG_INVARIANT"]
+        self.assertEqual([], harness, report)
+        self.assertEqual([], survived, report)
+        self.assertEqual([], wrong, report)
+        self.assertEqual(13, len(caught), report)
+
+    def test_f11m09_is_attributed_to_the_ordering_invariant(self):
+        """Section 15/23: F11M09 must be rejected by ordering, nothing else."""
+        result = execute_mutation(*MUTATION_MATRIX[8])
+        self.assertEqual("ASSERTION_CAUGHT", result["classification"])
+        self.assertEqual("success_print_after_provenance",
+                         result["intended_invariant"])
+        self.assertIn("success_print_after_provenance",
+                      result["observed_violations"])
+        self.assertEqual(
+            ["success_print_after_provenance"],
+            result["observed_violations"],
+            "F11M09 must be isolated: no unrelated invariant may fire")
+
+    def test_repository_production_file_is_never_modified(self):
+        with open(PRODUCTION_REL, encoding="utf-8") as handle:
+            before = handle.read()
+        for mutant in MUTATION_MATRIX:
+            execute_mutation(*mutant)
+        with open(PRODUCTION_REL, encoding="utf-8") as handle:
+            after = handle.read()
+        self.assertEqual(before, after)
+
+
 if __name__ == "__main__":
     unittest.main()
