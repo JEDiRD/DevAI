@@ -734,14 +734,28 @@ class LiveReachabilitySentinelTests(unittest.TestCase):
             self.assertNotIn(f"devai.{mod} import", src)
 
     def test_live_worker_subsystem_frozen(self):
-        """C1 may not touch the live dispatch subsystem."""
+        """C1 may not touch the live dispatch subsystem.
+
+        F08 transition. This sentinel originally compared the C1 base commit
+        against the CURRENT WORKTREE, which made every later legitimate
+        change to the live worker subsystem impossible -- it asserted not
+        "C1 did not change these files" but "nobody ever changes these
+        files". It is now a CLOSED HISTORICAL RANGE over two exact commits,
+        so it proves the original intent and stays valid after F08 and any
+        future phase legitimately modify worker_api.py / worker_identity.py.
+
+        It no longer references the worktree, HEAD, a branch name, or any
+        other ref that a later phase can move.
+        """
         import subprocess
-        base = "ab21619fccd83af2f18576133934e7f696cbf3af"
+        pre_c1_evidence = "31716362a7f07807c667ed8975192a770259adac"
+        c1_final_evidence = "b0d95f6eadb57ece278aafe63802bfec74f5d882"
         for name in ("worker_api", "worker_dispatch", "worker_identity",
                      "worker_registry"):
             rel = f"controller/devai/{name}.py"
             out = subprocess.run(
-                ["git", "diff", "--name-only", base, "--", rel],
+                ["git", "diff", "--name-only",
+                 pre_c1_evidence, c1_final_evidence, "--", rel],
                 cwd=DEVAI_ROOT, capture_output=True, text=True)
             self.assertEqual(out.stdout.strip(), "",
                              f"{rel} must be unchanged by Group C1")

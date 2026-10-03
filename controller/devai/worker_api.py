@@ -68,7 +68,31 @@ def require_worker(
             detail="Invalid Worker credential",
             headers={"WWW-Authenticate": "Bearer"},
         ) from None
-    if x_worker_id is not None and x_worker_id != principal.worker_node_id:
+    # X-Worker-Id is a MANDATORY consistency assertion, never an authority.
+    # The principal above was derived from the authenticated token alone, and
+    # it stays that way: the header is only ever compared against the token's
+    # own worker_node_id, so a valid token presented with another worker's id
+    # is refused rather than adopted. Identity authority remains token ->
+    # principal, and adding this requirement does not shift it to header ->
+    # identity.
+    #
+    # Missing and mismatched headers are refused with the same 401 credential
+    # detail as any other unusable credential, so an absent header is
+    # indistinguishable to a caller from an invalid token and reveals nothing
+    # about whether the Worker exists. A mismatch keeps its established 403.
+    #
+    # The header parameter stays Optional on purpose. Making it a required
+    # FastAPI Header would turn absence into a 422 validation error with a
+    # different body shape, which is both a new observable status and a second
+    # failure style; refusing it explicitly keeps one uniform contract.
+    if x_worker_id is None:
+        auth_failure(401)
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid Worker credential",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if x_worker_id != principal.worker_node_id:
         auth_failure(403)
         raise HTTPException(status_code=403, detail="Worker identity mismatch")
     return principal

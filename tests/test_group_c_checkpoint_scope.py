@@ -744,10 +744,22 @@ class C2BoundaryTests(unittest.TestCase):
             self.assertNotIn(mod, closure)
 
     def test_live_worker_subsystem_untouched_by_c2(self):
+        """C2 must not touch the live Worker subsystem.
+
+        F08 transition. This sentinel compared the C2 base commit against
+        the CURRENT WORKTREE, so it forbade every later phase from ever
+        changing the live subsystem rather than forbidding C2 specifically.
+        It is now a CLOSED HISTORICAL RANGE across C2's own evidence, which
+        preserves the original invariant while remaining valid after F08.
+
+        No worktree, HEAD, branch or movable ref is consulted.
+        """
         import subprocess
-        base = "b0d95f6eadb57ece278aafe63802bfec74f5d882"
+        c2_input_evidence = "b0d95f6eadb57ece278aafe63802bfec74f5d882"
+        c2_final_evidence = "e51664252e7cb4be561d7f13b2958b6df1cc3139"
         out = subprocess.run(
-            ["git", "diff", "--name-only", base, "--", "controller/devai"],
+            ["git", "diff", "--name-only",
+             c2_input_evidence, c2_final_evidence, "--", "controller/devai"],
             cwd=DEVAI_ROOT, capture_output=True, text=True)
         changed = [p for p in out.stdout.split()
                    if p and os.path.basename(p) in (

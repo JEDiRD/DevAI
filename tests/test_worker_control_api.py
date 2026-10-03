@@ -94,8 +94,21 @@ class WorkerControlApiTests(unittest.TestCase):
                     (worker_id, tenant_id, str(worker_id)),
                 )
 
-    def auth(self, token):
-        return {"Authorization": f"Bearer {token}"}
+    def auth(self, token, worker_id):
+        """Headers for a valid authenticated Worker client.
+
+        F08 transition. X-Worker-Id is now a MANDATORY consistency
+        assertion, so every request this suite treats as a well-formed
+        client supplies it. worker_id is mandatory and has no default: it
+        is never inferred from the token, never defaulted to the first
+        created Worker, and never Optional. The bearer token remains the
+        primary identity authority -- the header is compared against the
+        token-derived principal server-side and can never override it.
+        """
+        return {
+            "Authorization": f"Bearer {token}",
+            "X-Worker-Id": str(worker_id),
+        }
 
     def route(self, tenant_id, route_key, worker_id):
         connection_id = uuid4()
@@ -142,24 +155,25 @@ class WorkerControlApiTests(unittest.TestCase):
         )
         self.assertEqual(self.client.post(path, json={}).status_code, 401)
         self.assertEqual(
-            self.client.post(path, headers=self.auth("invalid"), json={}).status_code,
+            self.client.post(
+                path, headers=self.auth("invalid", self.worker_a1), json={}
+            ).status_code,
             401,
         )
         self.assertEqual(
             self.client.post(
                 path,
-                headers=self.auth(issued.token),
+                headers=self.auth(issued.token, self.worker_a1),
                 json={"platform": "windows", "architecture": "x64"},
             ).status_code,
             204,
         )
+        # Valid token for worker_a1 presented with worker_a2's id: the
+        # mismatch is refused, and the header never becomes the identity.
         self.assertEqual(
             self.client.post(
                 path,
-                headers={
-                    **self.auth(issued.token),
-                    "X-Worker-Id": str(self.worker_a2),
-                },
+                headers=self.auth(issued.token, self.worker_a2),
                 json={},
             ).status_code,
             403,
@@ -174,9 +188,11 @@ class WorkerControlApiTests(unittest.TestCase):
         worker_identity.revoke_worker_token(
             self.tenant_a, self.worker_a1, issued.id
         )
+        # A revoked credential stays refused even with the correct header:
+        # the matching assertion cannot rescue it.
         self.assertEqual(
             self.client.post(
-                path, headers=self.auth(issued.token), json={}
+                path, headers=self.auth(issued.token, self.worker_a1), json={}
             ).status_code,
             401,
         )
@@ -195,15 +211,17 @@ class WorkerControlApiTests(unittest.TestCase):
         )
         self.assertNotEqual(old.token, new.token)
         path = "/v1/worker/heartbeat"
+        # Both the retired and the replacement credential carry the correct
+        # header, so only credential state can decide the outcome.
         self.assertEqual(
             self.client.post(
-                path, headers=self.auth(old.token), json={}
+                path, headers=self.auth(old.token, self.worker_a1), json={}
             ).status_code,
             401,
         )
         self.assertEqual(
             self.client.post(
-                path, headers=self.auth(new.token), json={}
+                path, headers=self.auth(new.token, self.worker_a1), json={}
             ).status_code,
             204,
         )
@@ -226,7 +244,7 @@ class WorkerControlApiTests(unittest.TestCase):
             )
         self.assertEqual(
             self.client.post(
-                path, headers=self.auth(issued.token), json={}
+                path, headers=self.auth(issued.token, self.worker_a1), json={}
             ).status_code,
             401,
         )
@@ -237,9 +255,10 @@ class WorkerControlApiTests(unittest.TestCase):
         worker_registry.set_worker_status(
             self.tenant_a, self.worker_a1, "disabled"
         )
+        # A disabled Worker is refused despite the matching header.
         self.assertEqual(
             self.client.post(
-                path, headers=self.auth(active.token), json={}
+                path, headers=self.auth(active.token, self.worker_a1), json={}
             ).status_code,
             401,
         )
@@ -252,9 +271,11 @@ class WorkerControlApiTests(unittest.TestCase):
                 "UPDATE tenants SET status = 'suspended' WHERE id = %s",
                 (self.tenant_a,),
             )
+        # A suspended tenant is refused for worker_a2's own valid token; the
+        # matching header does not restore it.
         self.assertEqual(
             self.client.post(
-                path, headers=self.auth(another.token), json={}
+                path, headers=self.auth(another.token, self.worker_a2), json={}
             ).status_code,
             401,
         )
@@ -273,11 +294,15 @@ class WorkerControlApiTests(unittest.TestCase):
         token_b = worker_identity.issue_worker_token(
             self.tenant_b, self.worker_b
         ).token
-        for token in (token_a1, token_a2, token_b):
+        for token, worker in (
+            (token_a1, self.worker_a1),
+            (token_a2, self.worker_a2),
+            (token_b, self.worker_b),
+        ):
             self.assertEqual(
                 self.client.post(
                     "/v1/worker/heartbeat",
-                    headers=self.auth(token),
+                    headers=self.auth(token, worker),
                     json={},
                 ).status_code,
                 204,
@@ -309,18 +334,20 @@ class WorkerControlApiTests(unittest.TestCase):
         )
 
         claims = {}
-        for token, expected in (
-            (token_a1, a1), (token_a2, a2), (token_b, b)
+        for token, worker, expected in (
+            (token_a1, self.worker_a1, a1),
+            (token_a2, self.worker_a2, a2),
+            (token_b, self.worker_b, b),
         ):
             response = self.client.post(
-                "/v1/worker/claim", headers=self.auth(token)
+                "/v1/worker/claim", headers=self.auth(token, worker)
             )
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()["id"], str(expected))
             claims[expected] = response.json()["claim_version"]
             self.assertEqual(
                 self.client.post(
-                    "/v1/worker/claim", headers=self.auth(token)
+                    "/v1/worker/claim", headers=self.auth(token, worker)
                 ).status_code,
                 204,
             )
@@ -328,7 +355,7 @@ class WorkerControlApiTests(unittest.TestCase):
         for foreign in (a2, b):
             response = self.client.post(
                 f"/v1/worker/dispatches/{foreign}/complete",
-                headers=self.auth(token_a1),
+                headers=self.auth(token_a1, self.worker_a1),
                 json={"claim_version": claims[foreign], "content": "wrong"},
             )
             self.assertEqual(response.status_code, 409)
@@ -336,7 +363,7 @@ class WorkerControlApiTests(unittest.TestCase):
         self.assertEqual(
             self.client.post(
                 f"/v1/worker/dispatches/{a1}/complete",
-                headers=self.auth(token_a1),
+                headers=self.auth(token_a1, self.worker_a1),
                 json={
                     "claim_version": claims[a1] + 1,
                     "content": "wrong version",
@@ -348,7 +375,7 @@ class WorkerControlApiTests(unittest.TestCase):
         self.assertEqual(
             self.client.post(
                 f"/v1/worker/dispatches/{a1}/complete",
-                headers=self.auth(token_a1),
+                headers=self.auth(token_a1, self.worker_a1),
                 json={"claim_version": claims[a1], "content": "done"},
             ).status_code,
             204,
@@ -356,7 +383,7 @@ class WorkerControlApiTests(unittest.TestCase):
         self.assertEqual(
             self.client.post(
                 f"/v1/worker/dispatches/{a2}/fail",
-                headers=self.auth(token_a2),
+                headers=self.auth(token_a2, self.worker_a2),
                 json={"claim_version": claims[a2], "error": "failed"},
             ).status_code,
             204,
@@ -364,7 +391,7 @@ class WorkerControlApiTests(unittest.TestCase):
         self.assertEqual(
             self.client.post(
                 f"/v1/worker/dispatches/{b}/complete",
-                headers=self.auth(token_b),
+                headers=self.auth(token_b, self.worker_b),
                 json={"claim_version": claims[b], "content": "done"},
             ).status_code,
             204,
@@ -386,24 +413,24 @@ class WorkerControlApiTests(unittest.TestCase):
     def test_authority_and_termination_are_scoped_and_versioned(self):
         token=worker_identity.issue_worker_token(self.tenant_a,self.worker_a1).token
         foreign=worker_identity.issue_worker_token(self.tenant_b,self.worker_b).token
-        self.client.post('/v1/worker/heartbeat',headers=self.auth(token),json={})
+        self.client.post('/v1/worker/heartbeat',headers=self.auth(token,self.worker_a1),json={})
         self.route(self.tenant_a,'hardening/control',self.worker_a1)
         identifier=worker_dispatch.create_dispatch(tenant_id=self.tenant_a,worker_node_id=self.worker_a1,
             route_key='hardening/control',gateway_model='model',prompt='synthetic')
-        claimed=self.client.post('/v1/worker/claim',headers=self.auth(token)).json()
+        claimed=self.client.post('/v1/worker/claim',headers=self.auth(token,self.worker_a1)).json()
         path=f'/v1/worker/dispatches/{identifier}'
         version=claimed['claim_version']
-        self.assertEqual(self.client.post(path+'/status',headers=self.auth(token),json={'claim_version':version}).json(),{'state':'claimed'})
+        self.assertEqual(self.client.post(path+'/status',headers=self.auth(token,self.worker_a1),json={'claim_version':version}).json(),{'state':'claimed'})
         for endpoint in ('status','terminated'):
-            for auth,body in ((self.auth(foreign),{'claim_version':version}),
-                    (self.auth(token),{'claim_version':version+1})):
+            for auth,body in ((self.auth(foreign,self.worker_b),{'claim_version':version}),
+                    (self.auth(token,self.worker_a1),{'claim_version':version+1})):
                 self.assertEqual(self.client.post(path+'/'+endpoint,headers=auth,json=body).status_code,409)
             self.assertEqual(self.client.post(path+'/'+endpoint,json={'claim_version':version}).status_code,401)
-        self.assertEqual(self.client.post(path+'/terminated',headers=self.auth(token),json={'claim_version':version}).status_code,409)
+        self.assertEqual(self.client.post(path+'/terminated',headers=self.auth(token,self.worker_a1),json={'claim_version':version}).status_code,409)
         self.assertFalse(worker_dispatch.termination_confirmed(tenant_id=self.tenant_a,dispatch_id=identifier))
         worker_dispatch.cancel_dispatch(tenant_id=self.tenant_a,dispatch_id=identifier)
-        self.assertEqual(self.client.post(path+'/status',headers=self.auth(token),json={'claim_version':version}).json(),{'state':'cancelled'})
+        self.assertEqual(self.client.post(path+'/status',headers=self.auth(token,self.worker_a1),json={'claim_version':version}).json(),{'state':'cancelled'})
         for _ in range(2):
-            self.assertEqual(self.client.post(path+'/terminated',headers=self.auth(token),json={'claim_version':version}).status_code,204)
+            self.assertEqual(self.client.post(path+'/terminated',headers=self.auth(token,self.worker_a1),json={'claim_version':version}).status_code,204)
         self.assertTrue(worker_dispatch.termination_confirmed(tenant_id=self.tenant_a,dispatch_id=identifier))
-        self.assertEqual(self.client.post(path+'/complete',headers=self.auth(token),json={'claim_version':version,'content':'late'}).status_code,409)
+        self.assertEqual(self.client.post(path+'/complete',headers=self.auth(token,self.worker_a1),json={'claim_version':version,'content':'late'}).status_code,409)

@@ -2197,7 +2197,14 @@ class ControlApiConcurrentCompleteTests(unittest.TestCase):
 
         token = worker_identity.issue_worker_token(self.tenant, self.worker).token
         client = ApiClient()
-        headers = {"Authorization": f"Bearer {token}"}
+        # F08 transition: X-Worker-Id is a mandatory consistency
+        # assertion. Both concurrent requests carry the SAME bearer and the
+        # SAME matching worker id, so the [204, 409] outcome below stays
+        # decided purely by dispatch lease concurrency, not by identity.
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Worker-Id": str(self.worker),
+        }
 
         barrier = threading.Barrier(2)
 
