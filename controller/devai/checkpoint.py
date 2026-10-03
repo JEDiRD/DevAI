@@ -16,10 +16,18 @@ class LeaseLost(RuntimeError):
 
 @dataclass(frozen=True)
 class TaskLease:
+    """A held task lease carrying its caller's tenant authority.
+
+    ``tenant_id`` is the CALLER tenant that was proven to own the task at claim
+    time, not a value read back from a row. It is immutable (frozen) and is
+    never persisted or serialized, so adding it changes no storage format.
+    """
+
     task_id: UUID
     owner_id: UUID
     version: int
     expires_at: object
+    tenant_id: UUID
 
 
 @dataclass(frozen=True)
@@ -34,7 +42,17 @@ def claim_task(
     task_id: UUID,
     owner_id: UUID,
     lease_seconds: int = 60,
+    *,
+    tenant_id: UUID,
 ) -> TaskLease:
+    """Claim a task for ``tenant_id``.
+
+    The CALLER tenant is the authority. Ownership is proven inside the
+    authoritative UPDATE itself, atomically, by following the task to its job
+    (tasks.job_id -> jobs.id) and requiring jobs.tenant_id to equal the caller
+    tenant. There is no authorization precheck and no row-derived fallback: a
+    missing task and a foreign task are indistinguishable to the caller.
+    """
 
     if lease_seconds <= 0:
         raise ValueError("lease_seconds must be positive")
@@ -43,33 +61,37 @@ def claim_task(
         with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE tasks
+                UPDATE tasks t
                 SET lease_owner = %s,
-                    lease_version = lease_version + 1,
+                    lease_version = t.lease_version + 1,
                     lease_expires_at =
                         now() + (%s * interval '1 second'),
                     next_attempt_at = NULL,
                     status = 'running',
                     updated_at = now()
-                WHERE id = %s
-                  AND status IN ('pending', 'running')
+                FROM jobs j
+                WHERE j.id = t.job_id
+                  AND t.id = %s
+                  AND j.tenant_id = %s
+                  AND t.status IN ('pending', 'running')
                   AND (
-                      status <> 'pending'
-                      OR next_attempt_at IS NULL
-                      OR next_attempt_at <= now()
+                      t.status <> 'pending'
+                      OR t.next_attempt_at IS NULL
+                      OR t.next_attempt_at <= now()
                   )
                   AND (
-                      lease_expires_at IS NULL
-                      OR lease_expires_at <= now()
+                      t.lease_expires_at IS NULL
+                      OR t.lease_expires_at <= now()
                   )
                 RETURNING
-                    lease_version,
-                    lease_expires_at
+                    t.lease_version,
+                    t.lease_expires_at
                 """,
                 (
                     owner_id,
                     lease_seconds,
                     task_id,
+                    tenant_id,
                 ),
             )
 
@@ -85,31 +107,46 @@ def claim_task(
         owner_id=owner_id,
         version=row[0],
         expires_at=row[1],
+        tenant_id=tenant_id,
     )
 
 
 def renew_lease(
     lease: TaskLease,
     lease_seconds: int = 60,
+    *,
+    tenant_id: UUID,
 ) -> TaskLease:
+    """Renew ``lease`` for ``tenant_id``.
+
+    The CALLER tenant is the authority. Ownership is proven inside the
+    authoritative UPDATE, atomically, alongside the existing owner and
+    lease-version fence. Renewing under a foreign tenant leaves owner,
+    version, expiry and status untouched and raises the same LeaseLost a stale
+    lease would.
+    """
 
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE tasks
+                UPDATE tasks t
                 SET lease_expires_at =
                         now() + (%s * interval '1 second'),
                     updated_at = now()
-                WHERE id = %s
-                  AND lease_owner = %s
-                  AND lease_version = %s
-                  AND lease_expires_at > now()
-                RETURNING lease_expires_at
+                FROM jobs j
+                WHERE j.id = t.job_id
+                  AND t.id = %s
+                  AND j.tenant_id = %s
+                  AND t.lease_owner = %s
+                  AND t.lease_version = %s
+                  AND t.lease_expires_at > now()
+                RETURNING t.lease_expires_at
                 """,
                 (
                     lease_seconds,
                     lease.task_id,
+                    tenant_id,
                     lease.owner_id,
                     lease.version,
                 ),
@@ -125,6 +162,7 @@ def renew_lease(
         owner_id=lease.owner_id,
         version=lease.version,
         expires_at=row[0],
+        tenant_id=tenant_id,
     )
 
 

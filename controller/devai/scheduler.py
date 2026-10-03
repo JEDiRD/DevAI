@@ -186,9 +186,24 @@ def claim_next_ready_task(
     job_id: UUID,
     owner_id: UUID | None = None,
     lease_seconds: int = 60,
+    *,
+    tenant_id: UUID,
 ) -> TaskLease | None:
     """
-    Atomically select and claim one READY task.
+    Atomically select and claim one READY task for ``tenant_id``.
+
+    The CALLER tenant is the authority. Tenant scope is enforced INSIDE the
+    candidate CTE, before ORDER BY / FOR UPDATE / SKIP LOCKED / LIMIT, so a
+    foreign tenant's tasks are never locked, ordered into contention, or
+    selected. Scoping only the outer UPDATE would let the CTE lock foreign
+    rows before rejecting them.
+
+    The join to jobs is 1:1 on the tasks.job_id foreign key, so for a job that
+    genuinely belongs to the caller tenant the candidate set, its ordering and
+    its cardinality are unchanged. ``FOR UPDATE OF t`` keeps the lock target on
+    tasks alone: the joined jobs rows are read for authorization only and stay
+    outside the contention lock set, so same-job concurrent claims behave
+    exactly as before.
 
     Multiple workers may call this concurrently.
     PostgreSQL SKIP LOCKED ensures they do not receive
@@ -206,7 +221,10 @@ def claim_next_ready_task(
                 WITH candidate AS (
                     SELECT t.id
                     FROM tasks t
+                    JOIN jobs j
+                      ON j.id = t.job_id
                     WHERE t.job_id = %s
+                      AND j.tenant_id = %s
                       AND t.status = 'pending'
                       AND (
                           t.next_attempt_at IS NULL
@@ -223,7 +241,7 @@ def claim_next_ready_task(
                       )
 
                     ORDER BY t.external_id
-                    FOR UPDATE SKIP LOCKED
+                    FOR UPDATE OF t SKIP LOCKED
                     LIMIT 1
                 )
 
@@ -244,6 +262,7 @@ def claim_next_ready_task(
                 """,
                 (
                     job_id,
+                    tenant_id,
                     owner_id,
                     lease_seconds,
                 ),
@@ -259,4 +278,5 @@ def claim_next_ready_task(
         owner_id=owner_id,
         version=row[1],
         expires_at=row[2],
+        tenant_id=tenant_id,
     )

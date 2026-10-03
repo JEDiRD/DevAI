@@ -201,11 +201,21 @@ def worker_once(
     owner_id: UUID,
     reservation_by_cost_class: dict[str, Decimal],
     gateway: GatewayClient | None = None,
+    *,
+    tenant_id: UUID,
 ):
+    """Claim and run one task for ``tenant_id``.
+
+    The CALLER supplies tenant context; it is never derived from the job or
+    task row. ``worker_once`` remains unreachable from the live worker API, and
+    this adds no caller.
+    """
+
     lease = claim_next_ready_task(
         job_id=job_id,
         owner_id=owner_id,
         lease_seconds=60,
+        tenant_id=tenant_id,
     )
 
     if lease is None:

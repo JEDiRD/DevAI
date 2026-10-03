@@ -1832,7 +1832,8 @@ class SchedulerConcurrentClaimTests(CommittedConcurrentFixtureMixin, unittest.Te
 
         def claim():
             barrier.wait(timeout=5)
-            return scheduler.claim_next_ready_task(job, uuid4())
+            return scheduler.claim_next_ready_task(
+            job, uuid4(), tenant_id=self.tenant)
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             f1 = pool.submit(claim)

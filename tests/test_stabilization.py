@@ -122,7 +122,8 @@ class StabilizationTests(unittest.TestCase):
                 (task_id, job_id),
             )
 
-        lease = scheduler.claim_next_ready_task(job_id, uuid4())
+        lease = scheduler.claim_next_ready_task(
+            job_id, uuid4(), tenant_id=self.tenant_id)
         self.assertIsNotNone(lease)
         self.assertIsNone(runtime.run_claimed_task(lease, {"free": Decimal(0)}))
 
@@ -150,7 +151,8 @@ class StabilizationTests(unittest.TestCase):
         with self.assertRaises(checkpoint.LeaseLost):
             checkpoint.defer_task_for_route(lease)
         self.assertEqual(scheduler.list_ready_tasks(job_id), [])
-        self.assertIsNone(scheduler.claim_next_ready_task(job_id, uuid4()))
+        self.assertIsNone(scheduler.claim_next_ready_task(
+            job_id, uuid4(), tenant_id=self.tenant_id))
 
         with self.connection.cursor() as cur:
             cur.execute(
@@ -161,7 +163,8 @@ class StabilizationTests(unittest.TestCase):
                 (task_id,),
             )
         self.assertEqual(len(scheduler.list_ready_tasks(job_id)), 1)
-        self.assertIsNotNone(scheduler.claim_next_ready_task(job_id, uuid4()))
+        self.assertIsNotNone(scheduler.claim_next_ready_task(
+            job_id, uuid4(), tenant_id=self.tenant_id))
 
     def test_upsert_route_requires_and_updates_connection(self):
         first, second = self.connection_id(), self.connection_id()

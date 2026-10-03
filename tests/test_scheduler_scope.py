@@ -364,22 +364,41 @@ class SchedulerSignatureTests(unittest.TestCase):
         self.assertNotIn("TenantPrincipal", source)
 
     def test_group_c_claim_is_outside_b2(self):
-        """claim_next_ready_task keeps its Group C signature and fencing.
+        """claim_next_ready_task stays outside B2, with Group C now applied.
 
-        This is an untouched-code regression check, not an authorization
-        proof, so it reads the function source directly.
+        This began life as a phase handoff sentinel asserting that Group C
+        claim hardening had NOT yet happened (no tenant_id, bare FOR UPDATE
+        SKIP LOCKED, no TENANT_ID). Group C1 implements that deferred
+        contract, so the sentinel now records the transition instead: the
+        claim is still not a B2-authorized operation, but its signature and
+        fencing boundary have been hardened by Group C.
+
+        This stays a narrow structural marker. The authoritative proof that
+        tenant scope sits inside the candidate CTE, precedes
+        ORDER BY/FOR UPDATE/LIMIT, binds correctly and resists boolean
+        neutralization is owned by tests/test_group_c_claim_scope.py.
         """
         params = inspect.signature(
             scheduler.claim_next_ready_task
         ).parameters
         self.assertEqual(
-            list(params), ["job_id", "owner_id", "lease_seconds"]
+            list(params), ["job_id", "owner_id", "lease_seconds", "tenant_id"]
         )
-        self.assertNotIn("tenant_id", params)
+
+        tenant = params["tenant_id"]
+        self.assertIs(tenant.default, inspect.Parameter.empty,
+                      "tenant_id must be mandatory")
+        self.assertEqual(tenant.kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertNotIn("None", str(tenant.annotation))
+
         body = inspect.getsource(scheduler.claim_next_ready_task).upper()
-        self.assertIn("FOR UPDATE SKIP LOCKED", body)
+        # Task-only locking: the jobs join is for authorization, not contention.
+        self.assertIn("FOR UPDATE OF T SKIP LOCKED", body)
+        self.assertNotIn("FOR UPDATE OF T, J SKIP LOCKED", body)
         self.assertIn("LEASE_VERSION = T.LEASE_VERSION + 1", body)
-        self.assertNotIn("TENANT_ID", body)
+        # Group-C tenant scope is present in the claim candidate path.
+        self.assertIn("JOIN JOBS J", body)
+        self.assertIn("J.TENANT_ID = %S", body)
 
     def test_list_ready_tasks_signature_unchanged(self):
         params = inspect.signature(scheduler.list_ready_tasks).parameters
