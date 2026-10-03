@@ -9,13 +9,28 @@ Deliberately NOT in C1 (owned by C2): ``save_checkpoint``,
 ``load_latest_checkpoint``, ``release_task``, ``defer_task_for_route``,
 ``load_runtime_task`` and ``run_claimed_task``. No migration is introduced; the
 ownership join already exists via tasks.job_id.
+
+DB tests exercise production through its REAL connection factories. Fixtures
+are committed before production runs, so ``connect()`` opens genuine
+independent connections; nothing is patched onto a shared uncommitted
+connection. After-state is read from a further independent connection, and
+every foreign-denial test first proves its target resource exists and belongs
+to the foreign tenant, so a denial cannot be an invisibility artefact.
+
+This file also carries an EXECUTED structural mutation matrix. It mutates real
+production source, re-runs the same invariant checker used against the
+authoritative source, and classifies each mutant as ASSERTION_CAUGHT,
+HARNESS_ERROR or SURVIVED. That matrix is distinct from the structural
+negative controls below; the two are reported separately and never conflated.
 """
 
 import ast
+import dataclasses
 import inspect
 import os
 import re
 import unittest
+from datetime import datetime, timezone
 from uuid import uuid4
 
 import psycopg
@@ -26,6 +41,10 @@ from test_tenancy_invariants import canonical, _tokenize
 _DB_URL = os.environ.get("DEVAI_TEST_DATABASE_URL")
 
 DEVAI_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CK_PATH = os.path.join(DEVAI_ROOT, "controller", "devai", "checkpoint.py")
+SC_PATH = os.path.join(DEVAI_ROOT, "controller", "devai", "scheduler.py")
+
+EXPECTED_DENIAL_MESSAGE = "Task <task_id> is not claimable"
 
 
 def _code(sql):
@@ -62,9 +81,8 @@ def _neutralization_defects(sql):
     return defects
 
 
-def _exec_params(func):
+def _exec_params(tree):
     """The parameter tuple passed to cur.execute, in binding order."""
-    tree = ast.parse(inspect.cleandoc(_body(func)))
     for node in ast.walk(tree):
         if (isinstance(node, ast.Call)
                 and getattr(node.func, "attr", None) == "execute"):
@@ -85,15 +103,14 @@ def _exec_params(func):
 _PLACEHOLDER = re.compile(r"([A-Za-z_][A-Za-z0-9_.]*)\s*=\s*\Z")
 
 
-def _placeholder_order(func):
+def _placeholder_order(tree):
     """What each %s binds to, in SQL order.
 
     Returns the column expression each placeholder is compared against, or
-    "(expr)" when the placeholder is a bare value such as an interval
-    multiplier. Binding by role -- not by placeholder count -- is what lets a
-    swapped job/tenant binding be detected.
+    "(expr)" for a bare value such as an interval multiplier. Binding by role
+    -- not by placeholder count -- is what lets a swapped job/tenant binding be
+    detected.
     """
-    tree = ast.parse(inspect.cleandoc(_body(func)))
     for node in ast.walk(tree):
         if (isinstance(node, ast.Call)
                 and getattr(node.func, "attr", None) == "execute"):
@@ -101,16 +118,140 @@ def _placeholder_order(func):
             if not (isinstance(sql, ast.Constant)
                     and isinstance(sql.value, str)):
                 continue
-            out = []
-            rest = sql.value
+            out, rest = [], sql.value
             while "%s" in rest:
                 idx = rest.index("%s")
-                prefix = rest[:idx]
-                match = _PLACEHOLDER.search(prefix)
+                match = _PLACEHOLDER.search(rest[:idx])
                 out.append(match.group(1) if match else "(expr)")
                 rest = rest[idx + 2:]
             return out
     return None
+
+
+def _find_func(source, name):
+    """Parse `source` and return the FunctionDef called `name`."""
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    return None
+
+
+def _mutate_in_function(source, func_name, old, new):
+    """Apply `old` -> `new` ONLY inside `func_name`'s own source slice.
+
+    Plain str.replace() is unsafe here: claim_task and renew_lease contain the
+    byte-identical line 'AND j.tenant_id = %s', so a global first-match
+    replacement would silently mutate the wrong function and the checker would
+    then report the untouched one as conforming.
+    """
+    func = _find_func(source, func_name)
+    if func is None:
+        raise AssertionError(f"{func_name} not found in source")
+    lines = source.splitlines(keepends=True)
+    start, end = func.lineno - 1, func.end_lineno
+    segment = "".join(lines[start:end])
+    if old not in segment:
+        raise AssertionError(f"mutant does not apply in {func_name}: {old!r}")
+    mutated = segment.replace(old, new, 1)
+    return "".join(lines[:start]) + mutated + "".join(lines[end:])
+
+
+def _sql_of(func_def):
+    return "\n".join(_literal_strings(func_def))
+
+
+# ===========================================================================
+# SHARED INVARIANT CHECKER
+#
+# This is the single authority used both against the real production source
+# and against every mutant. The authoritative source must produce zero
+# violations; a mutant that also produces zero is SURVIVED.
+# ===========================================================================
+
+
+def _c1_invariants(source, func_name):
+    """Invariant violations for `func_name` in `source`.
+
+    Returns a list of short labels; an empty list means the variant satisfies
+    every C1 claim/lease invariant.
+    """
+    func = _find_func(source, func_name)
+    if func is None:
+        return [f"{func_name}:absent"]
+
+    sql = _sql_of(func)
+    params = _exec_params(func)
+    order = _placeholder_order(func)
+    bad = []
+
+    is_claim_next = func_name == "claim_next_ready_task"
+
+    # -- ownership join --
+    if is_claim_next:
+        if "JOIN JOBS J" not in sql:
+            bad.append("no_jobs_join")
+        if "J . ID = T . JOB_ID" not in sql:
+            bad.append("join_not_on_job_id")
+    else:
+        if "FROM JOBS J" not in sql:
+            bad.append("no_jobs_from")
+        if "J . ID = T . JOB_ID" not in sql:
+            bad.append("from_not_on_job_id")
+
+    # -- tenant predicate present --
+    if "J . TENANT_ID = %S" not in sql:
+        bad.append("tenant_predicate_missing")
+
+    # -- no boolean neutralization --
+    if _neutralization_defects(sql):
+        bad.append("boolean_neutralized")
+
+    # -- tenant supplied and bound by role --
+    if not params or "tenant_id" not in params:
+        bad.append("tenant_not_supplied")
+    elif order and "j.tenant_id" not in order:
+        bad.append("tenant_not_bound_to_tenant_placeholder")
+
+    if is_claim_next:
+        # -- tenant scope inside the candidate CTE, before contention --
+        try:
+            cte = sql.index("WITH CANDIDATE AS")
+            tenant = sql.index("J . TENANT_ID = %S")
+        except ValueError:
+            bad.append("cte_or_tenant_missing")
+        else:
+            if tenant < cte:
+                bad.append("tenant_outside_cte")
+            for marker, label in (("ORDER BY T . EXTERNAL_ID", "after_order"),
+                                  ("LIMIT 1", "after_limit")):
+                if marker in sql and tenant > sql.index(marker):
+                    bad.append(f"tenant_{label}")
+            # -- task-only lock target --
+            if "FOR UPDATE OF T SKIP LOCKED" not in sql:
+                bad.append("lock_target_not_task_only")
+            if ("FOR UPDATE SKIP LOCKED" in sql
+                    or "FOR UPDATE OF T, J" in sql
+                    or "FOR UPDATE J" in sql):
+                bad.append("lock_target_includes_joined_rows")
+            # -- job and tenant are distinct bindings --
+            if order and order[:2] != ["t.job_id", "j.tenant_id"]:
+                bad.append("job_tenant_binding_not_distinct")
+    else:
+        # -- the existing lease fence must survive --
+        if func_name == "renew_lease":
+            # renew_lease PRESERVES the version; it must not increment it.
+            for needed in ("T . LEASE_OWNER = %S",
+                           "T . LEASE_VERSION = %S",
+                           "T . LEASE_EXPIRES_AT > NOW ( )"):
+                if needed not in sql:
+                    bad.append(f"renew_fence_missing:{needed}")
+            if "LEASE_VERSION = T . LEASE_VERSION + 1" in sql:
+                bad.append("renew_lease_incorrectly_bumps_version")
+        elif "LEASE_VERSION = T . LEASE_VERSION + 1" not in sql:
+            bad.append("lease_version_fence_lost")
+
+    return bad
 
 
 # ===========================================================================
@@ -173,12 +314,16 @@ class ClaimSignatureTests(unittest.TestCase):
 
 
 # ===========================================================================
-# SECTION 2: AUTHORITATIVE STATEMENT SCOPE (static)
+# SECTION 2: STRUCTURAL NEGATIVE CONTROLS (static)
 # ===========================================================================
 
 
 class ClaimStatementScopeTests(unittest.TestCase):
-    """Tenant ownership is proven inside the authoritative statement."""
+    """Structural controls pinning the C1 claim/lease shape.
+
+    These are direct assertions against the authoritative source. The executed
+    mutation matrix in C1MutationMatrixTests is reported separately.
+    """
 
     def _claim_sql(self, func):
         tree = ast.parse(inspect.cleandoc(_body(func)))
@@ -192,10 +337,9 @@ class ClaimStatementScopeTests(unittest.TestCase):
 
     def test_claim_task_ownership_predicate_is_in_the_update(self):
         sql = self._claim_sql(checkpoint.claim_task)
-        # The authoritative statement is the UPDATE; ownership must be a
-        # predicate of that same statement, not a preceding probe.
         self.assertIn("UPDATE TASKS T", sql)
-        self.assertLess(sql.index("UPDATE TASKS T"), sql.index("J . TENANT_ID = %S"))
+        self.assertLess(sql.index("UPDATE TASKS T"),
+                        sql.index("J . TENANT_ID = %S"))
 
     def test_renew_lease_proves_ownership_through_jobs(self):
         sql = self._claim_sql(checkpoint.renew_lease)
@@ -223,12 +367,10 @@ class ClaimStatementScopeTests(unittest.TestCase):
         lock = sql.index("FOR UPDATE OF T SKIP LOCKED")
         limit = sql.index("LIMIT 1")
         self.assertLess(cte, tenant, "tenant scope must follow the CTE head")
-        self.assertLess(tenant, order,
-                        "tenant scope must precede ORDER BY")
+        self.assertLess(tenant, order, "tenant scope must precede ORDER BY")
         self.assertLess(tenant, lock,
                         "tenant scope must precede FOR UPDATE/SKIP LOCKED")
-        self.assertLess(tenant, limit,
-                        "tenant scope must precede LIMIT")
+        self.assertLess(tenant, limit, "tenant scope must precede LIMIT")
 
     def test_claim_next_lock_target_is_task_only(self):
         """The joined jobs rows must stay outside the contention lock set."""
@@ -279,8 +421,6 @@ class ClaimStatementScopeTests(unittest.TestCase):
             self.assertNotIn("TENANT_ID", ret,
                              f"{func.__name__} RETURNING must not adopt a row tenant")
 
-    # ---- neutralization ----
-
     def test_tenant_predicate_is_never_boolean_neutralized(self):
         """OR TRUE / OR 1=1 / OR 1 = 1 would erase the tenant scope."""
         for func in (checkpoint.claim_task, checkpoint.renew_lease,
@@ -303,31 +443,35 @@ class ClaimStatementScopeTests(unittest.TestCase):
             self.assertNotEqual(_neutralization_defects(mutated), [],
                                 f"bypass {bypass} not rejected")
 
-    # ---- binding order ----
-
     def test_claim_task_binds_tenant_to_the_tenant_placeholder(self):
         """job/task, duration, owner and tenant must bind by role."""
-        params = _exec_params(checkpoint.claim_task)
+        params = _exec_params(ast.parse(
+            inspect.cleandoc(_body(checkpoint.claim_task))))
         self.assertEqual(params, ["owner_id", "lease_seconds",
                                   "task_id", "tenant_id"])
-        order = _placeholder_order(checkpoint.claim_task)
+        order = _placeholder_order(ast.parse(
+            inspect.cleandoc(_body(checkpoint.claim_task))))
         self.assertEqual(order, ["lease_owner", "(expr)", "t.id",
                                  "j.tenant_id"])
 
     def test_renew_lease_binds_tenant_to_the_tenant_placeholder(self):
-        params = _exec_params(checkpoint.renew_lease)
+        params = _exec_params(ast.parse(
+            inspect.cleandoc(_body(checkpoint.renew_lease))))
         self.assertEqual(params, ["lease_seconds", "task_id",
                                   "tenant_id", "owner_id", "version"])
-        order = _placeholder_order(checkpoint.renew_lease)
+        order = _placeholder_order(ast.parse(
+            inspect.cleandoc(_body(checkpoint.renew_lease))))
         self.assertEqual(order, ["(expr)", "t.id", "j.tenant_id",
                                  "t.lease_owner", "t.lease_version"])
 
     def test_claim_next_binds_job_then_tenant_distinctly(self):
         """job_id and tenant_id must be separate placeholders, in that order."""
-        params = _exec_params(scheduler.claim_next_ready_task)
+        params = _exec_params(ast.parse(
+            inspect.cleandoc(_body(scheduler.claim_next_ready_task))))
         self.assertEqual(params, ["job_id", "tenant_id", "owner_id",
                                   "lease_seconds"])
-        order = _placeholder_order(scheduler.claim_next_ready_task)
+        order = _placeholder_order(ast.parse(
+            inspect.cleandoc(_body(scheduler.claim_next_ready_task))))
         self.assertEqual(order, ["t.job_id", "j.tenant_id",
                                  "lease_owner", "(expr)"])
         self.assertNotEqual(order[0], order[1],
@@ -348,7 +492,184 @@ class ClaimStatementScopeTests(unittest.TestCase):
 
 
 # ===========================================================================
-# SECTION 3: LIVE REACHABILITY SENTINEL (static)
+# SECTION 3: EXECUTED MUTATION MATRIX
+# ===========================================================================
+
+CK_CLAIM_TASK_TENANT = "                  AND j.tenant_id = %s\n"
+CK_RENEW_TENANT = "                  AND j.tenant_id = %s\n"
+SC_TENANT = "                      AND j.tenant_id = %s\n"
+
+# (id, label, source file, function under test, old, new)
+MUTATION_MATRIX = [
+    ("M01", "claim_task tenant predicate removed",
+     CK_PATH, "claim_task", CK_CLAIM_TASK_TENANT, ""),
+    ("M02", "claim_task tenant binding wrong",
+     CK_PATH, "claim_task", CK_CLAIM_TASK_TENANT,
+     "                  AND j.id = %s\n"),
+    ("M03", "claim_task boolean neutralization OR TRUE",
+     CK_PATH, "claim_task", CK_CLAIM_TASK_TENANT,
+     "                  AND j.tenant_id = %s OR TRUE\n"),
+    ("M04", "claim_task tenant dropped from params",
+     CK_PATH, "claim_task",
+     "                    task_id,\n                    tenant_id,\n",
+     "                    task_id,\n"),
+    ("M05", "renew_lease tenant predicate removed",
+     CK_PATH, "renew_lease", CK_RENEW_TENANT, ""),
+    ("M06", "renew_lease tenant binding wrong",
+     CK_PATH, "renew_lease", CK_RENEW_TENANT,
+     "                  AND j.id = %s\n"),
+    ("M07", "renew_lease boolean neutralization OR TRUE",
+     CK_PATH, "renew_lease", CK_RENEW_TENANT,
+     "                  AND j.tenant_id = %s OR TRUE\n"),
+    ("M08", "claim_next tenant predicate removed",
+     SC_PATH, "claim_next_ready_task", SC_TENANT, ""),
+    ("M09", "claim_next tenant binding wrong",
+     SC_PATH, "claim_next_ready_task", SC_TENANT,
+     "                      AND j.id = %s\n"),
+    ("M10", "claim_next job/tenant swapped",
+     SC_PATH, "claim_next_ready_task", SC_TENANT,
+     "                      AND t.id = %s\n"),
+    ("M11", "claim_next boolean neutralization OR TRUE",
+     SC_PATH, "claim_next_ready_task", SC_TENANT,
+     "                      AND j.tenant_id = %s OR TRUE\n"),
+    ("M12", "claim_next boolean neutralization OR 1=1",
+     SC_PATH, "claim_next_ready_task", SC_TENANT,
+     "                      AND j.tenant_id = %s OR 1=1\n"),
+    ("M13", "claim_next tenant scope moved to outer UPDATE only",
+     SC_PATH, "claim_next_ready_task",
+     SC_TENANT + "                      AND t.status = 'pending'\n",
+     "                      AND t.status = 'pending'\n"),
+    ("M14", "claim_next task-only lock removed (joined rows locked)",
+     SC_PATH, "claim_next_ready_task",
+     "FOR UPDATE OF t SKIP LOCKED", "FOR UPDATE SKIP LOCKED"),
+    ("M15", "claim_next authorization join dropped",
+     SC_PATH, "claim_next_ready_task",
+     "                    JOIN jobs j\n                      ON j.id = t.job_id\n",
+     ""),
+]
+
+
+class C1MutationMatrixTests(unittest.TestCase):
+    """Executed mutation matrix over real production source.
+
+    Each mutant is applied to the real source text, must remain syntactically
+    valid Python, and is then evaluated by the SAME invariant checker used
+    against the authoritative source. Verdicts:
+
+    * ASSERTION_CAUGHT -- invariants rejected it (the desired outcome)
+    * HARNESS_ERROR    -- unparseable/unloadable; never counted as a catch
+    * SURVIVED         -- invariants accepted it; a real evidence gap
+    """
+
+    def _source(self, path):
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+    def _verdict(self, mutant):
+        _, _, path, func_name, old, new = mutant
+        source = self._source(path)
+        mutated = _mutate_in_function(source, func_name, old, new)
+        try:
+            ast.parse(mutated)
+        except SyntaxError:
+            return "HARNESS_ERROR", ["SyntaxError"]
+        try:
+            return "ASSERTION_CAUGHT", _c1_invariants(mutated, func_name)
+        except Exception as exc:                      # noqa: BLE001
+            return "HARNESS_ERROR", [f"{type(exc).__name__}:{exc}"]
+
+    def test_each_mutant_lands_inside_its_target_function(self):
+        """Guard against cross-function mutation, which silently survives."""
+        for mutant in MUTATION_MATRIX:
+            _, label, path, func_name, old, new = mutant
+            source = self._source(path)
+            mutated = _mutate_in_function(source, func_name, old, new)
+            original_func = ast.get_source_segment(source, _find_func(
+                source, func_name))
+            mutated_func = ast.get_source_segment(mutated, _find_func(
+                mutated, func_name))
+            self.assertNotEqual(
+                original_func, mutated_func,
+                f"{label}: mutation did not change {func_name}")
+            for other in ("claim_task", "renew_lease", "claim_next_ready_task"):
+                if other == func_name:
+                    continue
+                a = ast.get_source_segment(source, _find_func(source, other))
+                b = ast.get_source_segment(mutated, _find_func(mutated, other))
+                self.assertEqual(a, b, f"{label}: {other} must be untouched")
+
+    def test_authoritative_source_has_zero_invariant_violations(self):
+        """Baseline: the real production source must fully conform."""
+        for path, func_name in ((CK_PATH, "claim_task"),
+                                (CK_PATH, "renew_lease"),
+                                (SC_PATH, "claim_next_ready_task")):
+            self.assertEqual(_c1_invariants(self._source(path), func_name), [],
+                             f"{func_name} baseline violations")
+
+    def test_matrix_is_exactly_fifteen_mutants(self):
+        """The matrix size is fixed, not tuned to the outcome."""
+        self.assertEqual(len(MUTATION_MATRIX), 15)
+        ids = [m[0] for m in MUTATION_MATRIX]
+        self.assertEqual(len(set(ids)), 15, "mutant ids must be unique")
+
+    def _run_one(self, mutant):
+        verdict, violations = self._verdict(mutant)
+        self.assertNotEqual(verdict, "HARNESS_ERROR",
+                            f"{mutant[0]} {mutant[1]} -> harness error: {violations}")
+        self.assertNotEqual(
+            verdict, "SURVIVED",
+            f"{mutant[0]} {mutant[1]} SURVIVED: invariants found no violation")
+        self.assertTrue(violations,
+                        f"{mutant[0]} {mutant[1]} produced no violation detail")
+
+    def test_M01_claim_task_tenant_predicate_removed(self):
+        self._run_one(MUTATION_MATRIX[0])
+
+    def test_M02_claim_task_tenant_binding_wrong(self):
+        self._run_one(MUTATION_MATRIX[1])
+
+    def test_M03_claim_task_boolean_neutralization(self):
+        self._run_one(MUTATION_MATRIX[2])
+
+    def test_M04_claim_task_tenant_dropped_from_params(self):
+        self._run_one(MUTATION_MATRIX[3])
+
+    def test_M05_renew_lease_tenant_predicate_removed(self):
+        self._run_one(MUTATION_MATRIX[4])
+
+    def test_M06_renew_lease_tenant_binding_wrong(self):
+        self._run_one(MUTATION_MATRIX[5])
+
+    def test_M07_renew_lease_boolean_neutralization(self):
+        self._run_one(MUTATION_MATRIX[6])
+
+    def test_M08_claim_next_tenant_predicate_removed(self):
+        self._run_one(MUTATION_MATRIX[7])
+
+    def test_M09_claim_next_tenant_binding_wrong(self):
+        self._run_one(MUTATION_MATRIX[8])
+
+    def test_M10_claim_next_job_tenant_swapped(self):
+        self._run_one(MUTATION_MATRIX[9])
+
+    def test_M11_claim_next_boolean_neutralization_or_true(self):
+        self._run_one(MUTATION_MATRIX[10])
+
+    def test_M12_claim_next_boolean_neutralization_or_1eq1(self):
+        self._run_one(MUTATION_MATRIX[11])
+
+    def test_M13_claim_next_tenant_scope_moved_to_outer_update(self):
+        self._run_one(MUTATION_MATRIX[12])
+
+    def test_M14_claim_next_task_only_lock_removed(self):
+        self._run_one(MUTATION_MATRIX[13])
+
+    def test_M15_claim_next_authorization_join_dropped(self):
+        self._run_one(MUTATION_MATRIX[14])
+
+
+# ===========================================================================
+# SECTION 4: LIVE REACHABILITY SENTINEL (static)
 # ===========================================================================
 
 
@@ -385,12 +706,7 @@ def _live_closure(entry):
 
 
 class LiveReachabilitySentinelTests(unittest.TestCase):
-    """Group C must not silently activate the dormant execution cluster.
-
-    The accepted live closure is the worker dispatch subsystem. If a future
-    change wires runtime/scheduler/checkpoint/executor into the worker API,
-    this fails instead of the change passing unnoticed.
-    """
+    """Group C must not silently activate the dormant execution cluster."""
 
     ACCEPTED_LIVE_CLOSURE = {
         "db", "worker_api", "worker_dispatch",
@@ -420,7 +736,7 @@ class LiveReachabilitySentinelTests(unittest.TestCase):
     def test_live_worker_subsystem_frozen(self):
         """C1 may not touch the live dispatch subsystem."""
         import subprocess
-        base = "31716362a7f07807c667ed8975192a770259adac"
+        base = "ab21619fccd83af2f18576133934e7f696cbf3af"
         for name in ("worker_api", "worker_dispatch", "worker_identity",
                      "worker_registry"):
             rel = f"controller/devai/{name}.py"
@@ -449,7 +765,7 @@ class LiveReachabilitySentinelTests(unittest.TestCase):
 
 
 # ===========================================================================
-# SECTION 4: C2 BOUNDARY NOT CROSSED (static)
+# SECTION 5: C2 BOUNDARY NOT CROSSED (static)
 # ===========================================================================
 
 
@@ -492,171 +808,326 @@ class C2BoundaryTests(unittest.TestCase):
 
 
 # ===========================================================================
-# SECTION 5: DB SECURITY (requires PostgreSQL)
+# SECTION 6: DB SECURITY (requires PostgreSQL)
 # ===========================================================================
+
+
+def _canonical_message(message, known_ids):
+    """Replace only the specific caller-supplied task identifiers.
+
+    Deliberately exact-match on str(known_id): no regex, no blanket UUID
+    normalization. Any other textual difference between two denials would
+    survive and fail the comparison.
+    """
+    out = message
+    for known in known_ids:
+        out = out.replace(str(known), "<task_id>")
+    return out
 
 
 @unittest.skipUnless(_DB_URL, "PostgreSQL integration URL required")
 class ClaimScopeDatabaseTests(unittest.TestCase):
-    """Cross-tenant claim/lease denial against a real database."""
+    """Cross-tenant claim/lease denial against a real database.
+
+    Fixtures are COMMITTED, then production runs through its own real
+    connections. Nothing is patched onto this test's connection, so each
+    production call exercises genuine transaction and connection boundaries.
+    After-state and pre-existence proofs are read from independent
+    connections, so neither can be satisfied by this test's session state.
+    """
 
     def setUp(self):
-        self.conn = psycopg.connect(_DB_URL)
-        self.addCleanup(self.conn.close)
-        self.addCleanup(self.conn.rollback)
+        self.setup = psycopg.connect(_DB_URL)
+        self.addCleanup(self.setup.close)
         self.tenant = uuid4()
         self.foreign = uuid4()
-        with self.conn.cursor() as cur:
+        self._owned_tasks, self._owned_jobs = [], []
+        with self.setup.cursor() as cur:
             for tenant in (self.tenant, self.foreign):
                 cur.execute(
                     "INSERT INTO tenants(id, slug, name) VALUES (%s,%s,%s)",
-                    (tenant, str(tenant), "c1 claim scope"))
+                    (tenant, f"c1-{tenant}", "c1 claim scope"))
+        self.setup.commit()
+        self.addCleanup(self._purge)
 
-    def sql(self, statement, params=()):
-        with self.conn.cursor() as cur:
-            cur.execute(statement, params)
-            return cur.fetchall() if cur.description else None
+    # ---- fixture ownership and cleanup ----
+
+    def _purge(self):
+        """Remove exactly this test's rows, using only guaranteed cascades."""
+        conn = psycopg.connect(_DB_URL)
+        try:
+            with conn.cursor() as cur:
+                if self._owned_tasks:
+                    cur.execute(
+                        "DELETE FROM tasks WHERE id = ANY(%s)",
+                        (self._owned_tasks,))
+                if self._owned_jobs:
+                    cur.execute(
+                        "DELETE FROM jobs WHERE id = ANY(%s)",
+                        (self._owned_jobs,))
+                cur.execute("DELETE FROM tenants WHERE id = ANY(%s)",
+                            ([self.tenant, self.foreign],))
+            conn.commit()
+        finally:
+            conn.close()
 
     def job(self, tenant=None):
+        """Create and COMMIT a job owned by `tenant`."""
         job = uuid4()
-        self.sql("INSERT INTO jobs(id, tenant_id, objective, status)"
-                 " VALUES (%s,%s,'c1','running')",
-                 (job, tenant or self.tenant))
+        self._owned_jobs.append(job)
+        with self.setup.cursor() as cur:
+            cur.execute("INSERT INTO jobs(id, tenant_id, objective, status)"
+                        " VALUES (%s,%s,'c1','running')",
+                        (job, tenant or self.tenant))
+        self.setup.commit()
         return job
 
-    def task(self, job, external="ext"):
+    def task(self, job, status="pending"):
+        """Create and COMMIT a pending task attached to `job`."""
         task = uuid4()
-        self.sql("INSERT INTO tasks(id, job_id, external_id, title,"
-                 " description, capability, risk, status)"
-                 " VALUES (%s,%s,%s,'t','d','basic','low','pending')",
-                 (task, job, f"{external}-{task}"))
+        self._owned_tasks.append(task)
+        with self.setup.cursor() as cur:
+            cur.execute(
+                "INSERT INTO tasks(id, job_id, external_id, title,"
+                " description, capability, risk, status)"
+                " VALUES (%s,%s,%s,'t','d','basic','low',%s)",
+                (task, job, f"ext-{task}", status))
+        self.setup.commit()
         return task
 
+    # ---- independent authoritative reads ----
+
+    def _fresh(self, sql, params=()):
+        """Read from a brand-new connection with no test session state."""
+        conn = psycopg.connect(_DB_URL)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                return cur.fetchall() if cur.description else None
+        finally:
+            conn.close()
+
     def task_state(self, task):
-        return self.sql(
+        """status, lease_owner, lease_version, lease_expires_at, checkpoint_seq."""
+        return self._fresh(
             "SELECT status, lease_owner, lease_version, lease_expires_at,"
             " checkpoint_seq FROM tasks WHERE id=%s", (task,))[0]
+
+    def prove_task_visible_and_owned_by(self, task, expected_tenant):
+        """R5/R7: the target must really exist and really belong elsewhere.
+
+        Without this, a 'foreign' denial could be an invisibility artefact
+        and the test would prove nothing.
+        """
+        rows = self._fresh(
+            "SELECT t.id, j.tenant_id, t.status FROM tasks t"
+            " JOIN jobs j ON j.id = t.job_id WHERE t.id = %s", (task,))
+        self.assertEqual(len(rows), 1,
+                         "target task must exist and be independently visible")
+        self.assertEqual(rows[0][1], expected_tenant,
+                         "target task must belong to the expected foreign tenant")
+        return rows[0]
+
+    def prove_job_visible_and_owned_by(self, job, expected_tenant):
+        rows = self._fresh(
+            "SELECT id, tenant_id FROM jobs WHERE id = %s", (job,))
+        self.assertEqual(len(rows), 1,
+                         "target job must exist and be independently visible")
+        self.assertEqual(rows[0][1], expected_tenant)
+        return rows[0]
+
+    def prove_task_eligible(self, task):
+        """The foreign task must be an eligible candidate, not merely present."""
+        row = self._fresh(
+            "SELECT status, next_attempt_at, lease_expires_at"
+            " FROM tasks WHERE id=%s", (task,))[0]
+        self.assertEqual(row[0], "pending", "candidate must be READY")
+        self.assertTrue(row[1] is None or row[1] <= datetime.now(timezone.utc),
+                        "candidate must not be deferred into the future")
+        self.assertTrue(row[2] is None, "candidate must hold no live lease")
+        return row
 
     # ---- claim_task ----
 
     def test_claim_task_same_tenant_succeeds(self):
-        job = self.job()
+        """R4: production really runs, sees the fixture, and claims."""
+        job = self.job(self.tenant)
         task = self.task(job)
         lease = checkpoint.claim_task(task, uuid4(), tenant_id=self.tenant)
+        self.assertIsNotNone(lease)
         self.assertEqual(lease.tenant_id, self.tenant)
         self.assertEqual(lease.task_id, task)
-        status, owner, version, _, _ = self.task_state(task)
-        self.assertEqual(status, "running")
-        self.assertEqual(owner, lease.owner_id)
-        self.assertEqual(version, 1)
+        state = self.task_state(task)
+        self.assertEqual(state[0], "running", "status must be claimed")
+        self.assertEqual(state[1], lease.owner_id, "lease owner must be set")
+        self.assertEqual(state[2], 1, "lease_version must increment once")
+        self.assertIsNotNone(state[3], "lease_expires_at must be set")
 
     def test_claim_task_foreign_tenant_denied_and_task_unchanged(self):
-        job = self.job()
+        """R5/R3: non-vacuous denial with fresh after-state."""
+        job = self.job(self.tenant)
         task = self.task(job)
+        self.prove_task_visible_and_owned_by(task, self.tenant)
         before = self.task_state(task)
         with self.assertRaises(checkpoint.TaskAlreadyClaimed):
             checkpoint.claim_task(task, uuid4(), tenant_id=self.foreign)
         self.assertEqual(self.task_state(task), before)
 
     def test_claim_task_missing_and_foreign_are_uniform(self):
-        job = self.job()
+        """R6: canonicalize only the specific supplied id, then exact-compare."""
+        job = self.job(self.tenant)
         task = self.task(job)
-        messages = []
-        for target, tenant in ((uuid4(), self.tenant), (task, self.foreign)):
+        self.prove_task_visible_and_owned_by(task, self.tenant)
+        missing = uuid4()
+        messages, classes = [], set()
+        for target, tenant in ((missing, self.tenant), (task, self.foreign)):
             with self.assertRaises(checkpoint.TaskAlreadyClaimed) as ctx:
                 checkpoint.claim_task(target, uuid4(), tenant_id=tenant)
-            messages.append(str(ctx.exception))
-        self.assertEqual(len(set(messages)), 1,
-                         f"missing/foreign must not form an oracle: {messages}")
+            messages.append(
+                _canonical_message(str(ctx.exception), [target]))
+            classes.add(type(ctx.exception))
+        self.assertEqual(len(classes), 1, "exception class must be identical")
+        for message in messages:
+            self.assertEqual(message, EXPECTED_DENIAL_MESSAGE)
+        self.assertEqual(messages[0], messages[1],
+                         "missing and foreign must be externally identical")
 
     # ---- renew_lease ----
 
     def test_renew_lease_same_tenant_succeeds(self):
-        job = self.job()
+        """R4/R8: correct owner and version, caller tenant carried."""
+        job = self.job(self.tenant)
         task = self.task(job)
         lease = checkpoint.claim_task(task, uuid4(), tenant_id=self.tenant)
+        before_expiry = self.task_state(task)[3]
         renewed = checkpoint.renew_lease(lease, tenant_id=self.tenant)
         self.assertEqual(renewed.tenant_id, self.tenant)
         self.assertEqual(renewed.version, lease.version)
+        state = self.task_state(task)
+        self.assertEqual(state[1], lease.owner_id, "owner must be preserved")
+        self.assertEqual(state[2], lease.version, "version must be preserved")
+        self.assertGreaterEqual(state[3], before_expiry,
+                                "expiry must not move backwards")
 
     def test_renew_lease_foreign_tenant_denied_and_state_unchanged(self):
-        job = self.job()
+        """R5/R3: owner, version, expiry and status all unchanged."""
+        job = self.job(self.tenant)
         task = self.task(job)
         lease = checkpoint.claim_task(task, uuid4(), tenant_id=self.tenant)
-        before = self.task_state(task)
-        with self.assertRaises(checkpoint.LeaseLost):
-            checkpoint.renew_lease(lease, tenant_id=self.foreign)
-        after = self.task_state(task)
-        self.assertEqual(after, before,
-                         "foreign renewal must leave owner/version/expiry/status")
-
-    def test_renew_lease_lease_tenant_is_not_authority(self):
-        """A lease carrying the owner tenant cannot be renewed by a foreign
-        caller merely because the lease object knows the owning tenant."""
-        job = self.job()
-        task = self.task(job)
-        lease = checkpoint.claim_task(task, uuid4(), tenant_id=self.tenant)
+        self.prove_task_visible_and_owned_by(task, self.tenant)
         before = self.task_state(task)
         with self.assertRaises(checkpoint.LeaseLost):
             checkpoint.renew_lease(lease, tenant_id=self.foreign)
         self.assertEqual(self.task_state(task), before)
 
+    def test_renew_lease_lease_tenant_is_not_authority(self):
+        """A lease that knows the owner tenant is not self-authorizing."""
+        job = self.job(self.tenant)
+        task = self.task(job)
+        lease = checkpoint.claim_task(task, uuid4(), tenant_id=self.tenant)
+        self.assertEqual(lease.tenant_id, self.tenant)
+        before = self.task_state(task)
+        with self.assertRaises(checkpoint.LeaseLost):
+            checkpoint.renew_lease(lease, tenant_id=self.foreign)
+        self.assertEqual(self.task_state(task), before)
+
+    def test_renew_lease_stale_version_rejected_and_state_unchanged(self):
+        """R8: the lease-version fence must survive tenant scoping."""
+        job = self.job(self.tenant)
+        task = self.task(job)
+        lease = checkpoint.claim_task(task, uuid4(), tenant_id=self.tenant)
+        stale = dataclasses.replace(lease, version=lease.version + 5)
+        before = self.task_state(task)
+        with self.assertRaises(checkpoint.LeaseLost):
+            checkpoint.renew_lease(stale, tenant_id=self.tenant)
+        self.assertEqual(self.task_state(task), before)
+
+    def test_renew_lease_wrong_owner_rejected_and_state_unchanged(self):
+        """R8: the owner fence must survive tenant scoping."""
+        job = self.job(self.tenant)
+        task = self.task(job)
+        lease = checkpoint.claim_task(task, uuid4(), tenant_id=self.tenant)
+        impostor = dataclasses.replace(lease, owner_id=uuid4())
+        before = self.task_state(task)
+        with self.assertRaises(checkpoint.LeaseLost):
+            checkpoint.renew_lease(impostor, tenant_id=self.tenant)
+        self.assertEqual(self.task_state(task), before)
+
     # ---- claim_next_ready_task ----
 
     def test_claim_next_same_tenant_succeeds(self):
-        job = self.job()
+        """R4: real PostgreSQL executes the JOIN and the task-only lock."""
+        job = self.job(self.tenant)
         task = self.task(job)
         lease = scheduler.claim_next_ready_task(
             job, uuid4(), tenant_id=self.tenant)
         self.assertIsNotNone(lease)
-        self.assertEqual(lease.tenant_id, self.tenant)
         self.assertEqual(lease.task_id, task)
+        self.assertEqual(lease.tenant_id, self.tenant)
+        state = self.task_state(task)
+        self.assertEqual(state[0], "running")
+        self.assertEqual(state[1], lease.owner_id)
+        self.assertEqual(state[2], 1)
 
     def test_claim_next_foreign_tenant_cannot_claim(self):
-        job = self.job()
-        task = self.task(job)
-        before = self.task_state(task)
-        self.assertIsNone(scheduler.claim_next_ready_task(
-            job, uuid4(), tenant_id=self.foreign))
-        self.assertEqual(self.task_state(task), before,
-                         "foreign claim must leave the task untouched")
-
-    def test_claim_next_foreign_job_id_under_own_tenant_cannot_claim(self):
-        """Own tenant but a job belonging to another tenant is still denied."""
+        """R5/R3: foreign job proven to exist and be tenant-eligible first."""
         foreign_job = self.job(self.foreign)
-        self.task(foreign_job)
+        foreign_task = self.task(foreign_job)
+        self.prove_job_visible_and_owned_by(foreign_job, self.foreign)
+        self.prove_task_visible_and_owned_by(foreign_task, self.foreign)
+        self.prove_task_eligible(foreign_task)
+        before = self.task_state(foreign_task)
         self.assertIsNone(scheduler.claim_next_ready_task(
             foreign_job, uuid4(), tenant_id=self.tenant))
+        self.assertEqual(self.task_state(foreign_task), before,
+                         "foreign candidate must be untouched")
+
+    def test_claim_next_foreign_job_id_under_own_tenant_cannot_claim(self):
+        """Own tenant but a foreign job id is still outside the scope."""
+        foreign_job = self.job(self.foreign)
+        foreign_task = self.task(foreign_job)
+        self.prove_job_visible_and_owned_by(foreign_job, self.foreign)
+        self.prove_task_eligible(foreign_task)
+        before = self.task_state(foreign_task)
+        self.assertIsNone(scheduler.claim_next_ready_task(
+            foreign_job, uuid4(), tenant_id=self.tenant))
+        self.assertEqual(self.task_state(foreign_task), before)
 
     def test_claim_next_missing_and_foreign_job_are_uniform(self):
-        job = self.job()
-        self.task(job)
+        """R7: both unavailable cases give the identical None contract."""
         foreign_job = self.job(self.foreign)
-        self.task(foreign_job)
+        foreign_task = self.task(foreign_job)
+        self.prove_job_visible_and_owned_by(foreign_job, self.foreign)
+        self.prove_task_eligible(foreign_task)
         missing = uuid4()
         outcomes = set()
         for target, tenant in ((missing, self.tenant),
                                (foreign_job, self.tenant)):
             outcomes.add(scheduler.claim_next_ready_task(
                 target, uuid4(), tenant_id=tenant))
-        self.assertEqual(outcomes, {None})
+        self.assertEqual(outcomes, {None},
+                         "missing and foreign job must both yield no claim")
 
     def test_claim_next_does_not_lock_or_consume_foreign_tasks(self):
-        """A foreign-tenant attempt must leave ordering and cardinality intact."""
+        """Repeated foreign attempts leave the foreign task claimable by its
+        own tenant, proving no consumption and no permanent contention."""
         foreign_job = self.job(self.foreign)
-        foreign_task = self.task(foreign_job, external="a")
+        foreign_task = self.task(foreign_job)
+        self.prove_job_visible_and_owned_by(foreign_job, self.foreign)
+        self.prove_task_eligible(foreign_task)
         before = self.task_state(foreign_task)
         for _ in range(3):
             self.assertIsNone(scheduler.claim_next_ready_task(
                 foreign_job, uuid4(), tenant_id=self.tenant))
         self.assertEqual(self.task_state(foreign_task), before)
-        # the owning tenant can still claim it normally afterwards
         lease = scheduler.claim_next_ready_task(
             foreign_job, uuid4(), tenant_id=self.foreign)
-        self.assertIsNotNone(lease)
+        self.assertIsNotNone(lease,
+                             "owning tenant must still be able to claim it")
+        self.assertEqual(lease.task_id, foreign_task)
 
     def test_lease_carries_exact_caller_tenant(self):
-        job = self.job()
+        job = self.job(self.tenant)
         self.task(job)
         lease = scheduler.claim_next_ready_task(
             job, uuid4(), tenant_id=self.tenant)
