@@ -82,6 +82,46 @@ def _statements(func):
     return _literal_strings(tree)
 
 
+def _first_sql_keyword(sql):
+    """The first executable SQL keyword, ignoring whitespace and comments.
+
+    ``_fresh`` is a READ-ONLY helper, so its contract is an allowlist of
+    SELECT rather than a denylist of writes: a denylist silently admits an
+    unknown statement class (CALL, DO, a bare WITH that mutates, ...).
+    Deriving the first executable keyword is deliberately not a SQL parser.
+    """
+    text = sql or ""
+    while True:
+        text = text.lstrip()
+        if text.startswith("--"):
+            newline = text.find("\n")
+            if newline == -1:
+                return ""
+            text = text[newline + 1:]
+            continue
+        if text.startswith("/*"):
+            end = text.find("*/")
+            if end == -1:
+                return ""
+            text = text[end + 2:]
+            continue
+        break
+    token = ""
+    for ch in text:
+        if ch.isalnum() or ch == "_":
+            token += ch
+        else:
+            break
+    return token.lower()
+
+
+SQL_WRITE_VERBS = frozenset({
+    "insert", "update", "delete", "truncate", "merge", "copy",
+    "create", "alter", "drop", "call", "do", "grant", "revoke",
+    "vacuum", "analyze", "refresh", "comment", "lock",
+})
+
+
 def _find_func(source, name):
     tree = ast.parse(source)
     for node in ast.walk(tree):
@@ -718,6 +758,68 @@ class C2BoundaryTests(unittest.TestCase):
             cwd=DEVAI_ROOT, capture_output=True, text=True)
         self.assertEqual(out.stdout.strip(), "", "C2 must not add migrations")
 
+    def test_fresh_helper_is_read_only_and_never_silently_rolls_back(self):
+        """A write through _fresh vanishes silently on close.
+
+        This pin exists because two rollback tests previously used it for
+        fixture mutation, so their setup never took effect and they silently
+        proved nothing. Call sites are derived from the AST of this very file
+        rather than from a hand-maintained allowlist, so it cannot go stale.
+        """
+        with open(os.path.join(DEVAI_ROOT, "tests",
+                               "test_group_c_checkpoint_scope.py"),
+                  encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+
+        fresh_selects = fresh_non_selects = committed_writes = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = getattr(node.func, "attr", None)
+            if name not in ("_fresh", "_committed_write"):
+                continue
+            sql = ""
+            if (node.args and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)):
+                sql = node.args[0].value
+            keyword = _first_sql_keyword(sql)
+            if name == "_committed_write":
+                committed_writes += 1
+                self.assertIn(keyword, SQL_WRITE_VERBS,
+                              "committed write helper must actually write "
+                              f"(saw {keyword!r})")
+            elif keyword == "select":
+                fresh_selects += 1
+            else:
+                fresh_non_selects += 1
+                self.fail(f"_fresh is SELECT-only; L{node.lineno} uses "
+                          f"{keyword!r}")
+
+        self.assertEqual(fresh_non_selects, 0,
+                         "_fresh must only ever be used for SELECT")
+        self.assertGreater(fresh_selects, 0, "_fresh must still read")
+        self.assertGreaterEqual(committed_writes, 2,
+                                "fixture mutations must be committed")
+
+        # The policy must survive leading whitespace and SQL comments, which is
+        # why it reads the first executable keyword rather than splitting.
+        for prefix in ("", "   ", "\n\t ", "-- a comment\n", "/* c */ ",
+                       "  -- x\n /* y */ "):
+            self.assertEqual(_first_sql_keyword(prefix + "SELECT 1"), "select")
+            self.assertEqual(_first_sql_keyword(prefix + "UPDATE t SET x=1"),
+                             "update")
+
+        # Every non-SELECT statement class must fail the allowlist, including
+        # a WITH whose CTE mutates -- which is why WITH is not allowed.
+        for sql in ("INSERT INTO t VALUES (1)", "UPDATE t SET a=1",
+                    "DELETE FROM t", "MERGE INTO t", "COPY t FROM stdin",
+                    "CREATE TABLE t()", "ALTER TABLE t ADD COLUMN c int",
+                    "DROP TABLE t", "TRUNCATE t", "CALL p()", "DO $$ $$",
+                    "WITH x AS (UPDATE t SET a=1 RETURNING *)"
+                    " SELECT * FROM x"):
+            self.assertNotEqual(_first_sql_keyword(sql), "select",
+                                f"{sql} must not pass the SELECT-only policy")
+
     def test_runtime_propagates_lease_tenant_only(self):
         """C3 owns runtime authority continuity; C2 only forwards the lease.
 
@@ -844,12 +946,45 @@ class CheckpointScopeDatabaseTests(unittest.TestCase):
         self.setup.commit()
         return task
 
+    WRITE_VERBS = tuple(sorted(SQL_WRITE_VERBS))
+
     def _fresh(self, sql, params=()):
+        """READ-ONLY authoritative read from a brand-new connection.
+
+        Contract is SELECT-only. A write issued here is silently rolled back
+        when the connection closes, which previously made fixture mutations
+        vanish without any error. Any intended mutation must go through
+        _committed_write instead.
+
+        Enforced as an allowlist rather than a denylist: a denylist would
+        admit unknown statement classes. The check is the first executable SQL
+        keyword, not a SQL parser.
+        """
+        keyword = _first_sql_keyword(sql)
+        if keyword != "select":
+            raise AssertionError(
+                f"_fresh is SELECT-only; use _committed_write for writes. "
+                f"Refused first keyword {keyword!r}: {(sql or '')[:80]}")
         conn = psycopg.connect(_DB_URL)
         try:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
                 return cur.fetchall() if cur.description else None
+        finally:
+            conn.close()
+
+    def _committed_write(self, sql, params=()):
+        """Execute a fixture mutation on its own connection and COMMIT it.
+
+        Used for every intended fixture mutation so the change is durable and
+        visible to production's independent connections. Never patches
+        production.
+        """
+        conn = psycopg.connect(_DB_URL)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+            conn.commit()
         finally:
             conn.close()
 
@@ -863,6 +998,36 @@ class CheckpointScopeDatabaseTests(unittest.TestCase):
             "SELECT count(*) FROM task_checkpoints WHERE task_id=%s",
             (task,))[0][0]
 
+    def checkpoint_constraint_schema(self, task):
+        """Schema owning the task_checkpoints table, as the DB reports it."""
+        return self._fresh(
+            "SELECT nsp.nspname FROM pg_class rel"
+            " JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace"
+            " WHERE rel.relname = 'task_checkpoints'")[0][0]
+
+    def checkpoint_sequences(self, task):
+        return [r[0] for r in self._fresh(
+            "SELECT sequence FROM task_checkpoints WHERE task_id=%s"
+            " ORDER BY sequence", (task,))]
+
+    def full_task_snapshot(self, task):
+        """Every field the C2 writes can alter, read from a fresh connection."""
+        return self._fresh(
+            "SELECT status, lease_owner, lease_version, lease_expires_at,"
+            " checkpoint_seq, next_attempt_at FROM tasks WHERE id=%s",
+            (task,))[0]
+
+    def assert_checkpoint_rollback_proof(self, task, before, expected_seq):
+        """After a failed INSERT, nothing the guard UPDATE touched may persist."""
+        after = self.full_task_snapshot(task)
+        self.assertEqual(after, before,
+                         "guard UPDATE must roll back with the failed INSERT")
+        self.assertEqual(after[4], expected_seq - 1,
+                         "checkpoint_seq must revert to its pre-call value")
+        self.assertEqual(self.checkpoint_sequences(task), [expected_seq],
+                         "exactly the pre-existing conflict row must remain")
+        self.assertEqual(self.checkpoint_count(task), 1)
+
     def prove_task_visible_and_owned_by(self, task, expected_tenant):
         rows = self._fresh(
             "SELECT t.id, j.tenant_id FROM tasks t JOIN jobs j"
@@ -871,9 +1036,17 @@ class CheckpointScopeDatabaseTests(unittest.TestCase):
         self.assertEqual(rows[0][1], expected_tenant)
         return rows[0]
 
-    def claim(self, task, tenant):
-        """Put a real, fence-valid lease on `task` as `tenant`."""
-        return checkpoint.claim_task(task, uuid4(), tenant_id=tenant)
+    def claim(self, task, tenant, *, lease_seconds=None):
+        """Put a real, fence-valid lease on `task` as `tenant`.
+
+        ``lease_seconds`` is optional and keyword-only; when omitted this
+        reproduces the production default, so every existing caller keeps
+        identical behaviour.
+        """
+        if lease_seconds is None:
+            return checkpoint.claim_task(task, uuid4(), tenant_id=tenant)
+        return checkpoint.claim_task(
+            task, uuid4(), lease_seconds, tenant_id=tenant)
 
     # ---- same tenant ----
 
@@ -1031,59 +1204,176 @@ class CheckpointScopeDatabaseTests(unittest.TestCase):
         self.assertEqual(self.checkpoint_count(task), 0)
 
     def test_expired_lease_denied_for_mutating_apis(self):
+        """Deterministic expiry, no sleeping and no race with the wall clock."""
         job = self.job(self.tenant)
         task = self.task(job)
-        lease = self.claim(task, self.tenant, lease_seconds=1)
-        with self._fresh(
-                "UPDATE tasks SET lease_expires_at = now() - interval '1 hour'"
-                " WHERE id=%s", (task,)):
-            pass
-        before = self.task_state(task)
+        lease = self.claim(task, self.tenant)
+
+        # Expiry is set through a committing independent connection; a write
+        # through _fresh would be silently rolled back on close.
+        self._committed_write(
+            "UPDATE tasks SET lease_expires_at = now() - interval '1 hour'"
+            " WHERE id=%s", (task,))
+
+        # Prove expiry is the ONLY broken fence, through a fresh connection.
+        state, expired_now = self._fresh(
+            "SELECT lease_owner, lease_version, checkpoint_seq,"
+            " lease_expires_at < now() AS expired"
+            " FROM tasks WHERE id=%s", (task,))[0]
+        self.assertTrue(expired_now, "lease must be provably expired")
+        self.prove_task_visible_and_owned_by(task, self.tenant)
+        self.assertEqual(state[0], lease.owner_id, "owner fence must be valid")
+        self.assertEqual(state[1], lease.version, "version fence must be valid")
+
+        before = self.full_task_snapshot(task)
         with self.assertRaises(checkpoint.LeaseLost):
             checkpoint.save_checkpoint(lease, {"x": 1})
-        self.assertEqual(self.task_state(task), before)
+        with self.assertRaises(checkpoint.LeaseLost):
+            checkpoint.release_task(lease, "completed")
+        self.assertEqual(self.full_task_snapshot(task), before,
+                         "expired-lease rejection must change nothing")
         self.assertEqual(self.checkpoint_count(task), 0)
 
     # ---- transactional rollback ----
 
+    def _build_insert_stage_conflict(self, lease, task):
+        """Force a deterministic UNIQUE(task_id, sequence) collision.
+
+        Leaves the task with a committed checkpoint at sequence N and
+        checkpoint_seq = N-1, so the next guard UPDATE is fully eligible and
+        advances to N, and the INSERT that follows collides with the existing
+        row. No fence is broken: tenant, owner, version and expiry stay valid.
+        """
+        # A real checkpoint establishes sequence 1 durably.
+        checkpoint.save_checkpoint(lease, {"conflict": True})
+        self.assertEqual(self.checkpoint_sequences(task), [1])
+        # Rewind only the counter, committing it, so the next guard UPDATE
+        # recomputes sequence 1.
+        self._committed_write(
+            "UPDATE tasks SET checkpoint_seq = 0 WHERE id=%s", (task,))
+        return 1
+
+    def resolve_checkpoint_unique_constraint(self):
+        """Identify the UNIQUE constraint on task_checkpoints(task_id, sequence).
+
+        Resolved from live PostgreSQL catalog metadata by constrained-column
+        signature, not by name matching, so the test does not depend on
+        PostgreSQL's automatic naming convention and no migration is needed.
+        """
+        rows = self._fresh(
+            "SELECT nsp.nspname, con.conname"
+            " FROM pg_constraint con"
+            " JOIN pg_class rel ON rel.oid = con.conrelid"
+            " JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace"
+            " WHERE rel.relname = 'task_checkpoints'"
+            "   AND con.contype = 'u'"
+            "   AND (SELECT array_agg(a.attname::text ORDER BY k.ord)"
+            "        FROM unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)"
+            "        JOIN pg_attribute a"
+            "          ON a.attrelid = rel.oid AND a.attnum = k.attnum)"
+            "       = ARRAY['task_id', 'sequence']")
+        self.assertEqual(len(rows), 1,
+                         f"expected exactly one UNIQUE(task_id, sequence), "
+                         f"found {rows}")
+        return rows[0][0], rows[0][1]
+
+    def _prove_conflict_preconditions(self, lease, task, expected_seq,
+                                       require_running):
+        """R12: prove GUARD ELIGIBLE, CONFLICT EXISTS and NEXT SEQ == CONFLICT."""
+        state, owner, version, expires, expired = self._fresh(
+            "SELECT status, lease_owner, lease_version, lease_expires_at,"
+            " lease_expires_at < now() FROM tasks WHERE id=%s", (task,))[0]
+        self.prove_task_visible_and_owned_by(task, lease.tenant_id)
+        self.assertEqual(owner, lease.owner_id, "GUARD ELIGIBLE: owner")
+        self.assertEqual(version, lease.version, "GUARD ELIGIBLE: version")
+        self.assertFalse(expired, "GUARD ELIGIBLE: lease must be unexpired")
+        self.assertIsNotNone(expires, "GUARD ELIGIBLE: lease must be held")
+        if require_running:
+            self.assertEqual(state, "running",
+                             "GUARD ELIGIBLE: defer requires status running")
+        self.assertEqual(
+            self.checkpoint_sequences(task), [expected_seq],
+            "CONFLICT ROW EXISTS at the expected sequence")
+        seq_now = self._fresh(
+            "SELECT checkpoint_seq FROM tasks WHERE id=%s", (task,))[0][0]
+        self.assertEqual(seq_now, expected_seq - 1,
+                         "NEXT CHECKPOINT SEQUENCE == CONFLICT SEQUENCE")
+
+    def _assert_insert_stage_violation(self, ctx, task, expected_seq,
+                                       expected_constraint):
+        """R13: the 23505 must come from the intended unique constraint."""
+        exc = ctx.exception
+        self.assertIsInstance(exc, psycopg.errors.UniqueViolation)
+        self.assertEqual(exc.sqlstate, "23505",
+                         "expected unique_violation SQLSTATE")
+        actual = getattr(exc.diag, "constraint_name", None)
+        self.assertIsNotNone(actual, "constraint identity must be readable")
+        self.assertEqual(actual, expected_constraint,
+                         "23505 must come from UNIQUE(task_id, sequence), "
+                         "not another constraint")
+        self.assertEqual(self.checkpoint_sequences(task), [expected_seq],
+                         "the conflicting row must still be the only one")
+
     def test_save_checkpoint_rolls_back_when_insert_fails(self):
-        """The guard UPDATE is eligible, the INSERT then fails on the
-        UNIQUE(task_id, sequence) constraint, and nothing may persist."""
+        """Eligible guard UPDATE, then a UNIQUE(task_id, sequence) collision.
+
+        Production must not translate this artificial database conflict, so the
+        expected outcome is the real psycopg UniqueViolation (SQLSTATE 23505).
+        Its arrival is the evidence that execution actually reached the INSERT
+        stage rather than failing early at the guard.
+        """
         job = self.job(self.tenant)
         task = self.task(job)
         lease = self.claim(task, self.tenant)
-        # Pre-create a checkpoint at the sequence the next save will compute.
-        checkpoint.save_checkpoint(lease, {"pre": True})
-        # Force the internal counter out of step with task_checkpoints so the
-        # next INSERT collides on UNIQUE(task_id, sequence).
-        with self._fresh(
-                "UPDATE tasks SET checkpoint_seq = checkpoint_seq + 5"
-                " WHERE id=%s", (task,)):
-            pass
-        fresh_lease = self.claim(task, self.tenant)
-        before_state = self.task_state(task)
-        before_cp = self.checkpoint_count(task)
-        # The UPDATE is eligible, but the INSERT selects nothing because the
-        # lease is stale, so the whole transaction must leave no trace.
-        self.assertGreaterEqual(before_state[4], 5)
-        with self.assertRaises(checkpoint.LeaseLost):
-            checkpoint.save_checkpoint(fresh_lease, {"boom": True})
-        after = self.task_state(task)
-        self.assertEqual(self.checkpoint_count(task), before_cp,
-                         "no partial checkpoint may persist")
-        self.assertEqual(after[0], before_state[0], "status must be unchanged")
+        expected_seq = self._build_insert_stage_conflict(lease, task)
+        schema, expected_constraint = self.resolve_checkpoint_unique_constraint()
+
+        before = self.full_task_snapshot(task)
+        self._prove_conflict_preconditions(lease, task, expected_seq,
+                                           require_running=False)
+
+        with self.assertRaises(psycopg.errors.UniqueViolation) as ctx:
+            checkpoint.save_checkpoint(lease, {"boom": True})
+
+        self._assert_insert_stage_violation(ctx, task, expected_seq,
+                                            expected_constraint)
+        self.assert_checkpoint_rollback_proof(task, before, expected_seq)
+        self.assertEqual(
+            self.checkpoint_constraint_schema(task), schema,
+            "constraint identity must be stable within the run")
 
     def test_defer_rolls_back_when_insert_fails(self):
+        """Eligible defer guard UPDATE, then a UNIQUE(task_id, sequence) hit.
+
+        The failure is induced only at the INSERT. Stale version, wrong owner,
+        wrong tenant and expired lease are deliberately NOT used: each of those
+        fails at the guard and would prove denial rather than rollback.
+        """
         job = self.job(self.tenant)
         task = self.task(job)
         lease = self.claim(task, self.tenant)
-        before_cp = self.checkpoint_count(task)
-        stale = dataclasses.replace(lease, version=lease.version + 9)
-        with self.assertRaises(checkpoint.LeaseLost):
-            checkpoint.defer_task_for_route(stale)
-        self.assertEqual(self.checkpoint_count(task), before_cp)
-        self.assertEqual(self.task_state(task)[0], "running",
-                         "a failed defer must not return the task to pending")
+        expected_seq = self._build_insert_stage_conflict(lease, task)
+        _schema, expected_constraint = self.resolve_checkpoint_unique_constraint()
+
+        before = self.full_task_snapshot(task)
+        self._prove_conflict_preconditions(lease, task, expected_seq,
+                                           require_running=True)
+
+        with self.assertRaises(psycopg.errors.UniqueViolation) as ctx:
+            checkpoint.defer_task_for_route(lease)
+
+        self._assert_insert_stage_violation(ctx, task, expected_seq,
+                                            expected_constraint)
+        self.assert_checkpoint_rollback_proof(task, before, expected_seq)
+        # The guard temporarily cleared lease_owner and set status='pending';
+        # rollback must restore BOTH exactly.
+        after = self.full_task_snapshot(task)
+        self.assertEqual(after[1], lease.owner_id,
+                         "lease_owner must be restored after rollback")
+        self.assertEqual(after[0], "running",
+                         "status must be restored after rollback")
+        self.assertIsNone(after[5],
+                          "next_attempt_at must be restored after rollback")
 
 
 if __name__ == "__main__":
