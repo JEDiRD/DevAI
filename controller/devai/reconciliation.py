@@ -232,6 +232,34 @@ def sweep(*, limit=100):
     return counts
 
 
+def committed_case_provenance(*, tenant_id, case_id):
+    """Read the committed reconciliation row for operator-visible evidence.
+
+    F11. This deliberately opens a NEW connection after resolve_case has
+    committed, so the values an operator is shown describe post-commit system
+    state rather than an in-flight transaction's own claims. resolve_case
+    returning only tells us the write was accepted; it does not tell us which
+    case was touched, what state it landed in, or when.
+
+    AUTHORIZATION is the CALLER tenant paired with the requested case id. The
+    row's own tenant column is ownership proof and is deliberately neither
+    projected nor adopted as authority, so it can never stand in for the
+    caller. Loading by case_id alone would let an operator name another
+    tenant's case and receive its provenance, so both predicates are required.
+
+    Returns (id, attempt_id, status, resolution, resolved_at). Raises
+    ReconciliationError if no committed row matches, which the CLI surfaces
+    through its existing generic failure contract.
+    """
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute('''SELECT id,attempt_id,status,resolution,resolved_at
+            FROM metered_reconciliations WHERE tenant_id=%s AND id=%s''', (tenant_id, case_id))
+        row = cur.fetchone()
+    if row is None:
+        raise ReconciliationError('EVIDENCE_UNAVAILABLE')
+    return row
+
+
 if __name__ == '__main__':
     import argparse
     import hashlib
@@ -256,7 +284,28 @@ if __name__ == '__main__':
                 usage=tuple(data['usage']) if data.get('usage') is not None else None,
                 statement_cost=Decimal(data['statement_cost']) if data.get('statement_cost') is not None else None,
                 evidence_sha256=data.get('evidence_sha256'),unrecoverable=data.get('unrecoverable') is True)
-            print(json.dumps({'resolved':True,'changed':changed}))
+            # F11. resolve_case has returned, so its transaction committed. The
+            # result the operator sees is now read back from committed state in
+            # a separate transaction, which makes it attributable: it names the
+            # case, the attempt, and the persisted status/resolution/timestamp
+            # that actually resulted. Two different cases can no longer produce
+            # indistinguishable output.
+            #
+            # 'resolved' is derived from the committed status rather than being a
+            # hard-coded True. 'changed' stays the operation outcome for THIS
+            # invocation, so a replayed no-op is distinguishable from a fresh
+            # mutation while both report the same committed state.
+            #
+            # If this read fails the whole invocation reports failure, even
+            # though the mutation has already committed. That is deliberately an
+            # evidence-generation failure, not a rollback, and no success JSON
+            # is printed.
+            case,attempt,status,resolution,resolved_at=committed_case_provenance(
+                tenant_id=UUID(data['tenant_id']),case_id=UUID(data['case_id']))
+            print(json.dumps({'case_id':str(case),'attempt_id':str(attempt),
+                'resolved':status=='resolved','changed':changed,'status':status,
+                'resolution':resolution,
+                'resolved_at':resolved_at.isoformat() if resolved_at is not None else None}))
         except Exception:
             print('RESOLUTION_REJECTED',file=sys.stderr)
             sys.exit(1)
