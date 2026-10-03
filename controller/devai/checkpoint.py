@@ -170,22 +170,39 @@ def save_checkpoint(
     lease: TaskLease,
     payload: dict,
 ) -> Checkpoint:
+    """Checkpoint ``lease``'s task, using the lease's own tenant authority.
+
+    Authority is ``lease.tenant_id``, the caller tenant proven at claim time.
+    It is never re-derived from a job, task or checkpoint row.
+
+    Both statements carry their own ownership proof. The guard UPDATE proves
+    tasks->jobs ownership directly. The INSERT does NOT rely on that UPDATE:
+    it is an INSERT ... SELECT that re-proves tasks->jobs ownership and binds
+    the checkpoint sequence, lease owner and lease version, so it is
+    independently incapable of creating a checkpoint outside the caller's
+    tenant. A zero-row INSERT is detected and raises, so authorization failure
+    can never look like success. Both statements share one transaction.
+    """
 
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE tasks
-                SET checkpoint_seq = checkpoint_seq + 1,
+                UPDATE tasks t
+                SET checkpoint_seq = t.checkpoint_seq + 1,
                     updated_at = now()
-                WHERE id = %s
-                  AND lease_owner = %s
-                  AND lease_version = %s
-                  AND lease_expires_at > now()
-                RETURNING checkpoint_seq
+                FROM jobs j
+                WHERE j.id = t.job_id
+                  AND t.id = %s
+                  AND j.tenant_id = %s
+                  AND t.lease_owner = %s
+                  AND t.lease_version = %s
+                  AND t.lease_expires_at > now()
+                RETURNING t.checkpoint_seq
                 """,
                 (
                     lease.task_id,
+                    lease.tenant_id,
                     lease.owner_id,
                     lease.version,
                 ),
@@ -201,6 +218,8 @@ def save_checkpoint(
             sequence = row[0]
             checkpoint_id = uuid4()
 
+            # Independently authorized: the effect-producing statement proves
+            # ownership and the fence itself.
             cur.execute(
                 """
                 INSERT INTO task_checkpoints (
@@ -210,19 +229,38 @@ def save_checkpoint(
                     lease_version,
                     payload
                 )
-                VALUES (%s, %s, %s, %s, %s)
+                SELECT %s, t.id, %s, %s, %s
+                FROM tasks t
+                JOIN jobs j
+                  ON j.id = t.job_id
+                WHERE t.id = %s
+                  AND j.tenant_id = %s
+                  AND t.checkpoint_seq = %s
+                  AND t.lease_owner = %s
+                  AND t.lease_version = %s
                 RETURNING created_at
                 """,
                 (
                     checkpoint_id,
-                    lease.task_id,
                     sequence,
                     lease.version,
                     Jsonb(payload),
+                    lease.task_id,
+                    lease.tenant_id,
+                    sequence,
+                    lease.owner_id,
+                    lease.version,
                 ),
             )
 
-            created_at = cur.fetchone()[0]
+            inserted = cur.fetchone()
+
+            if inserted is None:
+                raise LeaseLost(
+                    "Cannot checkpoint with a stale lease"
+                )
+
+            created_at = inserted[0]
 
     return Checkpoint(
         sequence=sequence,
@@ -234,23 +272,38 @@ def save_checkpoint(
 
 def load_latest_checkpoint(
     task_id: UUID,
+    *,
+    tenant_id: UUID,
 ) -> Checkpoint | None:
+    """Return the latest checkpoint for ``task_id`` within ``tenant_id``.
+
+    This API receives no TaskLease, so the caller supplies tenant authority
+    explicitly. Ownership is proven inside the SELECT, atomically, by following
+    task_checkpoints -> tasks -> jobs. A task outside the caller's tenant and a
+    task that does not exist both yield None, so there is no tenant-existence
+    oracle.
+    """
 
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT
-                    sequence,
-                    lease_version,
-                    payload,
-                    created_at
-                FROM task_checkpoints
-                WHERE task_id = %s
-                ORDER BY sequence DESC
+                    cp.sequence,
+                    cp.lease_version,
+                    cp.payload,
+                    cp.created_at
+                FROM task_checkpoints cp
+                JOIN tasks t
+                  ON t.id = cp.task_id
+                JOIN jobs j
+                  ON j.id = t.job_id
+                WHERE cp.task_id = %s
+                  AND j.tenant_id = %s
+                ORDER BY cp.sequence DESC
                 LIMIT 1
                 """,
-                (task_id,),
+                (task_id, tenant_id),
             )
 
             row = cur.fetchone()
@@ -283,19 +336,23 @@ def release_task(
         with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE tasks
+                UPDATE tasks t
                 SET lease_owner = NULL,
                     lease_expires_at = NULL,
                     status = %s,
                     updated_at = now()
-                WHERE id = %s
-                  AND lease_owner = %s
-                  AND lease_version = %s
-                  AND lease_expires_at > now()
+                FROM jobs j
+                WHERE j.id = t.job_id
+                  AND t.id = %s
+                  AND j.tenant_id = %s
+                  AND t.lease_owner = %s
+                  AND t.lease_version = %s
+                  AND t.lease_expires_at > now()
                 """,
                 (
                     final_status,
                     lease.task_id,
+                    lease.tenant_id,
                     lease.owner_id,
                     lease.version,
                 ),
@@ -320,29 +377,34 @@ def defer_task_for_route(
     }
 
     # The checkpoint and lease release must commit together. A stale owner
-    # cannot defer a task claimed by somebody else.
+    # cannot defer a task claimed by somebody else. Authority is the lease's
+    # own tenant, never a value re-derived from a row.
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE tasks
-                SET checkpoint_seq = checkpoint_seq + 1,
+                UPDATE tasks t
+                SET checkpoint_seq = t.checkpoint_seq + 1,
                     status = 'pending',
                     next_attempt_at =
                         now() + (%s * interval '1 second'),
                     lease_owner = NULL,
                     lease_expires_at = NULL,
                     updated_at = now()
-                WHERE id = %s
-                  AND lease_owner = %s
-                  AND lease_version = %s
-                  AND lease_expires_at > now()
-                  AND status = 'running'
-                RETURNING checkpoint_seq
+                FROM jobs j
+                WHERE j.id = t.job_id
+                  AND t.id = %s
+                  AND j.tenant_id = %s
+                  AND t.lease_owner = %s
+                  AND t.lease_version = %s
+                  AND t.lease_expires_at > now()
+                  AND t.status = 'running'
+                RETURNING t.checkpoint_seq
                 """,
                 (
                     retry_seconds,
                     lease.task_id,
+                    lease.tenant_id,
                     lease.owner_id,
                     lease.version,
                 ),
@@ -353,23 +415,39 @@ def defer_task_for_route(
                 raise LeaseLost("Cannot defer with a stale lease")
 
             sequence = row[0]
+
+            # Independently authorized: this INSERT proves tasks->jobs
+            # ownership itself rather than trusting the preceding UPDATE.
             cur.execute(
                 """
                 INSERT INTO task_checkpoints (
                     id, task_id, sequence, lease_version, payload
                 )
-                VALUES (%s, %s, %s, %s, %s)
+                SELECT %s, t.id, %s, %s, %s
+                FROM tasks t
+                JOIN jobs j
+                  ON j.id = t.job_id
+                WHERE t.id = %s
+                  AND j.tenant_id = %s
+                  AND t.checkpoint_seq = %s
                 RETURNING created_at
                 """,
                 (
                     uuid4(),
-                    lease.task_id,
                     sequence,
                     lease.version,
                     Jsonb(payload),
+                    lease.task_id,
+                    lease.tenant_id,
+                    sequence,
                 ),
             )
-            created_at = cur.fetchone()[0]
+
+            inserted = cur.fetchone()
+            if inserted is None:
+                raise LeaseLost("Cannot defer with a stale lease")
+
+            created_at = inserted[0]
 
     return Checkpoint(
         sequence=sequence,

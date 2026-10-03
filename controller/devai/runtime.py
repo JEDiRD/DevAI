@@ -81,8 +81,10 @@ def run_claimed_task(
 ):
     task = load_runtime_task(lease.task_id)
 
-    previous = load_latest_checkpoint(task.id)
+    previous = load_latest_checkpoint(task.id, tenant_id=lease.tenant_id)
 
+    # Authority below is lease.tenant_id, the caller tenant already proven at
+    # claim time. It is never re-derived from RuntimeTask or job rows.
     save_checkpoint(
         lease,
         {

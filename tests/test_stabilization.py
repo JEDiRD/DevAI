@@ -146,7 +146,8 @@ class StabilizationTests(unittest.TestCase):
             )
             self.assertEqual(cur.fetchone()[0], 0)
 
-        latest = checkpoint.load_latest_checkpoint(task_id)
+        latest = checkpoint.load_latest_checkpoint(
+            task_id, tenant_id=self.tenant_id)
         self.assertEqual(latest.payload["phase"], "waiting_for_route")
         with self.assertRaises(checkpoint.LeaseLost):
             checkpoint.defer_task_for_route(lease)

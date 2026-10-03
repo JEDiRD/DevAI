@@ -776,19 +776,77 @@ class C2BoundaryTests(unittest.TestCase):
                 "release_task", "defer_task_for_route")
 
     def test_c2_owned_signatures_have_no_tenant_yet(self):
-        for name in self.C2_OWNED:
-            func = getattr(checkpoint, name)
+        """C1->C2 handoff marker: records the C2 authority model.
+
+        This began as an absence marker asserting the C2 APIs had gained no
+        tenant_id yet. Group C2 implements exactly that, so it now records the
+        resulting authority classification instead. The LEASE versus EXPLICIT
+        distinction is the contract and must not be flattened into "all four
+        take tenant_id": the three lease-taking APIs must NOT grow a redundant
+        explicit argument, and only the lease-free API may take one.
+
+        The authoritative detailed proof lives in
+        tests/test_group_c_checkpoint_scope.py; this stays a narrow marker.
+        """
+        lease_apis = ("save_checkpoint", "release_task",
+                      "defer_task_for_route")
+        for name in lease_apis:
+            params = inspect.signature(getattr(checkpoint, name)).parameters
+            self.assertIn("lease", params, f"{name} must receive the lease")
             self.assertNotIn(
-                "tenant_id", inspect.signature(func).parameters,
-                f"{name} is C2-owned and must not gain tenant_id in C1")
+                "tenant_id", params,
+                f"{name} takes authority from lease.tenant_id and must not "
+                "gain a redundant explicit tenant_id")
+            src = inspect.cleandoc(inspect.getsource(getattr(checkpoint, name)))
+            self.assertIn("lease.tenant_id", src,
+                          f"{name} must read authority from the lease")
+
+        explicit = inspect.signature(
+            checkpoint.load_latest_checkpoint).parameters["tenant_id"]
+        self.assertEqual(explicit.kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIs(explicit.default, inspect.Parameter.empty,
+                      "load_latest_checkpoint tenant_id must be mandatory")
+        self.assertNotIn("None", str(explicit.annotation))
 
     def test_c2_owned_statements_have_no_tenant_predicate(self):
-        for name in self.C2_OWNED:
-            func = getattr(checkpoint, name)
+        """C1->C2 handoff marker: the C2 surfaces are now tenant scoped.
+
+        Was an absence marker asserting no C2 statement carried a tenant
+        predicate. Group C2 adds one to every authoritative statement, and
+        converts both checkpoint writes to INSERT ... SELECT rather than an
+        unscoped VALUES insert.
+
+        Detailed proof, including the full invariant checker and the executed
+        mutation matrix, lives in tests/test_group_c_checkpoint_scope.py.
+        """
+        def statements(func):
             tree = ast.parse(inspect.cleandoc(inspect.getsource(func)))
-            joined = "\n".join(_literal_strings(tree))
-            self.assertNotIn("TENANT_ID", joined, name)
-            self.assertNotIn("JOBS", joined, name)
+            out = []
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Call)
+                        and getattr(node.func, "attr", None) == "execute"
+                        and node.args
+                        and isinstance(node.args[0], ast.Constant)
+                        and isinstance(node.args[0].value, str)):
+                    out.append(node.args[0].value)
+            return out
+
+        for name in self.C2_OWNED:
+            joined = "\n".join(_code(s) for s in statements(
+                getattr(checkpoint, name)))
+            self.assertIn("J . TENANT_ID = %S", joined,
+                          f"{name} must carry a tenant predicate")
+            self.assertIn("J . ID = T . JOB_ID", joined,
+                          f"{name} must prove ownership via tasks -> jobs")
+
+        # Both checkpoint writes must be INSERT ... SELECT, never VALUES.
+        for name in ("save_checkpoint", "defer_task_for_route"):
+            inserts = [s for s in statements(getattr(checkpoint, name))
+                       if "INSERT INTO task_checkpoints" in s]
+            self.assertEqual(len(inserts), 1, name)
+            self.assertIn("SELECT", inserts[0].upper(), name)
+            self.assertNotIn("VALUES", inserts[0].upper(),
+                             f"{name} must not use an unscoped VALUES insert")
 
     def test_load_runtime_task_and_run_claimed_task_unchanged(self):
         self.assertEqual(
