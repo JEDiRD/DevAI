@@ -1216,14 +1216,19 @@ class CheckpointScopeDatabaseTests(unittest.TestCase):
             " WHERE id=%s", (task,))
 
         # Prove expiry is the ONLY broken fence, through a fresh connection.
-        state, expired_now = self._fresh(
+        # All four returned columns are bound explicitly and asserted, so a
+        # future projection change cannot silently drop evidence.
+        owner, version, checkpoint_seq, expired_now = self._fresh(
             "SELECT lease_owner, lease_version, checkpoint_seq,"
             " lease_expires_at < now() AS expired"
             " FROM tasks WHERE id=%s", (task,))[0]
         self.assertTrue(expired_now, "lease must be provably expired")
         self.prove_task_visible_and_owned_by(task, self.tenant)
-        self.assertEqual(state[0], lease.owner_id, "owner fence must be valid")
-        self.assertEqual(state[1], lease.version, "version fence must be valid")
+        self.assertEqual(owner, lease.owner_id, "owner fence must be valid")
+        self.assertEqual(version, lease.version, "version fence must be valid")
+        self.assertEqual(checkpoint_seq, 0,
+                         "checkpoint_seq must be untouched, so no other "
+                         "state differs and expiry is the sole broken fence")
 
         before = self.full_task_snapshot(task)
         with self.assertRaises(checkpoint.LeaseLost):
