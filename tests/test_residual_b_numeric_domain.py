@@ -67,8 +67,10 @@ import sys
 import unittest
 from decimal import Decimal
 from unittest import mock
+from uuid import uuid4
 
-from devai import accounting, budget, reconciliation, worker_dispatch
+from devai import accounting, budget, db as db_module, pricing as pricing_module
+from devai import reconciliation, worker_dispatch
 from devai.pricing import (ModelPrice, PricingNotConfigured, calculate_cost)
 from devai.reconciliation import ReconciliationError
 from devai.worker_dispatch import DispatchUnavailable
@@ -1435,19 +1437,61 @@ class HugeValueTests(unittest.TestCase):
                     except ValueError as exc:
                         self.assertNotEqual("INVALID_TOKEN_USAGE", str(exc))
 
-    def test_numeric_capacity_limits_are_not_asserted_as_persistence(self):
-        """Explicitly refuses to claim oversized costs persist.
+    def _assert_pure_huge_cost_property(self, label):
+        """The huge-value property, free of any database or env assumption.
 
-        NUMERIC(18,8) caps magnitude at 10**10 - 1, so a 10**1000 token cost
-        would overflow on write. No engine is available here, so this suite
-        asserts only the pure calculation and records the gap as NOT_TESTED.
+        NUMERIC(18,8) caps magnitude at 10**10 - 1, so these costs could not
+        persist. That is a STORAGE claim, deliberately not made here. What is
+        asserted is only that the pure calculation handles them: correct type,
+        finite, positive, and larger than the durable capacity.
         """
         for tokens in self.HUGE:
-            cost = calculate_cost(price(), tokens, 0)
-            self.assertGreater(cost, Decimal(10 ** 10),
-                               "these costs exceed NUMERIC(18,8) capacity")
-        self.assertFalse(os.environ.get("DEVAI_TEST_DATABASE_URL"),
-                         "this host has no engine; DB capacity is NOT_TESTED")
+            with self.subTest(case=label, magnitude=len(str(tokens))):
+                cost = calculate_cost(price(), tokens, 0)
+                self.assertIsInstance(cost, Decimal)
+                self.assertTrue(cost.is_finite())
+                self.assertGreater(cost, 0)
+                self.assertGreater(cost, Decimal(10 ** 10))
+
+    def test_huge_costs_are_computable_with_no_database_access(self):
+        """Pure calculation, proven to touch no connection boundary.
+
+        `connect` is patched to explode at both the pricing and db module
+        boundaries, so any accidental database access fails the test rather
+        than passing unnoticed.
+        """
+        boom = mock.Mock(side_effect=AssertionError("database access attempted"))
+        with mock.patch.object(pricing_module, "connect", boom), \
+                mock.patch.object(db_module, "connect", boom):
+            self._assert_pure_huge_cost_property("no-db")
+
+    def test_huge_cost_property_is_independent_of_database_env(self):
+        """Regression for RESIDUAL_B_TEST_HARNESS_DEFECT.
+
+        The earlier version of this suite asserted the environment variable
+        was UNSET, which made a 121/121 green run impossible: the five real-DB
+        tests skip when it is unset and fail when it is set. That coupling
+        made the no-DB and real-DB configurations mutually exclusive.
+
+        The property here is pure Python, so it must hold with the variable
+        absent AND present. A synthetic, non-secret, deliberately unreachable
+        DSN is used; no connection is attempted, and `connect` is patched to
+        explode to prove it. No real credential is ever encoded.
+        """
+        synthetic = ("postgresql://residualb-synthetic@127.0.0.1:1/"
+                     "residualb-synthetic-absent")
+        boom = mock.Mock(side_effect=AssertionError("database access attempted"))
+        with mock.patch.dict(os.environ, {"DEVAI_TEST_DATABASE_URL": synthetic}):
+            self.assertEqual(synthetic, os.environ["DEVAI_TEST_DATABASE_URL"])
+            with mock.patch.object(pricing_module, "connect", boom), \
+                    mock.patch.object(db_module, "connect", boom):
+                self._assert_pure_huge_cost_property("db-env-present")
+        # and again with the variable explicitly absent
+        with mock.patch.dict(os.environ):
+            os.environ.pop("DEVAI_TEST_DATABASE_URL", None)
+            with mock.patch.object(pricing_module, "connect", boom), \
+                    mock.patch.object(db_module, "connect", boom):
+                self._assert_pure_huge_cost_property("db-env-absent")
 
 
 # ----------------------------------------------------------------------
@@ -2082,51 +2126,439 @@ def db_available():
     return bool(os.environ.get("DEVAI_TEST_DATABASE_URL"))
 
 
+CHECK_VIOLATION = "23514"
+
+
+def require_check_violation(case, exc, label):
+    """Accept ONLY a psycopg CheckViolation with SQLSTATE 23514.
+
+    This is the whole point of the corrective. The previous oracle was a bare
+    `assertRaises(Exception)`, which happily accepted ProgrammingError raised
+    by a parameter-count mismatch -- evidence of nothing at all. Kept as a
+    free function so it can be unit-tested without an engine, including with
+    synthetic exception objects, so the oracle itself is proven strict.
+    """
+    import psycopg
+    sqlstate = getattr(exc, "sqlstate", None)
+    case.assertEqual(
+        CHECK_VIOLATION, sqlstate,
+        "%s: expected check_violation (23514), got %s / sqlstate=%r: %s"
+        % (label, type(exc).__name__, sqlstate, exc))
+    case.assertIsInstance(exc, psycopg.errors.CheckViolation,
+                          "%s: not a psycopg CheckViolation" % label)
+
+
+class CheckViolationOracleTests(unittest.TestCase):
+    """The oracle is strict, proven with NO database and synthetic errors.
+
+    Section 15. A parameter-count mismatch raises ProgrammingError, whose
+    SQLSTATE is not 23514. These tests construct such exceptions directly, so
+    they run without an engine and cannot themselves drift into accepting the
+    wrong failure.
+    """
+
+    def test_oracle_rejects_the_exact_defect_that_was_reported(self):
+        """The original defect shape, asserted directly against the oracle.
+
+        The failing statement was a two-placeholder SELECT given one
+        parameter. Reproducing the exception class here and requiring the
+        oracle to reject it is the regression test for RESIDUAL_B_TEST_DEFECT,
+        and it needs no engine.
+        """
+        import psycopg
+        mismatch = psycopg.errors.ProgrammingError(
+            "the query has 2 placeholders but 1 parameters were passed")
+        self.assertNotEqual(CHECK_VIOLATION,
+                            getattr(mismatch, "sqlstate", None))
+        with self.assertRaises(AssertionError):
+            require_check_violation(self, mismatch, "param mismatch")
+
+    def test_only_a_check_violation_satisfies_the_oracle(self):
+        """Every other failure mode must be rejected, by construction.
+
+        Enumerated in one place so the rejected set is explicit: the original
+        defect's ProgrammingError, plus foreign-key, NOT NULL, overflow and a
+        plain exception with no SQLSTATE at all.
+        """
+        import psycopg
+        rejected = (
+            ("parameter_mismatch", psycopg.errors.ProgrammingError("x")),
+            ("syntax", psycopg.errors.SyntaxError("x")),
+            ("foreign_key", psycopg.errors.ForeignKeyViolation("x")),
+            ("not_null", psycopg.errors.NotNullViolation("x")),
+            ("overflow", psycopg.errors.NumericValueOutOfRange("x")),
+            ("no_sqlstate", ValueError("x")),
+        )
+        for label, exc in rejected:
+            with self.subTest(case=label):
+                self.assertNotEqual(CHECK_VIOLATION,
+                                    getattr(exc, "sqlstate", None))
+                with self.assertRaises(AssertionError):
+                    require_check_violation(self, exc, label)
+
+    def test_check_violation_is_accepted(self):
+        import psycopg
+        require_check_violation(
+            self, psycopg.errors.CheckViolation("synthetic"), "synthetic")
+
+
+class DbTestFamilyCensusTests(unittest.TestCase):
+    """Sections 3, 5, 8: exactly five real DB property families exist.
+
+    Structural and engine-free, so the census is verified even with no
+    database configured. Each family must perform a durable table write
+    against a real committed column, and the oracle must be the strict
+    23514 check, never a bare Exception.
+    """
+
+    FAMILIES = (
+        ("negative_pricing_constrained_write",
+         "test_negative_pricing_rate_is_rejected_by_the_column",
+         "model_pricing"),
+        ("negative_budget_constrained_write",
+         "test_negative_budget_amounts_are_rejected", "job_budgets"),
+        ("numeric_overflow_rollback",
+         "test_oversized_numeric_rolls_back", "model_pricing"),
+        ("huge_cost_durable_persistence_rollback",
+         "test_huge_usage_cost_overflow_rolls_back",
+         "execution_attempts"),
+        ("token_domain_overflow",
+         "test_beyond_bigint_token_counts_are_rejected",
+         "execution_attempts"),
+    )
+
+    def test_the_five_db_gated_methods_are_exactly_the_five_families(self):
+        import inspect
+        gated = sorted(name for name, _ in inspect.getmembers(
+            DatabaseConstraintTests, predicate=inspect.isfunction)
+            if name.startswith("test_"))
+        expected = sorted(name for _, name, _ in self.FAMILIES)
+        self.assertEqual(expected, gated)
+        self.assertEqual(5, len(gated))
+
+    def test_each_family_writes_a_real_table_not_a_bare_select(self):
+        import inspect
+        for family, method, table in self.FAMILIES:
+            source = inspect.getsource(getattr(DatabaseConstraintTests, method))
+            with self.subTest(family=family):
+                self.assertIn(table, source)
+                upper = source.upper()
+                self.assertTrue("INSERT INTO" in upper or "UPDATE" in upper,
+                                "%s must perform a durable table write"
+                                % family)
+
+    def test_no_db_test_relies_on_a_bare_exception_oracle(self):
+        """A generic assertRaises(Exception) must never BE the oracle.
+
+        Where a broad `assertRaises(Exception)` is used, it exists only to
+        CAPTURE the exception so a specific psycopg error class can be
+        asserted immediately afterwards. The test below requires that pairing
+        for every occurrence, so a bare catch can never again stand as
+        evidence of CHECK enforcement.
+        """
+        import inspect
+        for name, _ in inspect.getmembers(
+                DatabaseConstraintTests, predicate=inspect.isfunction):
+            if not name.startswith("test_"):
+                continue
+            source = inspect.getsource(getattr(DatabaseConstraintTests, name))
+            with self.subTest(method=name):
+                self.assertNotIn("self._rejects", source,
+                                 "%s: the old one-parameter helper is gone"
+                                 % name)
+                if "assertRaises(Exception)" not in source:
+                    continue
+                # A broad catch is only legitimate if the method ALSO
+                # asserts a specific psycopg error class (23514 via the
+                # oracle, or a named .errors.X for overflow). Otherwise the
+                # bare catch would be standing in as the oracle.
+                narrows = ("require_check_violation" in source
+                           or ".errors." in source)
+                self.assertTrue(
+                    narrows,
+                    "%s: assertRaises(Exception) must be narrowed to a "
+                    "specific psycopg error class" % name)
+
+    def test_constraint_rejections_route_through_the_strict_oracle(self):
+        """Every 23514 expectation must go through require_check_violation."""
+        import inspect
+        source = inspect.getsource(DatabaseConstraintTests)
+        self.assertIn("require_check_violation", source)
+        # the old one-parameter helper must be entirely absent
+        self.assertNotIn("def _rejects(", source)
+
+
 @unittest.skipUnless(db_available(),
                      "set DEVAI_TEST_DATABASE_URL to run Residual-B "
                      "database tests; reported NOT_TESTED when absent")
 class DatabaseConstraintTests(unittest.TestCase):
-    """Section 23: real engine only. Never faked, never self-passing."""
+    """Section 23: real engine only. Never faked, never self-passing.
+
+    Every negative-value probe below performs a REAL durable write against a
+    REAL constrained column in the committed schema, and requires PostgreSQL
+    SQLSTATE 23514 (check_violation) from the table's own CHECK.
+
+    The earlier version of these tests was invalid evidence: it ran
+    `SELECT %s::numeric(18,8) WHERE %s::numeric(18,8) >= 0` with ONE
+    parameter for TWO placeholders, so psycopg raised ProgrammingError during
+    binding -- before PostgreSQL ever evaluated anything. Wrapped in a bare
+    `assertRaises(Exception)` that passed for the wrong reason, proving
+    nothing about any constraint.
+
+    Two properties are therefore enforced here:
+
+      * The oracle is a specific SQLSTATE, not a generic Exception. A
+        parameter-count mismatch, syntax error, foreign-key violation or
+        NOT NULL violation can no longer satisfy these tests.
+      * The cast is NOT the security oracle. `SELECT (-1)::numeric(18,8)`
+        SUCCEEDS in PostgreSQL, so a load-bearing control asserts that
+        explicitly: the rejection must come from the table CHECK, proven by
+        comparing the bare cast against the constrained write.
+
+    NOTE on NaN, unchanged and honest: in PostgreSQL a numeric NaN compares
+    greater than every other value, so `CHECK (x >= 0)` does NOT exclude NaN.
+    These tests assert the NON-NEGATIVE constraints only. Finiteness is
+    enforced code-side by is_finite(), which is what the pure tests pin. No
+    migration is authorized and none is proposed.
+    """
 
     def setUp(self):
         import psycopg
+        self.psycopg = psycopg
         self.conn = psycopg.connect(os.environ["DEVAI_TEST_DATABASE_URL"])
         self.cur = self.conn.cursor()
+        self.tenant = uuid4()
+        self.job = uuid4()
+        self.task = uuid4()
+        self.pricing_key = "residualb-%s" % uuid4().hex[:12]
+        self._create_fixtures()
 
     def tearDown(self):
-        self.conn.rollback()
-        self.conn.close()
+        try:
+            self.conn.rollback()
+            self._drop_fixtures()
+        finally:
+            self.conn.close()
 
-    def _rejects(self, sql, value):
-        with self.assertRaises(Exception):
+    # -- fixtures -----------------------------------------------------
+    def _create_fixtures(self):
+        with self.conn.transaction():
+            self.cur.execute(
+                "INSERT INTO tenants(id,slug,name) VALUES (%s,%s,%s)",
+                (self.tenant, "rb-%s" % self.tenant.hex[:12], "Residual-B"))
+            self.cur.execute(
+                "INSERT INTO jobs(id,tenant_id,objective,status) "
+                "VALUES (%s,%s,%s,'running')",
+                (self.job, self.tenant, "residual-b constraint probe"))
+            self.cur.execute(
+                "INSERT INTO tasks(id,job_id,external_id,title,description,"
+                "capability,risk,needs_review,status) "
+                "VALUES (%s,%s,%s,%s,%s,'basic','low',FALSE,'running')",
+                (self.task, self.job, "rb-ext-1", "t", "d"))
+            # A legitimate, valid pricing row, so later negative writes are
+            # rejected by the CHECK rather than by a missing fixture.
+            self.cur.execute(
+                "INSERT INTO model_pricing(pricing_key,version,"
+                "input_per_million_usd,output_per_million_usd,active) "
+                "VALUES (%s,1,%s,%s,TRUE)",
+                (self.pricing_key, Decimal("1.5"), Decimal("3")))
+            self.cur.execute(
+                "INSERT INTO job_budgets(job_id,limit_usd) VALUES (%s,%s)",
+                (self.job, Decimal("10")))
+            self.cur.execute(
+                "INSERT INTO execution_attempts(id,job_id,task_id,"
+                "attempt_number,route_key,provider,gateway_model,status,"
+                "billing_mode) VALUES (%s,%s,%s,1,%s,%s,%s,'running','metered')",
+                (uuid4(), self.job, self.task, "standard", "p", "m"))
+
+    def _drop_fixtures(self):
+        with self.conn.transaction():
+            self.cur.execute(
+                "DELETE FROM execution_attempts WHERE job_id=%s", (self.job,))
+            self.cur.execute("DELETE FROM job_budgets WHERE job_id=%s",
+                             (self.job,))
+            self.cur.execute("DELETE FROM model_pricing WHERE pricing_key=%s",
+                             (self.pricing_key,))
+            self.cur.execute("DELETE FROM tasks WHERE job_id=%s", (self.job,))
+            self.cur.execute("DELETE FROM jobs WHERE id=%s", (self.job,))
+            self.cur.execute("DELETE FROM tenants WHERE id=%s", (self.tenant,))
+
+    # -- oracles ------------------------------------------------------
+    def _assert_check_violation(self, sql, params, label):
+        """Require SQLSTATE 23514 from a real constrained write.
+
+        The transaction is expected to abort. On any other outcome the test
+        fails, which is precisely what makes a parameter mismatch
+        impossible to mistake for constraint enforcement.
+        """
+        with self.assertRaises(Exception) as ctx:
             with self.conn.transaction():
-                self.cur.execute(sql, (value,))
+                self.cur.execute(sql, params)
+        require_check_violation(self, ctx.exception, label)
+        return ctx.exception
 
+    def _assert_bare_numeric_cast_succeeds(self, value, label):
+        """Load-bearing control: the CAST is not the security oracle.
+
+        PostgreSQL happily stores -1 in a numeric(18,8) expression. Only the
+        table's CHECK rejects it. If this control ever started failing, the
+        negative-write tests would be proving something else entirely.
+        """
+        self.cur.execute("SELECT %s::numeric(18,8)", (value,))
+        row = self.cur.fetchone()
+        self.assertIsNotNone(row, "%s: bare cast returned no row" % label)
+        self.assertEqual(Decimal("-1"), row[0],
+                         "%s: bare cast must round-trip the negative value"
+                         % label)
+
+    def _read_pricing(self):
+        self.cur.execute(
+            "SELECT input_per_million_usd,output_per_million_usd "
+            "FROM model_pricing WHERE pricing_key=%s AND version=1",
+            (self.pricing_key,))
+        return self.cur.fetchone()
+
+    def _read_budget(self):
+        self.cur.execute(
+            "SELECT limit_usd,reserved_usd,spent_usd,"
+            "recovery_exposure_usd,unpriced_exposure_usd "
+            "FROM job_budgets WHERE job_id=%s", (self.job,))
+        return self.cur.fetchone()
+
+    # -- A. negative pricing, real constrained write ------------------
     def test_negative_pricing_rate_is_rejected_by_the_column(self):
-        self._rejects("SELECT %s::numeric(18,8) WHERE %s::numeric(18,8) >= 0",
-                      Decimal("-1"))
+        """Real INSERT and UPDATE against model_pricing; require 23514."""
+        before = self._read_pricing()
+        self.assertEqual((Decimal("1.5"), Decimal("3")), before)
 
+        self._assert_bare_numeric_cast_succeeds(
+            Decimal("-1"), "negative pricing bare cast")
+
+        self._assert_check_violation(
+            "INSERT INTO model_pricing(pricing_key,version,"
+            "input_per_million_usd,output_per_million_usd,active) "
+            "VALUES (%s,2,%s,%s,TRUE)",
+            ("%s-neg" % self.pricing_key, Decimal("-1"), Decimal("1")),
+            "negative input_per_million_usd INSERT")
+
+        self._assert_check_violation(
+            "UPDATE model_pricing SET input_per_million_usd=%s "
+            "WHERE pricing_key=%s AND version=1",
+            (Decimal("-1"), self.pricing_key),
+            "negative input_per_million_usd UPDATE")
+
+        self._assert_check_violation(
+            "UPDATE model_pricing SET output_per_million_usd=%s "
+            "WHERE pricing_key=%s AND version=1",
+            (Decimal("-0.00000001"), self.pricing_key),
+            "negative output_per_million_usd UPDATE")
+
+        # Independent re-read in a clean transaction: nothing negative
+        # persisted, and the valid fixture is untouched.
+        self.conn.rollback()
+        self.assertEqual((Decimal("1.5"), Decimal("3")),
+                         self._read_pricing())
+        self.cur.execute(
+            "SELECT count(*) FROM model_pricing WHERE pricing_key=%s",
+            ("%s-neg" % self.pricing_key,))
+        self.assertEqual(0, self.cur.fetchone()[0],
+                         "the rejected negative pricing row must not exist")
+
+    # -- B. negative budget amounts, real constrained writes ----------
     def test_negative_budget_amounts_are_rejected(self):
-        for column in ("reserved_usd", "spent_usd", "recovery_exposure_usd",
-                       "unpriced_exposure_usd"):
-            with self.subTest(column=column):
-                self._rejects(
-                    "SELECT %s::numeric(18,8) WHERE %s::numeric(18,8) >= 0",
-                    Decimal("-1"))
+        """Real UPDATE against each constrained job_budgets column."""
+        before = self._read_budget()
+        self.assertEqual((Decimal("10"), Decimal("0"), Decimal("0"),
+                          Decimal("0"), Decimal("0")), before)
 
+        self._assert_bare_numeric_cast_succeeds(
+            Decimal("-1"), "negative budget bare cast")
+
+        for column in ("reserved_usd", "spent_usd",
+                       "recovery_exposure_usd", "unpriced_exposure_usd"):
+            with self.subTest(column=column):
+                self._assert_check_violation(
+                    "UPDATE job_budgets SET %s=%%s WHERE job_id=%%s"
+                    % column,
+                    (Decimal("-1"), self.job),
+                    "negative %s UPDATE" % column)
+
+        # limit_usd carries a strict > 0 constraint, so zero is invalid too.
+        self._assert_check_violation(
+            "UPDATE job_budgets SET limit_usd=%s WHERE job_id=%s",
+            (Decimal("0"), self.job), "zero limit_usd UPDATE")
+
+        # Independent re-read after rollback.
+        self.conn.rollback()
+        self.assertEqual(before, self._read_budget())
+        for value in self._read_budget():
+            self.assertGreaterEqual(value, 0,
+                                    "no negative budget amount may persist")
+
+    # -- C. NUMERIC(18,8) overflow, real write ------------------------
     def test_oversized_numeric_rolls_back(self):
-        with self.assertRaises(Exception):
+        """A real constrained write that overflows numeric(18,8)."""
+        before = self._read_pricing()
+        with self.assertRaises(Exception) as ctx:
             with self.conn.transaction():
                 self.cur.execute(
-                    "SELECT %s::numeric(18,8)", (Decimal("1e40"),))
+                    "UPDATE model_pricing SET input_per_million_usd=%s "
+                    "WHERE pricing_key=%s AND version=1",
+                    (Decimal("1e40"), self.pricing_key))
+        self.assertNotEqual(self.CHECK_VIOLATION,
+                            getattr(ctx.exception, "sqlstate", None),
+                            "overflow is not a check violation")
+        self.assertIsInstance(ctx.exception,
+                              self.psycopg.errors.NumericValueOutOfRange)
+        self.conn.rollback()
+        self.assertEqual(before, self._read_pricing())
 
+    # -- D. huge calculated monetary value at durable persistence -----
     def test_huge_usage_cost_overflow_rolls_back(self):
-        with self.assertRaises(Exception):
+        """A real calculate_cost result written to a durable cost column."""
+        huge = calculate_cost(price(), 10 ** 50, 0)
+        self.assertGreater(huge, Decimal(10 ** 10))
+        self.cur.execute("SELECT reserved_cost_usd,reconciled_cost_usd "
+                         "FROM execution_attempts WHERE job_id=%s", (self.job,))
+        before = self.cur.fetchone()
+        self.assertEqual((None, None), before)
+        with self.assertRaises(Exception) as ctx:
             with self.conn.transaction():
-                self.cur.execute("SELECT %s::numeric(18,8)",
-                                 (calculate_cost(price(), 10 ** 50, 0),))
+                self.cur.execute(
+                    "UPDATE execution_attempts SET reconciled_cost_usd=%s "
+                    "WHERE job_id=%s", (huge, self.job))
+        self.assertIsInstance(ctx.exception,
+                              self.psycopg.errors.NumericValueOutOfRange)
+        self.conn.rollback()
+        self.cur.execute("SELECT reserved_cost_usd,reconciled_cost_usd "
+                         "FROM execution_attempts WHERE job_id=%s", (self.job,))
+        self.assertEqual((None, None), self.cur.fetchone(),
+                         "the oversized cost must not have persisted")
 
+    # -- E. token durable-domain overflow ----------------------------
     def test_beyond_bigint_token_counts_are_rejected(self):
-        with self.assertRaises(Exception):
-            with self.conn.transaction():
-                self.cur.execute("SELECT %s::bigint", (10 ** 50,))
+        """A real write to execution_attempts.prompt_tokens (BIGINT)."""
+        self.cur.execute("SELECT prompt_tokens,completion_tokens "
+                         "FROM execution_attempts WHERE job_id=%s", (self.job,))
+        self.assertEqual((None, None), self.cur.fetchone())
+        for value in (10 ** 50, 10 ** 1000):
+            with self.subTest(magnitude=len(str(value))):
+                with self.assertRaises(Exception) as ctx:
+                    with self.conn.transaction():
+                        self.cur.execute(
+                            "UPDATE execution_attempts SET prompt_tokens=%s "
+                            "WHERE job_id=%s", (value, self.job))
+                self.assertIsInstance(
+                    ctx.exception,
+                    self.psycopg.errors.NumericValueOutOfRange)
+                self.conn.rollback()
+        self.cur.execute("SELECT prompt_tokens FROM execution_attempts "
+                         "WHERE job_id=%s", (self.job,))
+        self.assertIsNone(self.cur.fetchone()[0],
+                          "oversized token counts must not have persisted")
+
+    # The five gated property families are exactly the five test methods
+    # above. No extra gated tests live here: the oracle's own strictness is
+    # unit-tested engine-free in CheckViolationOracleTests, and the family
+    # census is structural in DbTestFamilyCensusTests, so this class stays at
+    # exactly five skips-or-executions.
