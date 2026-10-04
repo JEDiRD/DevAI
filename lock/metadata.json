@@ -1,0 +1,48 @@
+{
+  "format_version": "1",
+  "python_version": "3.13.16",
+  "python_implementation": "CPython",
+  "pip_tools_version": "7.6.1",
+  "requirements_sha256": "275bdf2469a4d401813ec8a90fe63494ca5324ef6a6466c5904184cbdf6166ad",
+  "requirements_file": "requirements.in",
+  "linux": {
+    "lock_file": "lock/linux-cp313.txt",
+    "os": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "arch": "x86_64",
+    "libc": "glibc-2.39",
+    "pip_version": "26.2.1",
+    "lock_sha256": "05c9744beb969acc37b4a89eb61cb4d618291d53ae975ddab5503765c94c9560",
+    "lock_file_size": 19857,
+    "resolved_package_count": 19,
+    "freeze_sha256": "7818d0d6ed5637f340c3e75eaa3738cd9282dc215804526f00404012b8f2a7a2"
+  },
+  "windows": {
+    "lock_file": "lock/windows-cp313.txt",
+    "os": "Windows-2025Server-10.0.26100-SP0",
+    "arch": "AMD64",
+    "pip_version": "26.2.1",
+    "lock_sha256": "a2647d678c0029d8ce0e5ce696ab342327cc929fb3e96988bb1665d7e771d125",
+    "lock_file_size": 20062,
+    "resolved_package_count": 20,
+    "freeze_sha256": "f3c36c666eecdb5465ba1d82454ce0dd1845d6b36c6fc34c8927f90dd0f3de30"
+  },
+  "generation": {
+    "semantics": "Each platform lock is resolved natively by CPython 3.13.16 on that platform's x86_64 runner. No --platform flag is used, so no cross-resolution occurs. Both locks were generated twice in independent directories and matched byte-for-byte.",
+    "generation_command_template": "python -m piptools compile --generate-hashes --resolver=backtracking --output-file <platform-lock> requirements.in",
+    "resolver": "backtracking",
+    "hashes": "sha256 via --generate-hashes",
+    "header_policy": "Raw pip-compile output is committed verbatim. The header records only the relative output filename and contains no absolute path or machine identity."
+  },
+  "validation": {
+    "hashed_installs_per_platform": 2,
+    "hashed_install_result": "PASS",
+    "pip_check_runs_per_platform": 2,
+    "pip_check_result": "PASS",
+    "lock_regeneration_match": "YES",
+    "same_platform_freeze_diff": "NONE",
+    "secret_and_path_scan": "CLEAN",
+    "install_command_template": "pip install --require-hashes -r lock/<platform>.txt",
+    "ranged_requirements_permitted_for_release": false
+  },
+  "identity_note": "Fields above are identity-critical and contain no timestamps, CI temp paths, credentials, or user paths. Only os/libc/arch describe the generating environment, which is the evidence of native resolution."
+}

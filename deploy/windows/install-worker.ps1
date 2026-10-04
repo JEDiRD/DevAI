@@ -1,67 +1,47 @@
-param([Parameter(Mandatory=$true)][string]$PackageRoot,[switch]$ValidateOnly,[switch]$ResumeServiceCreation,[switch]$InspectInstall)
+param([Parameter(Mandatory=$true)][string]$PackageRoot,
+      [switch]$ValidateOnly,
+      [switch]$ResumeServiceCreation,
+      [switch]$InspectInstall,
+      [string]$WorkerId='',
+      [string]$ApiBaseUrl='',
+      [string]$ExistingConfig='',
+      [switch]$ReusePersonalFixture)
 $ErrorActionPreference='Stop'
-function Assert-PackageEntryName([string]$Name) {
-  $parts=$Name -split '[\\/]'
-  if ([string]::IsNullOrWhiteSpace($Name) -or [IO.Path]::IsPathRooted($Name) -or
-      $parts -contains '..' -or $parts -contains '.' -or $parts -contains '' -or $Name.Contains(':')) {
-    throw 'UNSAFE_PACKAGE_PATH'
-  }
-}
+# Helpers are loaded BEFORE any validation so the authoritative manifest and
+# target-state implementations are used instead of a forked copy here.
+. (Join-Path $PSScriptRoot 'install-support.ps1')
 
 $PackageRoot=(Resolve-Path -LiteralPath $PackageRoot).Path
-for ($parent=Get-Item -LiteralPath $PackageRoot; $null -ne $parent; $parent=$parent.Parent) {
-  if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'PACKAGE_ANCESTOR_REPARSE_POINT' }
-}
-$manifestPath=Join-Path $PackageRoot 'package.json'
-$manifestItem=Get-Item -LiteralPath $manifestPath
-if ($manifestItem.PSIsContainer -or ($manifestItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'UNSAFE_PACKAGE_MANIFEST' }
-$package=Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-if (@($package.PSObject.Properties.Name | Where-Object {$_ -notin @('worker_id','api_base_url','personal_denial_fixture','files')}).Count) { throw 'INVALID_PACKAGE_METADATA' }
-$workerId=[Guid]::Empty
-if (![Guid]::TryParse($package.worker_id,[ref]$workerId) -or $workerId -eq [Guid]::Empty) { throw 'INVALID_PACKAGE_WORKER_ID' }
-$origin=$null
-$address=[Net.IPAddress]::None
-if (![Uri]::TryCreate($package.api_base_url,[UriKind]::Absolute,[ref]$origin) -or
-    $origin.Scheme -notin @('http','https') -or $origin.UserInfo -or $origin.AbsolutePath -ne '/' -or
-    $origin.Query -or $origin.Fragment -or ![Net.IPAddress]::TryParse($origin.Host,[ref]$address)) { throw 'INVALID_PACKAGE_API_ORIGIN' }
-$bytes=$address.GetAddressBytes()
-if (![Net.IPAddress]::IsLoopback($address) -and !($bytes.Length -eq 4 -and $bytes[0] -eq 100 -and $bytes[1] -ge 64 -and $bytes[1] -le 127)) { throw 'INVALID_PACKAGE_API_ORIGIN' }
-if (![IO.Path]::IsPathRooted($package.personal_denial_fixture)) { throw 'INVALID_PERSONAL_FIXTURE_PATH' }
-$fixtureItem=Get-Item -LiteralPath $package.personal_denial_fixture -Force
-if ($fixtureItem.PSIsContainer -or ($fixtureItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'INVALID_PERSONAL_FIXTURE_PATH' }
-for ($parent=$fixtureItem.Directory; $null -ne $parent; $parent=$parent.Parent) {
-  if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'INVALID_PERSONAL_FIXTURE_PATH' }
-}
-if ($null -eq $package.files -or @($package.files.PSObject.Properties).Count -eq 0) { throw 'EMPTY_PACKAGE_MANIFEST' }
-$validatedFiles=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-foreach ($entry in $package.files.PSObject.Properties) {
-  Assert-PackageEntryName $entry.Name
-  $path=[IO.Path]::GetFullPath((Join-Path $PackageRoot $entry.Name))
-  if (!$path.StartsWith($PackageRoot+'\',[StringComparison]::OrdinalIgnoreCase) -or !$validatedFiles.Add($path)) { throw 'UNSAFE_PACKAGE_PATH' }
-  if ($entry.Value -notmatch '^[a-f0-9]{64}$') { throw 'INVALID_PACKAGE_DIGEST' }
-  $item=Get-Item -LiteralPath $path
-  if ($item.PSIsContainer) { throw 'PACKAGE_ENTRY_MUST_BE_FILE' }
-  for ($parent=$item.Directory; $parent.FullName -ne $PackageRoot; $parent=$parent.Parent) {
-    if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'PACKAGE_ANCESTOR_REPARSE_POINT' }
-  }
-  if ((Get-Item -LiteralPath $path).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'PACKAGE_REPARSE_POINT' }
-  if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $entry.Value) { throw 'PACKAGE_INTEGRITY_FAILED' }
-}
-# Copy-Item must not later copy files absent from the validated manifest. Inspect
-# one directory at a time; reject reparse points before descending into them.
-$directories=[Collections.Generic.Stack[string]]::new()
-$directories.Push($PackageRoot)
-while ($directories.Count) {
-  foreach ($item in Get-ChildItem -LiteralPath $directories.Pop() -Force) {
-    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'PACKAGE_REPARSE_POINT' }
-    if ($item.PSIsContainer) { $directories.Push($item.FullName) }
-    elseif ($item.FullName -ne $manifestPath -and !$validatedFiles.Contains($item.FullName)) { throw 'UNMANIFESTED_PACKAGE_FILE' }
-  }
-}
-foreach ($required in @('install-worker.ps1','install-support.ps1','worker.dpapi','host-runtime/python.exe','sandbox-runtime/python.exe','control/worker_agent/windows_service.py')) {
-  if (!$validatedFiles.Contains([IO.Path]::GetFullPath((Join-Path $PackageRoot $required)))) { throw 'REQUIRED_PACKAGE_FILE_MISSING' }
-}
+
+# A package.json-only artifact is a legacy release format. Fail clearly; never
+# crash on a missing property and never dual-read.
+$hasLegacy=Test-Path -LiteralPath (Join-Path $PackageRoot 'package.json')
+$hasRelease=Test-Path -LiteralPath (Join-Path $PackageRoot 'manifest.json')
+if ($hasLegacy -and !$hasRelease) { throw 'UNSUPPORTED_LEGACY_PACKAGE_FORMAT' }
+
+# --- IMMUTABLE RELEASE VERIFICATION (no target mutation may precede this) ---
+$manifest=Read-ReleaseManifest $PackageRoot
+$verifiedFiles=Assert-ManifestPayload $PackageRoot $manifest | Out-Null
+Assert-ManifestRequiredMembers $manifest @(
+  'install-worker.ps1','install-support.ps1','control/worker_agent/windows_service.py')
+# Recompute the V2 identity aggregate from verified payload bytes and compare.
+Assert-ManifestIdentityAggregate $PackageRoot $manifest | Out-Null
+
 if ($ValidateOnly) { Write-Output 'DEVAI_PACKAGE_VALIDATED'; return }
+
+# --- TARGET IDENTITY (read-only; never mutates the target) ---
+# Identity and endpoint are TARGET CONFIG. They are never concrete data in
+# manifest.json. A fresh install must supply both; -ExistingConfig is
+# explicit-only and validated here. Disagreement between CLI and config fails
+# closed: there is deliberately NO precedence rule.
+$stateRoot=Join-Path $env:ProgramData 'DevAIWorker'
+$existingConfig=$null
+if ($ExistingConfig) {
+  if (!(Test-Path -LiteralPath $ExistingConfig -PathType Leaf)) { throw 'EXISTING_CONFIG_MISSING' }
+  $existingConfig=Read-TargetServiceConfig $ExistingConfig
+  if ($null -eq $existingConfig) { throw 'EXISTING_CONFIG_INVALID' }
+}
+$identity=Resolve-TargetIdentity -CliWorkerId $WorkerId -CliApiBaseUrl $ApiBaseUrl -Config $existingConfig
 
 # Installation boundary: package validation above performs read-only operations.
 $admin=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -72,14 +52,17 @@ $stateRoot=Join-Path $env:ProgramData 'DevAIWorker'
 if ($InspectInstall -and !$ResumeServiceCreation) { throw 'INSPECT_REQUIRES_EXPLICIT_RESUME' }
 if ($ResumeServiceCreation) {
   # Entire existing installation and volume are checked read-only FIRST.
-  $partial=Assert-PartialWorkerInstall $installRoot $stateRoot $package
+  $partial=Assert-PartialWorkerInstall $installRoot $stateRoot $manifest
   Write-Output (@{partial_install_validated=$true;volume=$partial.volume;volume_reformatted=$false} | ConvertTo-Json -Depth 4 -Compress)
   if ($InspectInstall) { return }
   # Preserve credential/config/VHDX/workspaces. Upgrade only this manifested
   # mount helper to suppress automatic drive letters on subsequent boots.
-  $helper=Join-Path $installRoot 'control/worker_agent/volume_host.py'
-  Copy-Item -LiteralPath (Join-Path $PackageRoot 'control/worker_agent/volume_host.py') -Destination $helper
-  $partial.manifest.'control/worker_agent/volume_host.py'=$package.files.'control/worker_agent/volume_host.py'
+  $helperRelative='control/worker_agent/volume_host.py'
+  $helper=Join-Path $installRoot $helperRelative
+  Copy-Item -LiteralPath (Join-Path $PackageRoot $helperRelative) -Destination $helper
+  # The expected digest comes from the verified release manifest, never from the
+  # installed-tree manifest that is being updated here.
+  $partial.manifest.$helperRelative=Get-ManifestFileDigest $manifest $helperRelative
   [IO.File]::WriteAllText($partial.manifest_file,($partial.manifest | ConvertTo-Json -Depth 3))
   $manifestAcl=Get-Acl -LiteralPath $partial.manifest_file
   $manifestAcl.SetAccessRuleProtection($true,$true)
@@ -156,26 +139,60 @@ Set-ManagedAcl $vhd '' '' $false
 Set-ManagedAcl $attachFile '' '' $false
 
 $credential=Join-Path $stateRoot 'credentials/worker.dpapi'
-Copy-Item -LiteralPath (Join-Path $PackageRoot 'worker.dpapi') -Destination $credential
-Set-ManagedAcl $credential $serviceSid 'Read' $false
 $runtime=Join-Path $installRoot 'sandbox-runtime'
+
+# --- TARGET PROVISIONING ORDER: fixture -> service.json -> credential ---
+# worker.dpapi is NEVER a release artifact. It is provisioned on the target by
+# the packaged pinned runtime invoking the existing, byte-identical
+# worker_agent.provision primitive, with the token delivered only over stdin.
+$operatorSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$fixture=New-TargetPersonalDenialFixture -ProfileRoot $env:USERPROFILE -OwnerSid $operatorSid
+Assert-TargetPersonalDenialFixture -Fixture $fixture -OwnerSid $operatorSid -ServiceSid $serviceSid
+
 $config=@{
- worker_id=$package.worker_id;api_base_url=$package.api_base_url;heartbeat_seconds=20;poll_seconds=2;
- credential_path=$credential;service_sid=$serviceSid;volume_guid=$volume;sandbox_runtime=$runtime;
- sandbox_executable_sha256=(Get-FileHash -LiteralPath (Join-Path $runtime 'python.exe')).Hash.ToLowerInvariant();
- sandbox_payload_sha256=(Get-FileHash -LiteralPath (Join-Path $runtime 'synthetic_process.py')).Hash.ToLowerInvariant()
- personal_denial_fixture=$package.personal_denial_fixture
+worker_id=$identity.WorkerId;api_base_url=$identity.ApiBaseUrl;heartbeat_seconds=20;poll_seconds=2;
+credential_path=$credential;service_sid=$serviceSid;volume_guid=$volume;sandbox_runtime=$runtime;
+sandbox_executable_sha256=(Get-FileHash -LiteralPath (Join-Path $runtime 'python.exe')).Hash.ToLowerInvariant();
+sandbox_payload_sha256=(Get-FileHash -LiteralPath (Join-Path $runtime 'synthetic_process.py')).Hash.ToLowerInvariant();
+personal_denial_fixture=$fixture
 }
 $configFile=Join-Path $stateRoot 'service.json'
 [IO.File]::WriteAllText($configFile,($config | ConvertTo-Json))
 Set-ManagedAcl $configFile $serviceSid 'Read' $false
-$manifest=@{}
+
+# An ordinary reinstall must NOT silently overwrite an existing credential.
+# Presence, path and ACL are validated; the DPAPI blob is never decrypted or
+# re-derived here, so a stale-but-present credential cannot be detected beyond
+# those checks (documented limitation; no decryption logic is invented).
+if (Test-TargetCredentialPresent $credential) {
+  Assert-ManagedPrivateAcl $credential $serviceSid
+  Write-Output 'DEVAI_EXISTING_CREDENTIAL_PRESERVED'
+} else {
+  $secure=Read-Host -Prompt 'Worker token' -AsSecureString
+  $bstr=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+  try {
+    $plain=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    # Narrow conversion for redirected stdin only. Managed copies are NOT
+    # claimed to be cryptographically erasable; the requirement is no durable,
+    # loggable or process-metadata exposure.
+    Invoke-TargetCredentialProvisioning -InstallRoot $installRoot -RuntimeRoot (Join-Path $installRoot 'host-runtime') -WorkerId $identity.WorkerId -CredentialPath $credential -Token $plain
+  } finally {
+    $plain=$null
+    if ($bstr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+  }
+}
+# Fail closed: the service must never start without a credential on disk.
+if (!(Test-TargetCredentialPresent $credential)) { throw 'CREDENTIAL_PROVISIONING_FAILED' }
+
+# Installed-tree manifest. This is a DIFFERENT artifact from the release-root
+# manifest.json contract and is deliberately named apart from it.
+$installedTreeManifest=@{}
 Get-ChildItem -LiteralPath $installRoot -Recurse -File | ForEach-Object {
   $relative=$_.FullName.Substring($installRoot.Length+1).Replace('\','/')
-  $manifest[$relative]=(Get-FileHash -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+  $installedTreeManifest[$relative]=(Get-FileHash -LiteralPath $_.FullName).Hash.ToLowerInvariant()
 }
 $manifestFile=Join-Path $installRoot 'manifest.json'
-[IO.File]::WriteAllText($manifestFile,($manifest | ConvertTo-Json -Depth 3))
+[IO.File]::WriteAllText($manifestFile,($installedTreeManifest | ConvertTo-Json -Depth 3))
 Set-ManagedAcl $manifestFile $serviceSid 'Read' $false
 
 $base=Get-WorkerServiceCommand $installRoot $configFile

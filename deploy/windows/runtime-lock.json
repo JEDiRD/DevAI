@@ -1,0 +1,18 @@
+{
+  "lock_format_version": "1",
+  "python_version": "3.13.16",
+  "python_implementation": "CPython",
+  "architecture": "x86_64",
+  "windows_architecture": "AMD64",
+  "runtime_artifact_type": "python-embeddable-amd64",
+  "source_url": "https://www.python.org/ftp/python/3.13.16/python-3.13.16-embed-amd64.zip",
+  "source_sha256": "97dae5274cc54867065e8d5a3226e48c35017ed332a0fdb0e27d5b5821961297",
+  "source_size_bytes": 11439094,
+  "platform": "win32",
+  "notes": "The build MUST verify source_sha256 against the downloaded artifact on every run and MUST fail closed on mismatch. Host Python (sys.base_prefix / sys.executable) must never determine package identity. No mutable or unverified runtime bytes are stored in this repository.",
+  "verification_evidence": {
+    "verified_by": "independent download of the official python.org artifact and locally computed SHA256",
+    "result": "match",
+    "reverification_required": true
+  }
+}

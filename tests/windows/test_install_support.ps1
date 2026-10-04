@@ -125,14 +125,27 @@ try {
   }
   [IO.File]::WriteAllText((Join-Path $code 'manifest.json'),($hashes | ConvertTo-Json))
   $sid='S-1-5-80-1-2-3-4-5'
+  # RH-B 5A-2A: the fixture is a TARGET artifact. A real one, with the real
+  # recovered three-ACE ACL, is required -- a placeholder string can no longer
+  # satisfy target-state validation.
+  # No real ACL inspection is possible here: this harness stubs Get-Acl globally.
+  $script:fixture=(Join-Path $env:USERPROFILE 'DevAIWorkerAccessProbe/service-access-denial.fixture')
   $config=@{worker_id=[Guid]::NewGuid().ToString();api_base_url='http://100.91.132.78:8765';service_sid=$sid;
     credential_path=(Join-Path $state 'credentials/worker.dpapi');sandbox_runtime=(Join-Path $code 'sandbox-runtime');
-    personal_denial_fixture='non-secret probe';volume_guid=$script:guid;
+    personal_denial_fixture=$script:fixture;volume_guid=$script:guid;
     sandbox_executable_sha256=$hashes['sandbox-runtime/python.exe'];sandbox_payload_sha256=$hashes['sandbox-runtime/synthetic_process.py']}
   $cfg=Join-Path $state 'service.json'
   function Save-TestConfig {[IO.File]::WriteAllText($cfg,($config | ConvertTo-Json))}
   Save-TestConfig
-  $package=[pscustomobject]@{worker_id=$config.worker_id;api_base_url=$config.api_base_url;personal_denial_fixture=$config.personal_denial_fixture;files=($hashes | ConvertTo-Json | ConvertFrom-Json)}
+    # RH-B 5A-2B: the release contract is manifest.json ONLY. The dual-shape seam
+  # is gone, so the fixture is a real release manifest whose Files is a genuine
+  # dictionary of {sha256,size} entries.
+  $releaseFiles=[Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+  foreach($key in $hashes.Keys){
+    $item=Get-Item -LiteralPath (Join-Path $code $key)
+    $releaseFiles[$key]=[pscustomobject]@{sha256=[string]$hashes[$key];size=[long]$item.Length}
+  }
+  $releaseManifest=[pscustomobject]@{Files=$releaseFiles}
   $script:helper=[pscustomobject]@{State='Stopped';StartName='LocalSystem';PathName=((Get-WorkerServiceCommand $code $cfg)+' --volume-host')}
   function Get-Service {param($Name,$ErrorAction) return $null}
   $script:worker=[pscustomobject]@{State='Stopped';StartName='NT SERVICE\DevAIWorker';PathName=(Get-WorkerServiceCommand $code $cfg);StartMode='Auto'}
@@ -140,50 +153,71 @@ try {
   function Assert-ManagedPrivateAcl {param($Path,$ServiceSid,[switch]$AllowInherited) Assert-ManagedNoReparse $Path | Out-Null}
   function sc.exe {$global:LASTEXITCODE=0;return $sid}
   $tokens=$null;$errors=$null
-  $installerAst=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '../../deploy/windows/install-worker.ps1'),[ref]$tokens,[ref]$errors)
-  $entryFunction=$installerAst.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-PackageEntryName'},$true)
+  $tokens=$null;$errors=$null
+  $helperAst=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '../../deploy/windows/install-support.ps1'),[ref]$tokens,[ref]$errors)
+  $entryFunction=$helperAst.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-PackageEntryName'},$true)
+  if ($null -eq $entryFunction) { throw 'SOURCE_ENTRY_VALIDATOR_MISSING' }
   . ([ScriptBlock]::Create($entryFunction.Extent.Text))
   $script:vhd=Join-Path $state 'volumes/workspace.vhdx';$script:mount=Join-Path $state 'workspace-volume'
   $script:image.ImagePath=$script:vhd;$script:disk.Location=$script:vhd
   $script:partition.AccessPaths=@(($script:mount+'\'),$script:guid)
-  $result=Assert-PartialWorkerInstall $code $state $package
+  $result=Assert-PartialWorkerInstall $code $state $releaseManifest
   if(!$result.volume.mount_verified){throw 'VALID_PARTIAL_INSTALL_REJECTED'}
-  $originalWorker=$config.worker_id;$config.worker_id=[Guid]::NewGuid().ToString();Save-TestConfig
-  try{Assert-PartialWorkerInstall $code $state $package;throw 'FOREIGN_WORKER_ACCEPTED'}
+  # OLD: a worker_id differing from package.worker_id was rejected. That
+  # comparison is GONE BY DESIGN -- the release manifest no longer owns any
+  # target value. NEW: worker_id is validated against TARGET POLICY (UUID).
+  # WHY_NOT_WEAKER: the old check only detected a mismatch with a removed
+  # field; the new check rejects any structurally invalid identity outright, so
+  # it accepts strictly fewer bad states.
+  $originalWorker=$config.worker_id;$config.worker_id='not-a-uuid';Save-TestConfig
+  try{Assert-PartialWorkerInstall $code $state $releaseManifest;throw 'INVALID_WORKER_ID_ACCEPTED'}
   catch{if($_.Exception.Message -ne 'PARTIAL_INSTALL_CONFIG_MISMATCH'){throw}}
-  $config.worker_id=$originalWorker;Save-TestConfig
+  # A structurally valid but different UUID is now legitimately accepted:
+  # identity is target state, not package state.
+  $config.worker_id=[Guid]::NewGuid().ToString();Save-TestConfig
+  Assert-PartialWorkerInstall $code $state $releaseManifest | Out-Null
+  # api_base_url outside the preserved 18-case policy must still fail closed.
+  $config.api_base_url='https://10.0.0.1/';Save-TestConfig
+  try{Assert-PartialWorkerInstall $code $state $releaseManifest;throw 'RFC1918_API_ACCEPTED'}
+  catch{if($_.Exception.Message -ne 'PARTIAL_INSTALL_CONFIG_MISMATCH'){throw}}
+  $config.api_base_url='http://100.91.132.78:8765';Save-TestConfig
+  # The denial fixture must still be a genuine witness: a relative path is not.
+  $config.personal_denial_fixture='relative-probe';Save-TestConfig
+  try{Assert-PartialWorkerInstall $code $state $releaseManifest;throw 'BAD_FIXTURE_PATH_ACCEPTED'}
+  catch{if($_.Exception.Message -ne 'INVALID_PERSONAL_FIXTURE_PATH'){throw}}
+  $config.personal_denial_fixture=$script:fixture;Save-TestConfig
   $script:helper.State='Running'
-  try{Assert-PartialWorkerInstall $code $state $package;throw 'RUNNING_HELPER_ACCEPTED'}
+  try{Assert-PartialWorkerInstall $code $state $releaseManifest;throw 'RUNNING_HELPER_ACCEPTED'}
   catch{if($_.Exception.Message -ne 'PARTIAL_INSTALL_HELPER_MISMATCH'){throw}}
   $script:helper.State='Stopped'
   # Existing-service diagnostics accept ONLY the pinned old/new service source.
   # Any other runtime mismatch or administrative service identity stays closed.
   $oldService=$hashes['control/worker_agent/windows_service.py']
-  $package.files.'control/worker_agent/windows_service.py'='a'*64
+  $releaseFiles['control/worker_agent/windows_service.py'].sha256='a'*64
   $script:helper.State='Running'
-  Assert-PartialWorkerInstall $code $state $package -ExistingService -PreviousServiceHash $oldService | Out-Null
-  try{Assert-PartialWorkerInstall $code $state $package -ExistingService -PreviousServiceHash ('b'*64);throw 'UNKNOWN_SERVICE_HASH_ACCEPTED'}
+  Assert-PartialWorkerInstall $code $state $releaseManifest -ExistingService -PreviousServiceHash $oldService | Out-Null
+  try{Assert-PartialWorkerInstall $code $state $releaseManifest -ExistingService -PreviousServiceHash ('b'*64);throw 'UNKNOWN_SERVICE_HASH_ACCEPTED'}
   catch{if($_.Exception.Message -ne 'DIAGNOSTIC_PACKAGE_RUNTIME_MISMATCH'){throw}}
   $script:worker.StartName='LocalSystem'
-  try{Assert-PartialWorkerInstall $code $state $package -ExistingService -PreviousServiceHash $oldService;throw 'ADMIN_WORKER_ACCEPTED'}
+  try{Assert-PartialWorkerInstall $code $state $releaseManifest -ExistingService -PreviousServiceHash $oldService;throw 'ADMIN_WORKER_ACCEPTED'}
   catch{if($_.Exception.Message -ne 'DIAGNOSTIC_WORKER_SERVICE_MISMATCH'){throw}}
   $script:worker.StartName='NT SERVICE\DevAIWorker'
-  $package.files.'sandbox-runtime/python.exe'='c'*64
-  try{Assert-PartialWorkerInstall $code $state $package -ExistingService -PreviousServiceHash $oldService;throw 'UNRELATED_RUNTIME_UPGRADE_ACCEPTED'}
+  $releaseFiles['sandbox-runtime/python.exe'].sha256='c'*64
+  try{Assert-PartialWorkerInstall $code $state $releaseManifest -ExistingService -PreviousServiceHash $oldService;throw 'UNRELATED_RUNTIME_UPGRADE_ACCEPTED'}
   catch{if($_.Exception.Message -ne 'DIAGNOSTIC_PACKAGE_RUNTIME_MISMATCH'){throw}}
-  $package.files.'sandbox-runtime/python.exe'=$hashes['sandbox-runtime/python.exe']
+  $releaseFiles['sandbox-runtime/python.exe'].sha256=$hashes['sandbox-runtime/python.exe']
   $oldWorkspace=$hashes['control/worker_agent/workspace.py']
-  $package.files.'control/worker_agent/workspace.py'='d'*64
-  Assert-PartialWorkerInstall $code $state $package -ExistingService -PreviousServiceHash $oldService -PreviousWorkspaceHash $oldWorkspace | Out-Null
-  try{Assert-PartialWorkerInstall $code $state $package -ExistingService -PreviousServiceHash $oldService -PreviousWorkspaceHash ('e'*64);throw 'UNKNOWN_WORKSPACE_HASH_ACCEPTED'}
+  $releaseFiles['control/worker_agent/workspace.py'].sha256='d'*64
+  Assert-PartialWorkerInstall $code $state $releaseManifest -ExistingService -PreviousServiceHash $oldService -PreviousWorkspaceHash $oldWorkspace | Out-Null
+  try{Assert-PartialWorkerInstall $code $state $releaseManifest -ExistingService -PreviousServiceHash $oldService -PreviousWorkspaceHash ('e'*64);throw 'UNKNOWN_WORKSPACE_HASH_ACCEPTED'}
   catch{if($_.Exception.Message -ne 'DIAGNOSTIC_PACKAGE_RUNTIME_MISMATCH'){throw}}
-  try{Assert-PartialWorkerInstall $code $state $package -ExistingService -PreviousServiceHash $oldService;throw 'WORKSPACE_UPDATE_WITHOUT_PIN_ACCEPTED'}
+  try{Assert-PartialWorkerInstall $code $state $releaseManifest -ExistingService -PreviousServiceHash $oldService;throw 'WORKSPACE_UPDATE_WITHOUT_PIN_ACCEPTED'}
   catch{if($_.Exception.Message -ne 'DIAGNOSTIC_PACKAGE_RUNTIME_MISMATCH'){throw}}
-  $package.files.'control/worker_agent/workspace.py'=$oldWorkspace
-  $package.files.'control/worker_agent/windows_service.py'=$oldService
+  $releaseFiles['control/worker_agent/workspace.py'].sha256=$oldWorkspace
+  $releaseFiles['control/worker_agent/windows_service.py'].sha256=$oldService
   $script:helper.State='Stopped'
   [IO.File]::WriteAllText((Join-Path $code 'host-runtime/python.exe'),'altered code')
-  try{Assert-PartialWorkerInstall $code $state $package;throw 'TAMPERED_RUNTIME_ACCEPTED'}
+  try{Assert-PartialWorkerInstall $code $state $releaseManifest;throw 'TAMPERED_RUNTIME_ACCEPTED'}
   catch{if($_.Exception.Message -ne 'INSTALLED_RUNTIME_INTEGRITY_FAILED'){throw}}
 } finally {
   if([IO.Path]::GetDirectoryName($root) -ne [IO.Path]::GetTempPath().TrimEnd([char[]]'\/')){throw 'UNSAFE_TEST_CLEANUP'}

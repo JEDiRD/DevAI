@@ -4,15 +4,29 @@ param(
   [Parameter(Mandatory=$true)][string]$ExpectedInstallerSHA256,
   [Parameter(Mandatory=$true)][string]$ResultPath,
   [switch]$DiagnoseOnly,
-  [switch]$ResumeServiceCreation
+  [switch]$ResumeServiceCreation,
+  [string]$WorkerId='',
+  [string]$ApiBaseUrl='',
+  [string]$ExistingConfig=''
 )
 $ErrorActionPreference='Stop'
 $phase='manifest_hash'
 try {
-  if ((Get-FileHash -LiteralPath (Join-Path $PackageRoot 'package.json') -Algorithm SHA256).Hash.ToLowerInvariant() -ne $ExpectedManifestSHA256) { throw 'PACKAGE_MANIFEST_CHANGED' }
+  # EXTERNAL TRUST ANCHOR. The expected digest is supplied by the caller and is
+  # never embedded in the artifact, so an attacker who rewrites the manifest
+  # (or any file it describes) cannot move the anchor. This is release
+  # authenticity. The manifest's internal V2 aggregate is consistency only.
+  $releaseManifest=Join-Path $PackageRoot 'manifest.json'
+  if (!(Test-Path -LiteralPath $releaseManifest)) { throw 'UNSUPPORTED_LEGACY_PACKAGE_FORMAT' }
+  if ((Get-FileHash -LiteralPath $releaseManifest -Algorithm SHA256).Hash.ToLowerInvariant() -ne $ExpectedManifestSHA256.ToLowerInvariant()) { throw 'PACKAGE_MANIFEST_CHANGED' }
   $phase='installer_hash'
   $installer=Join-Path $PackageRoot 'install-worker.ps1'
-  if ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $ExpectedInstallerSHA256) { throw 'PACKAGE_INSTALLER_CHANGED' }
+    # SECOND, INDEPENDENT EXTERNAL ANCHOR. It authenticates the installer SCRIPT
+    # BYTES that are about to be executed. manifest.json already lists
+    # install-worker.ps1 as a member, but a valid payload manifest does NOT stop
+    # an attacker substituting the script the launcher runs, so this anchor is
+    # preserved deliberately and must not be collapsed into the manifest check.
+  if ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $ExpectedInstallerSHA256.ToLowerInvariant()) { throw 'PACKAGE_INSTALLER_CHANGED' }
   $phase='package_validation'
   & $installer -PackageRoot $PackageRoot -ValidateOnly
   $phase='installation_preflight'
@@ -25,7 +39,7 @@ try {
   $existingState=Test-Path -LiteralPath (Join-Path $programData.FullName 'DevAIWorker')
   if ($DiagnoseOnly) {
     if ($ResumeServiceCreation) {
-      & $installer -PackageRoot $PackageRoot -ResumeServiceCreation -InspectInstall
+      & $installer -PackageRoot $PackageRoot -ResumeServiceCreation -InspectInstall -WorkerId $WorkerId -ApiBaseUrl $ApiBaseUrl -ExistingConfig $ExistingConfig
     }
     $proof=@{diagnostic_only=$true;package_validated=$true;administrator=$admin;service_exists=$service;installation_directory_exists=$existingCode;state_directory_exists=$existingState;process_64_bit=[Environment]::Is64BitProcess;phase=$phase;at=[DateTime]::UtcNow.ToString('o')}
     [IO.File]::WriteAllText($ResultPath,($proof | ConvertTo-Json))
@@ -33,7 +47,7 @@ try {
     return
   }
   $phase='installation'
-  & $installer -PackageRoot $PackageRoot -ResumeServiceCreation:$ResumeServiceCreation
+  & $installer -PackageRoot $PackageRoot -ResumeServiceCreation:$ResumeServiceCreation -WorkerId $WorkerId -ApiBaseUrl $ApiBaseUrl -ExistingConfig $ExistingConfig
   [IO.File]::WriteAllText($ResultPath,(@{completed=$true;phase='completed';at=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json))
 } catch {
   $original=$_

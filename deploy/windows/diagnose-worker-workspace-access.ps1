@@ -111,7 +111,7 @@ function Get-WorkspaceAccessSummary([string]$Label,$Result,[string]$ServiceSid) 
 }
 
 try {
-  if((Get-FileHash -LiteralPath (Join-Path $PackageRoot 'package.json')).Hash.ToLowerInvariant() -cne $ExpectedManifestSHA256){throw 'PACKAGE_MANIFEST_CHANGED'}
+  if((Get-FileHash -LiteralPath (Join-Path $PackageRoot 'manifest.json')).Hash.ToLowerInvariant() -cne $ExpectedManifestSHA256){throw 'PACKAGE_MANIFEST_CHANGED'}
   $installer=Join-Path $PackageRoot 'install-worker.ps1'
   if((Get-FileHash -LiteralPath $installer).Hash.ToLowerInvariant() -cne $ExpectedInstallerSHA256){throw 'PACKAGE_INSTALLER_CHANGED'}
   & $installer -PackageRoot $PackageRoot -ValidateOnly
@@ -119,8 +119,12 @@ try {
   if(!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'ADMINISTRATOR_DIAGNOSTIC_REQUIRED'}
   $code=Join-Path $env:ProgramFiles 'DevAIWorker'
   $state=Join-Path $env:ProgramData 'DevAIWorker'
-  $package=Get-Content -LiteralPath (Join-Path $PackageRoot 'package.json') -Raw | ConvertFrom-Json
   . (Join-Path $PackageRoot 'install-support.ps1')
+  # Immutable release identity. The external caller-supplied digest above
+  # authenticates manifest.json; everything below is verified payload.
+  $releaseManifest=Read-ReleaseManifest $PackageRoot
+  Assert-ManifestPayload $PackageRoot $releaseManifest | Out-Null
+  Assert-ManifestIdentityAggregate $PackageRoot $releaseManifest | Out-Null
   $tokens=$null;$errors=$null
   $ast=[Management.Automation.Language.Parser]::ParseFile($installer,[ref]$tokens,[ref]$errors)
   if($errors.Count){throw 'INSTALLER_SYNTAX_INVALID'}
@@ -128,7 +132,7 @@ try {
   if(!$entry){throw 'PACKAGE_PATH_VALIDATOR_MISSING'}
   . ([ScriptBlock]::Create($entry.Extent.Text))
   # No old hashes: the complete installed inventory must match THIS package.
-  $verified=Assert-PartialWorkerInstall $code $state $package -ExistingService -PreviousServiceHash $package.files.'control/worker_agent/windows_service.py'
+  $verified=Assert-PartialWorkerInstall $code $state $releaseManifest -ExistingService -PreviousServiceHash $releaseManifest.files.'control/worker_agent/windows_service.py'
   $mount=Join-Path $state 'workspace-volume'
   $policy=Get-WorkspaceRootPolicy (Join-Path $state 'volumes/workspace.vhdx') $mount $verified.config.volume_guid $verified.config.service_sid
   Initialize-WorkspaceAccessReader

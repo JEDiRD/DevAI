@@ -1,7 +1,10 @@
 $ErrorActionPreference='Stop'
+# The extracted transaction calls the REAL release-digest helper, so the
+# authoritative implementation is loaded rather than a local reimplementation.
 $path=Join-Path $PSScriptRoot '../../deploy/windows/update-worker-access-diagnostic.ps1'
 $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$errors)
+. (Join-Path $PSScriptRoot '../../deploy/windows/install-support.ps1')
 if($errors.Count){throw 'UPDATE_SYNTAX_INVALID'}
 $blocks=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.TryStatementAst] -and
   $node.Extent.Text.Contains('ACCESS_DIAGNOSTIC_UPDATE_INTEGRITY_FAILED') -and
@@ -40,7 +43,13 @@ try {
     [IO.File]::WriteAllText($manifestFile,($manifest | ConvertTo-Json))
     Copy-Item -LiteralPath $manifestFile -Destination (Join-Path $backup 'manifest.json')
     $verified=@{manifest=$manifest;manifest_file=$manifestFile;config=@{service_sid='test-public-sid'}}
-    $package=@{files=$files}
+    # RH-B 5A-2B: the extracted transaction reads release digests from a
+    # validated manifest.json shape, not from a package.json-shaped object.
+    $releaseFiles=[Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    foreach($prop in $files.PSObject.Properties){
+      $releaseFiles[$prop.Name]=[pscustomobject]@{sha256=[string]$prop.Value;size=0}
+    }
+    $releaseManifest=[pscustomobject]@{Files=$releaseFiles}
     if($fail) {
       try {& $transaction;throw 'CORRUPT_UPDATE_ACCEPTED'}
       catch {if($_.Exception.Message -ne 'ACCESS_DIAGNOSTIC_UPDATE_ROLLED_BACK'){throw}}

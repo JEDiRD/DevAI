@@ -4,14 +4,14 @@ $root=Join-Path ([IO.Path]::GetTempPath()) ('devai-launcher-test-'+[Guid]::NewGu
 [IO.Directory]::CreateDirectory($root) | Out-Null
 try {
   $installer=Join-Path $root 'install-worker.ps1'
-  [IO.File]::WriteAllText((Join-Path $root 'package.json'),'{}')
+  [IO.File]::WriteAllText((Join-Path $root 'manifest.json'),'{}')
   # Deliberately simulate the original failure with secret-bearing exception
   # text. The diagnostic output must preserve location without the text.
   [IO.File]::WriteAllText($installer,@'
 param($PackageRoot,[switch]$ValidateOnly)
 throw [System.Management.Automation.ItemNotFoundException]::new('token=DO_NOT_LOG_THIS_FIXTURE')
 '@)
-  $manifestHash=(Get-FileHash -LiteralPath (Join-Path $root 'package.json')).Hash.ToLowerInvariant()
+  $manifestHash=(Get-FileHash -LiteralPath (Join-Path $root 'manifest.json')).Hash.ToLowerInvariant()
   $installerHash=(Get-FileHash -LiteralPath $installer).Hash.ToLowerInvariant()
   $result=Join-Path $root 'result.json'
   $failed=$false

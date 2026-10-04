@@ -100,7 +100,13 @@ function Get-VerifiedWorkspaceVolume([string]$VhdPath,[string]$Mount,[string]$Ex
   return @{disk_number=[uint32]$disk.Number;file_backed=$true;disk_bytes=134217728;filesystem='NTFS';no_drive_letter=$true;mount_verified=$true}
 }
 
-function Assert-PartialWorkerInstall([string]$InstallRoot,[string]$StateRoot,$Package,[switch]$ExistingService,[string]$PreviousServiceHash,[string]$PreviousWorkspaceHash) {
+function Assert-PartialWorkerInstall([string]$InstallRoot,[string]$StateRoot,$ReleaseManifest,[switch]$ExistingService,[string]$PreviousServiceHash,[string]$PreviousWorkspaceHash) {
+  # RELEASE IDENTITY ONLY. This validator receives a validated release manifest from
+  # Read-ReleaseManifest. There is deliberately no dual-shape handling and no
+  # package.json fallback: exactly one release format exists.
+  $releaseDigests=@{}
+  if ($null -eq $ReleaseManifest) { throw 'RELEASE_DIGEST_SOURCE_UNAVAILABLE' }
+  foreach ($key in $ReleaseManifest.Files.Keys) { $releaseDigests[$key]=[string]$ReleaseManifest.Files[$key].sha256 }
   if (!$ExistingService -and (Get-Service -Name DevAIWorker -ErrorAction Ignore)) { throw 'RESUME_REQUIRES_WORKER_SERVICE_ABSENT' }
   if ($ExistingService -and $PreviousServiceHash -notmatch '^[a-f0-9]{64}$') { throw 'DIAGNOSTIC_PREVIOUS_HASH_REQUIRED' }
   if ($PreviousWorkspaceHash -and (!$ExistingService -or $PreviousWorkspaceHash -notmatch '^[a-f0-9]{64}$')) { throw 'WORKSPACE_PREVIOUS_HASH_INVALID' }
@@ -120,13 +126,35 @@ function Assert-PartialWorkerInstall([string]$InstallRoot,[string]$StateRoot,$Pa
   # code root. Accept that exact legacy state, still checking owner and rights.
   Assert-ManagedPrivateAcl $manifestFile $serviceSid -AllowInherited
   # This config contains paths, IDs and hashes only. Never read/decrypt tokens.
+  #
+  # TARGET values are validated against TARGET POLICY. They are deliberately
+  # NOT compared to package-owned data: the immutable release manifest carries
+  # no concrete worker_id, api_base_url or fixture path, so such a comparison
+  # is no longer meaningful and would blur the two trust domains.
+  # Read directly: Assert-ManagedNoReparse already ran over the state tree above,
+  # and this validator is used where path/Test-Path probing is unavailable.
   $config=Get-Content -LiteralPath $configFile -Raw | ConvertFrom-Json
+  if ($null -eq $config) { throw 'PARTIAL_INSTALL_CONFIG_MISMATCH' }
   $keys=@('worker_id','api_base_url','heartbeat_seconds','poll_seconds','credential_path','service_sid','volume_guid','sandbox_runtime','sandbox_executable_sha256','sandbox_payload_sha256','personal_denial_fixture')
-  if (@($config.PSObject.Properties.Name | Where-Object {$_ -notin $keys}).Count -or
-      $config.worker_id -ne $Package.worker_id -or $config.api_base_url -ne $Package.api_base_url -or
-      $config.service_sid -ne $serviceSid -or $config.personal_denial_fixture -ne $Package.personal_denial_fixture -or
+  if (@($config.PSObject.Properties.Name | Where-Object {$_ -notin $keys}).Count) { throw 'PARTIAL_INSTALL_CONFIG_MISMATCH' }
+  if ($config.service_sid -ne $serviceSid -or
       $config.credential_path -ne (Join-Path $StateRoot 'credentials/worker.dpapi') -or
       $config.sandbox_runtime -ne (Join-Path $InstallRoot 'sandbox-runtime')) { throw 'PARTIAL_INSTALL_CONFIG_MISMATCH' }
+  # Target identity policy: non-empty UUID plus the UNCHANGED ApiBaseUrl matrix.
+  $parsedId=[Guid]::Empty
+  if (![Guid]::TryParse([string]$config.worker_id,[ref]$parsedId) -or $parsedId -eq [Guid]::Empty) { throw 'PARTIAL_INSTALL_CONFIG_MISMATCH' }
+  if (!(Test-TargetApiBaseUrl ([string]$config.api_base_url))) { throw 'PARTIAL_INSTALL_CONFIG_MISMATCH' }
+  # The fixture path must be a genuine absolute target path. The full ACL
+  # witness check (protected DACL, exactly three ACEs, no service-SID ACE) is
+  # enforced where it is created (New-TargetPersonalDenialFixture) and again by
+  # the installer after fixture creation; it is deliberately NOT re-derived here,
+  # because this validator must stay usable where ACL inspection is unavailable.
+  if ([string]::IsNullOrWhiteSpace([string]$config.personal_denial_fixture) -or
+      ![IO.Path]::IsPathRooted([string]$config.personal_denial_fixture)) { throw 'INVALID_PERSONAL_FIXTURE_PATH' }
+  foreach ($forbidden in @($env:ProgramData,$env:ProgramFiles,[IO.Path]::GetTempPath())) {
+    if (![string]::IsNullOrWhiteSpace($forbidden) -and
+        ([string]$config.personal_denial_fixture).StartsWith($forbidden,[StringComparison]::OrdinalIgnoreCase)) { throw 'PERSONAL_FIXTURE_FORBIDDEN_LOCATION' }
+  }
   $base=Get-WorkerServiceCommand $InstallRoot $configFile
   if ($ExistingService) {
     $worker=Get-CimInstance Win32_Service -Filter "Name='DevAIWorker'"
@@ -145,12 +173,13 @@ function Assert-PartialWorkerInstall([string]$InstallRoot,[string]$StateRoot,$Pa
     if (!$path.StartsWith($InstallRoot+'\',[StringComparison]::OrdinalIgnoreCase) -or !$verified.Add($path)) { throw 'INSTALLED_MANIFEST_PATH_INVALID' }
     Assert-ManagedNoReparse $path | Out-Null
     if ($entry.Value -notmatch '^[a-f0-9]{64}$' -or (Get-FileHash -LiteralPath $path).Hash.ToLowerInvariant() -ne $entry.Value) { throw 'INSTALLED_RUNTIME_INTEGRITY_FAILED' }
-    $packaged=$Package.files.PSObject.Properties[$entry.Name]
+    # Immutable release source. NEVER the installed-tree manifest being checked.
+    $packaged=if ($releaseDigests.ContainsKey($entry.Name)) { $releaseDigests[$entry.Name] } else { $null }
     if ($ExistingService) {
-      $allowed=if ($entry.Name -eq 'control/worker_agent/windows_service.py') {@($PreviousServiceHash,$packaged.Value)}
-        elseif ($entry.Name -eq 'control/worker_agent/workspace.py' -and $PreviousWorkspaceHash) {@($PreviousWorkspaceHash,$packaged.Value)} else {@($packaged.Value)}
+      $allowed=if ($entry.Name -eq 'control/worker_agent/windows_service.py') {@($PreviousServiceHash,$packaged)}
+        elseif ($entry.Name -eq 'control/worker_agent/workspace.py' -and $PreviousWorkspaceHash) {@($PreviousWorkspaceHash,$packaged)} else {@($packaged)}
       if (!$packaged -or $entry.Value -notin $allowed) { throw 'DIAGNOSTIC_PACKAGE_RUNTIME_MISMATCH' }
-    } elseif (!$packaged -or ($entry.Name -ne 'control/worker_agent/volume_host.py' -and $entry.Value -ne $packaged.Value)) { throw 'RESUME_PACKAGE_RUNTIME_MISMATCH' }
+    } elseif (!$packaged -or ($entry.Name -ne 'control/worker_agent/volume_host.py' -and $entry.Value -ne $packaged)) { throw 'RESUME_PACKAGE_RUNTIME_MISMATCH' }
   }
   $directories=[Collections.Generic.Stack[string]]::new()
   $directories.Push($InstallRoot)
@@ -263,4 +292,368 @@ function New-PrivateWorkspaceVolume([string]$VhdPath,[string]$Mount) {
   Get-VerifiedWorkspaceVolume $VhdPath $Mount $guid | Out-Null
   Remove-Item -LiteralPath $createFile
   return $guid
+}
+
+# ===========================================================================
+# RH-B 5A-2: authoritative helpers, two DISTINCT trust domains.
+#
+#   A. IMMUTABLE RELEASE  -- manifest.json and the payload it authenticates.
+#   B. TARGET STATE       -- service.json, personal fixture, credential state.
+#
+# These families are deliberately separate. An immutable helper never reads
+# service.json; a target helper never authenticates release payload.
+# ===========================================================================
+
+# --- A. IMMUTABLE RELEASE -------------------------------------------------
+
+function Get-ManifestFormat {
+  # Storage format (JSON contract) and identity serialization (MANIFEST_FORMAT_V2)
+  # are different concepts and are named separately on purpose.
+  'DEVAI_PACKAGE_MANIFEST'
+}
+
+function Get-ManifestIdentityFormat { 'MANIFEST_FORMAT_V2' }
+
+function Read-ReleaseManifest {
+  # Validates schema and entry model BEFORE any entry is trusted.
+  param([Parameter(Mandatory=$true)][string]$PackageRoot)
+  $manifestPath=Join-Path $PackageRoot 'manifest.json'
+  if (!(Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw 'MANIFEST_MISSING' }
+  $raw=[IO.File]::ReadAllBytes($manifestPath)
+  if ($raw.Length -ge 3 -and $raw[0] -eq 0xEF -and $raw[1] -eq 0xBB -and $raw[2] -eq 0xBF) { throw 'MANIFEST_HAS_BOM' }
+  # Windows PowerShell 5.1 pipes a byte array into ConvertFrom-Json element by
+  # element, which silently yields an empty document. Decode first.
+  $text=[Text.Encoding]::UTF8.GetString($raw)
+  try { $document=$text | ConvertFrom-Json } catch { throw 'MANIFEST_NOT_VALID_JSON' }
+  if ($document.manifest_format -ne (Get-ManifestFormat)) { throw 'UNSUPPORTED_MANIFEST_FORMAT' }
+  if ([int]$document.manifest_schema_version -ne 1) { throw 'UNSUPPORTED_MANIFEST_SCHEMA_VERSION' }
+  $files=@($document.files)
+  if ($files.Count -eq 0) { throw 'MANIFEST_FILES_MISSING' }
+  $seen=@{}
+  $table=@{}
+  foreach ($entry in $files) {
+    foreach ($field in @('path','sha256','size')) {
+      if ($null -eq $entry.$field) { throw "MANIFEST_ENTRY_FIELD_MISSING:$field" }
+    }
+    $path=[string]$entry.path
+    if ([string]::IsNullOrWhiteSpace($path)) { throw 'MANIFEST_ENTRY_PATH_INVALID' }
+    if ([IO.Path]::IsPathRooted($path) -or $path.Contains('\') -or $path.Contains(':')) { throw "UNSAFE_MANIFEST_PATH:$path" }
+    foreach ($segment in ($path -split '/')) {
+      if ($segment -eq '' -or $segment -eq '.' -or $segment -eq '..') { throw "UNSAFE_MANIFEST_PATH:$path" }
+    }
+    $folded=$path.ToLowerInvariant()
+    if ($seen.ContainsKey($folded)) { throw "MANIFEST_PATH_COLLISION:$path" }
+    $seen[$folded]=$true
+    if ([string]$entry.sha256 -notmatch '^[0-9a-f]{64}$') { throw "MANIFEST_SHA256_MALFORMED:$path" }
+    $table[$path]=@{ sha256=[string]$entry.sha256; size=[int64]$entry.size }
+  }
+  $aggregate=$document.identity.aggregate_sha256
+  if ([string]$aggregate -notmatch '^[0-9a-f]{64}$') { throw 'MANIFEST_IDENTITY_AGGREGATE_MALFORMED' }
+  return [pscustomobject]@{
+    Document=$document; Files=$table; Aggregate=$aggregate
+    IdentityFormat=[string]$document.identity.format
+    PolicyRequirements=@($document.policy_requirements)
+    Runtime=$document.runtime; DependencyLocks=$document.dependency_locks
+  }
+}
+
+function Assert-PackageEntryName {
+  # Name-shape validation for an entry key of an INSTALLED-TREE manifest (a
+  # different artifact from the release-root manifest contract). Rejects rooted
+  # paths, traversal, empty segments, '.', and drive-qualified names.
+  param([string]$Name)
+  $parts=$Name -split '[\\/]'
+  if ([string]::IsNullOrWhiteSpace($Name) -or [IO.Path]::IsPathRooted($Name) -or
+      $parts -contains '..' -or $parts -contains '.' -or $parts -contains '' -or $Name.Contains(':')) {
+    throw 'UNSAFE_PACKAGE_PATH'
+  }
+}
+
+function Assert-ManifestPathSafe {
+  # Containment: the resolved member must stay inside the release root.
+  param([string]$PackageRoot,[string]$Relative)
+  $rootFull=[IO.Path]::GetFullPath($PackageRoot).TrimEnd('\','/')
+  $target=[IO.Path]::GetFullPath((Join-Path $rootFull $Relative))
+  if (!($target.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase))) {
+    throw "MANIFEST_PATH_ESCAPE:$Relative"
+  }
+}
+
+function Assert-ManifestPayload {
+  # Full immutable integrity gate. Everything here precedes any target mutation.
+  param([Parameter(Mandatory=$true)][string]$PackageRoot,$Manifest)
+  Assert-ManagedNoReparse $PackageRoot
+  for ($parent=$PackageRoot; $null -ne $parent; $parent=$parent.Parent) {
+    if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'PACKAGE_ANCESTOR_REPARSE_POINT' }
+  }
+  $verified=@{}
+  foreach ($relative in ($Manifest.Files.Keys | Sort-Object)) {
+    Assert-ManifestPathSafe $PackageRoot $relative
+    $full=[IO.Path]::GetFullPath((Join-Path $PackageRoot $relative))
+    if (!(Test-Path -LiteralPath $full -PathType Leaf)) { throw "MANIFEST_FILE_MISSING:$relative" }
+    $item=Get-Item -LiteralPath $full -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "MANIFEST_REPARSE_MEMBER:$relative" }
+    if ($item.Length -ne $Manifest.Files[$relative].size) { throw "MANIFEST_SIZE_MISMATCH:$relative" }
+    $digest=(Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($digest -cne $Manifest.Files[$relative].sha256) { throw "MANIFEST_HASH_MISMATCH:$relative" }
+    $verified[$relative]=$digest
+  }
+  foreach ($item in (Get-ChildItem -LiteralPath $PackageRoot -Recurse -Force -File)) {
+    $relative=$item.FullName.Substring($PackageRoot.Length+1).Replace('\','/')
+    if ($relative -eq 'manifest.json') { continue }
+    if (!$verified.ContainsKey($relative)) { throw "UNMANIFESTED_PACKAGE_FILE:$relative" }
+  }
+  return $verified
+}
+
+function Get-ManifestV2Serialization {
+  # MANIFEST_FORMAT_V2 canonical serialization, rebuilt here from ACTUAL
+  # payload bytes: UTF-8, no BOM, LF separators, trailing LF, first line
+  # "# MANIFEST_FORMAT_V2", then UTF-8 byte-sorted identity lines.
+  #
+  # This is an identity algorithm, NOT the storage format. It is recomputed
+  # from verified bytes rather than read from the document, so a manifest
+  # cannot validate itself by asserting its own aggregate.
+  param([Parameter(Mandatory=$true)][string]$PackageRoot,$Manifest)
+  $sb=New-Object Text.StringBuilder
+  [void]$sb.Append('# ' + (Get-ManifestIdentityFormat) + "`n")
+  $sorted=[System.Collections.Generic.List[string]]::new()
+  foreach ($key in $Manifest.Files.Keys) { $sorted.Add($key) }
+  $sorted.Sort([System.Collections.Generic.Comparer[string]]::Create(
+    [System.Comparison[string]]{ param($a,$b)
+      $x=[Text.Encoding]::UTF8.GetBytes($a); $y=[Text.Encoding]::UTF8.GetBytes($b)
+      $n=[Math]::Min($x.Length,$y.Length)
+      for ($i=0;$i -lt $n;$i++) { if ($x[$i] -ne $y[$i]) { return $x[$i] - $y[$i] } }
+      return $x.Length - $y.Length } ))
+  foreach ($relative in $sorted) {
+    $entry=$Manifest.Files[$relative]
+    [void]$sb.Append($entry.sha256 + '  ' + $entry.size + '  ' + $relative + "`n")
+  }
+  return [Text.Encoding]::UTF8.GetBytes($sb.ToString())
+}
+
+function Assert-ManifestIdentityAggregate {
+  # INTERNAL CONSISTENCY ONLY. This proves the document's stored aggregate
+  # matches the payload it describes. It is NOT release authenticity: only an
+  # independently trusted digest (the launcher's ExpectedManifestSHA256)
+  # authenticates the manifest itself. Never present this as authenticity.
+  param([Parameter(Mandatory=$true)][string]$PackageRoot,$Manifest)
+  $bytes=Get-ManifestV2Serialization $PackageRoot $Manifest
+  $sha=[Security.Cryptography.SHA256]::Create()
+  try { $digest=([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','').ToLowerInvariant() }
+  finally { $sha.Dispose() }
+  if ($digest -cne $Manifest.Aggregate) { throw 'MANIFEST_IDENTITY_AGGREGATE_MISMATCH' }
+  return $digest
+}
+
+function Assert-ManifestRequiredMembers {
+  param($Manifest,[string[]]$Required)
+  foreach ($member in $Required) {
+    if (!$Manifest.Files.ContainsKey($member)) { throw "REQUIRED_MANIFEST_MEMBER_MISSING:$member" }
+  }
+}
+
+function Get-ManifestFileDigest {
+  param($Manifest,[string]$Relative)
+  if (!$Manifest.Files.ContainsKey($Relative)) { throw "MANIFEST_FILE_MISSING:$Relative" }
+  return $Manifest.Files[$Relative].sha256
+}
+
+function Assert-ManifestRuntimeIdentity {
+  param($Manifest,$RuntimeLock)
+  if ($null -eq $Manifest.Runtime) { throw 'MANIFEST_RUNTIME_IDENTITY_MISSING' }
+  if ([string]$Manifest.Runtime.python_version -ne [string]$RuntimeLock.python_version) { throw 'RUNTIME_VERSION_MISMATCH' }
+  if ([string]$Manifest.Runtime.source_sha256 -ne [string]$RuntimeLock.source_sha256) { throw 'RUNTIME_SHA256_MISMATCH' }
+}
+
+function Assert-ManifestDependencyLockIdentity {
+  param($Manifest,$LockMetadata,[string]$Platform)
+  $key=if ($Platform -eq 'windows') { 'windows' } else { 'linux' }
+  if ($null -eq $Manifest.DependencyLocks) { throw 'MANIFEST_LOCK_IDENTITY_MISSING' }
+  $declared=$Manifest.DependencyLocks.$key
+  if ($null -eq $declared) { throw "MANIFEST_LOCK_IDENTITY_MISSING:$key" }
+  if ([string]$declared.sha256 -ne [string]$LockMetadata.$key.lock_sha256) { throw "LOCK_IDENTITY_MISMATCH:$key" }
+}
+
+# --- B. TARGET STATE ------------------------------------------------------
+
+function Test-TargetApiBaseUrl {
+  # EXISTING tested policy, preserved verbatim. This is NOT "HTTPS required":
+  # the established behaviour accepts http AND https, and requires a literal
+  # IP host that is loopback or 100.64.0.0/10 (CGNAT). Do not tighten or broaden.
+  param([string]$Url)
+  $origin=$null; $address=$null
+  if (![Uri]::TryCreate($Url,[UriKind]::Absolute,[ref]$origin) -or
+      $origin.Scheme -notin @('http','https') -or $origin.UserInfo -or $origin.AbsolutePath -ne '/' -or
+      $origin.Query -or $origin.Fragment -or ![Net.IPAddress]::TryParse($origin.Host,[ref]$address)) { return $false }
+  $bytes=$address.GetAddressBytes()
+  if (![Net.IPAddress]::IsLoopback($address) -and !($bytes.Length -eq 4 -and $bytes[0] -eq 100 -and $bytes[1] -ge 64 -and $bytes[1] -le 127)) { return $false }
+  return $true
+}
+
+function Assert-TargetApiBaseUrl { param([string]$Url) if (!(Test-TargetApiBaseUrl $Url)) { throw 'INVALID_API_BASE_URL' } }
+
+function Resolve-TargetIdentity {
+  # CLI and ExistingConfig may both supply a value; they must AGREE.
+  # No precedence rule: disagreement fails closed so reinstall cannot silently
+  # change worker identity or endpoint.
+  param([string]$CliWorkerId,[string]$CliApiBaseUrl,$Config)
+  $workerId=$CliWorkerId; $apiBaseUrl=$CliApiBaseUrl
+  if ($null -ne $Config) {
+    $existingWorker=[string]$Config.worker_id
+    $existingApi=[string]$Config.api_base_url
+    if ([string]::IsNullOrWhiteSpace($existingWorker)) { throw 'EXISTING_CONFIG_WORKER_ID_MISSING' }
+    if ([string]::IsNullOrWhiteSpace($existingApi)) { throw 'EXISTING_CONFIG_API_BASE_URL_MISSING' }
+    if ([string]::IsNullOrWhiteSpace($workerId)) { $workerId=$existingWorker }
+    elseif ($workerId -ine $existingWorker) { throw 'WORKER_ID_CONFLICT' }
+    if ([string]::IsNullOrWhiteSpace($apiBaseUrl)) { $apiBaseUrl=$existingApi }
+    elseif ($apiBaseUrl -ine $existingApi) { throw 'API_BASE_URL_CONFLICT' }
+  }
+  if ([string]::IsNullOrWhiteSpace($workerId)) { throw 'WORKER_ID_REQUIRED' }
+  if ([string]::IsNullOrWhiteSpace($apiBaseUrl)) { throw 'API_BASE_URL_REQUIRED' }
+  $parsed=[Guid]::Empty
+  if (![Guid]::TryParse($workerId,[ref]$parsed) -or $parsed -eq [Guid]::Empty) { throw 'INVALID_WORKER_ID' }
+  Assert-TargetApiBaseUrl $apiBaseUrl
+  return [pscustomobject]@{ WorkerId=$workerId; ApiBaseUrl=$apiBaseUrl }
+}
+
+function Read-TargetServiceConfig {
+  param([Parameter(Mandatory=$true)][string]$ConfigFile)
+  if (!(Test-Path -LiteralPath $ConfigFile -PathType Leaf)) { return $null }
+  Assert-ManagedNoReparse $ConfigFile
+  return (Get-Content -LiteralPath $ConfigFile -Raw | ConvertFrom-Json)
+}
+
+function New-TargetPersonalDenialFixture {
+  # Target-side creation of the personal-profile denial witness.
+  #
+  # Reproduces the EXACT security model previously implemented by
+  # worker_agent.prepare_personal_fixture: a protected (non-inherited) DACL
+  # with exactly three full-control allow ACEs (LOCAL SYSTEM, BUILTIN
+  # Administrators, and the installing operator). The worker service identity
+  # is deliberately NOT granted an ACE, which is what makes the runtime
+  # service_personal_profile_denied gate meaningful.
+  #
+  # Location is the installing operator's private profile root, and is never
+  # under AppData (which desktop-app package virtualisation would redirect).
+  param([string]$ProfileRoot,[string]$OwnerSid)
+  if ([string]::IsNullOrWhiteSpace($ProfileRoot) -or ![IO.Path]::IsPathRooted($ProfileRoot)) { throw 'INVALID_PROFILE_ROOT' }
+  if ([string]::IsNullOrWhiteSpace($OwnerSid)) { throw 'INVALID_PROFILE_OWNER' }
+  $leaf=Join-Path $ProfileRoot 'AppData'
+  if ((Split-Path -Leaf $ProfileRoot) -eq 'AppData') { throw 'PROFILE_ROOT_INSIDE_APPDATA' }
+  $probeRoot=Join-Path $ProfileRoot 'DevAIWorkerAccessProbe'
+  $fixture=Join-Path $probeRoot 'service-access-denial.fixture'
+  foreach ($path in @($ProfileRoot,$probeRoot)) {
+    if (Test-Path -LiteralPath $path) {
+      Assert-ManagedNoReparse $path | Out-Null
+    } else {
+      [IO.Directory]::CreateDirectory($path) | Out-Null
+      Assert-ManagedNoReparse $path | Out-Null
+    }
+    $sddlModel='D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;' + $OwnerSid + ')'
+    # The SDDL above is the reference model. It is applied PROGRAMMATICALLY
+    # rather than through SetSecurityDescriptorSddlForm, because round-tripping
+    # an SDDL that omits the SACL makes SetAccessControl demand SeSecurityPrivilege.
+    # Protected DACL (D:P) + exactly three inheritable full-control allow ACEs
+    # (SYSTEM, Administrators, installing owner) and NO other ACE, in particular
+    # no service SID. This is byte-for-byte the same access model.
+    $inherit=[Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
+    $directoryAcl=New-Object Security.AccessControl.DirectorySecurity
+    $directoryAcl.SetAccessRuleProtection($true,$false)
+    foreach ($identity in @('S-1-5-18','S-1-5-32-544',$OwnerSid)) {
+      $directoryAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+        [Security.Principal.SecurityIdentifier]::new($identity),'FullControl',$inherit,'None','Allow')))
+    }
+    ([IO.DirectoryInfo]$path).SetAccessControl($directoryAcl)
+    # The witness file must itself carry a protected three-ACE DACL rather than
+    # merely inheriting one, so it is set explicitly with no inheritance.
+    $fileAcl=New-Object Security.AccessControl.FileSecurity
+    $fileAcl.SetAccessRuleProtection($true,$false)
+    foreach ($identity in @('S-1-5-18','S-1-5-32-544',$OwnerSid)) {
+      $fileAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+        [Security.Principal.SecurityIdentifier]::new($identity),'FullControl','None','None','Allow')))
+    }
+  }
+  if (Test-Path -LiteralPath $fixture) { Assert-ManagedNoReparse $fixture }
+  else { [IO.File]::WriteAllText($fixture,"Non-secret DevAI dedicated-service ACL acceptance fixture.`n") }
+  # Applied after creation so an existing file is normalised to the same model.
+  ([IO.FileInfo]$fixture).SetAccessControl($fileAcl)
+  Assert-ManagedNoReparse $fixture | Out-Null
+  Assert-TargetPersonalDenialFixture $fixture $OwnerSid | Out-Null
+  return $fixture
+}
+
+function Assert-TargetPersonalDenialFixture {
+  # Validates the fixture is a genuine denial witness: absolute, non-reparse,
+  # outside shared/system locations, protected ACL with exactly the intended
+  # SID set, and NOT readable by the worker service identity.
+  param([string]$Fixture,[string]$OwnerSid,[string]$ServiceSid='')
+  if ([string]::IsNullOrWhiteSpace($Fixture) -or ![IO.Path]::IsPathRooted($Fixture)) { throw 'INVALID_PERSONAL_FIXTURE_PATH' }
+  for ($parent=$Fixture; $null -ne $parent; $parent=$parent.Parent) {
+    if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'INVALID_PERSONAL_FIXTURE_PATH' }
+  }
+  foreach ($forbidden in @($env:ProgramData,$env:ProgramFiles,[IO.Path]::GetTempPath())) {
+    if (![string]::IsNullOrWhiteSpace($forbidden) -and
+        $Fixture.StartsWith($forbidden,[StringComparison]::OrdinalIgnoreCase)) { throw 'PERSONAL_FIXTURE_FORBIDDEN_LOCATION' }
+  }
+  if (!(Test-Path -LiteralPath $Fixture -PathType Leaf)) { throw 'PERSONAL_FIXTURE_MISSING' }
+  foreach ($path in @($Fixture,(Split-Path -Parent $Fixture))) {
+    $acl=Get-Acl -LiteralPath $path
+    if (!$acl.AreAccessRulesProtected) { throw 'PERSONAL_FIXTURE_ACL_INHERITED' }
+    $sids=@($acl.Access | ForEach-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } | Sort-Object -Unique)
+    $expected=@('S-1-5-18','S-1-5-32-544',$OwnerSid) | Sort-Object -Unique
+    if (($sids -join ',') -cne ($expected -join ',')) { throw 'PERSONAL_FIXTURE_ACL_SID_SET_MISMATCH' }
+    foreach ($rule in $acl.Access) {
+      if ($rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -in @('S-1-1-0','S-1-5-32-545','S-1-5-11')) {
+        throw 'PERSONAL_FIXTURE_ACL_BROAD_ACE'
+      }
+      if ($ServiceSid -and $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq $ServiceSid) {
+        throw 'PERSONAL_FIXTURE_SERVICE_READ_GRANTED'
+      }
+    }
+  }
+  return $true
+}
+
+function Test-TargetCredentialPresent {
+  param([Parameter(Mandatory=$true)][string]$CredentialPath)
+  return (Test-Path -LiteralPath $CredentialPath -PathType Leaf)
+}
+
+function Invoke-TargetCredentialProvisioning {
+  # Calls the packaged pinned runtime with the EXISTING, byte-identical
+  # worker_agent.provision primitive. --worker-id and --store-path are
+  # non-secret. The token is delivered ONLY over redirected stdin.
+  param(
+    [Parameter(Mandatory=$true)][string]$InstallRoot,
+    [Parameter(Mandatory=$true)][string]$RuntimeRoot,
+    [Parameter(Mandatory=$true)][string]$WorkerId,
+    [Parameter(Mandatory=$true)][string]$CredentialPath,
+    [Parameter(Mandatory=$true)][string]$Token
+  )
+  $python=Join-Path $RuntimeRoot 'python.exe'
+  if (!(Test-Path -LiteralPath $python -PathType Leaf)) { throw 'PROVISION_RUNTIME_MISSING' }
+  $psi=New-Object Diagnostics.ProcessStartInfo
+  $psi.FileName=$python
+  # No token in argv. Only non-secret identity and destination.
+  $psi.Arguments='-m worker_agent.provision --worker-id ' + $WorkerId + ' --store-path "' + $CredentialPath + '"'
+  $psi.WorkingDirectory=$InstallRoot
+  $psi.UseShellExecute=$false
+  $psi.RedirectStandardInput=$true
+  $psi.RedirectStandardOutput=$true
+  $psi.RedirectStandardError=$true
+  $process=[Diagnostics.Process]::Start($psi)
+  try {
+    # Written to the child's stdin and immediately dropped from this buffer.
+    $process.StandardInput.Write($Token)
+    $process.StandardInput.Close()
+    $process.StandardInput=$null
+    $Token=$null
+    $process.WaitForExit()
+  } finally {
+    if (!$process.HasExited) { $process.Kill() }
+  }
+  if ($process.ExitCode -ne 0) { throw 'CREDENTIAL_PROVISIONING_FAILED' }
+  if (!(Test-TargetCredentialPresent $CredentialPath)) { throw 'CREDENTIAL_PROVISIONING_FAILED' }
+  return $true
 }

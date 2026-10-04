@@ -7,7 +7,7 @@ param(
   [switch]$DiagnoseOnly
 )
 $ErrorActionPreference='Stop'
-if ((Get-FileHash -LiteralPath (Join-Path $PackageRoot 'package.json')).Hash.ToLowerInvariant() -cne $ExpectedManifestSHA256) {throw 'PACKAGE_MANIFEST_CHANGED'}
+if ((Get-FileHash -LiteralPath (Join-Path $PackageRoot 'manifest.json')).Hash.ToLowerInvariant() -cne $ExpectedManifestSHA256) {throw 'PACKAGE_MANIFEST_CHANGED'}
 $installer=Join-Path $PackageRoot 'install-worker.ps1'
 if ((Get-FileHash -LiteralPath $installer).Hash.ToLowerInvariant() -cne $ExpectedInstallerSHA256) {throw 'PACKAGE_INSTALLER_CHANGED'}
 & $installer -PackageRoot $PackageRoot -ValidateOnly
@@ -15,15 +15,19 @@ $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.Window
 if (!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {throw 'ADMINISTRATOR_UPDATE_REQUIRED'}
 $code=Join-Path $env:ProgramFiles 'DevAIWorker'
 $state=Join-Path $env:ProgramData 'DevAIWorker'
-$package=Get-Content -LiteralPath (Join-Path $PackageRoot 'package.json') -Raw | ConvertFrom-Json
 . (Join-Path $PackageRoot 'install-support.ps1')
+  # Immutable release identity. The external caller-supplied digest above
+  # authenticates manifest.json; everything below is verified payload.
+  $releaseManifest=Read-ReleaseManifest $PackageRoot
+  Assert-ManifestPayload $PackageRoot $releaseManifest | Out-Null
+  Assert-ManifestIdentityAggregate $PackageRoot $releaseManifest | Out-Null
 $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile($installer,[ref]$tokens,[ref]$errors)
 if($errors.Count){throw 'INSTALLER_SYNTAX_INVALID'}
 $entry=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-PackageEntryName'},$true)
 if(!$entry){throw 'PACKAGE_PATH_VALIDATOR_MISSING'}
 . ([ScriptBlock]::Create($entry.Extent.Text))
-$verified=Assert-PartialWorkerInstall $code $state $package -ExistingService -PreviousServiceHash $PreviousServiceHash -PreviousWorkspaceHash $PreviousWorkspaceHash
+$verified=Assert-PartialWorkerInstall $code $state $releaseManifest -ExistingService -PreviousServiceHash $PreviousServiceHash -PreviousWorkspaceHash $PreviousWorkspaceHash
 $vhd=Join-Path $state 'volumes/workspace.vhdx'
 $mount=Join-Path $state 'workspace-volume'
 $sid=$verified.config.service_sid
@@ -55,8 +59,8 @@ try {
   $rootChanged=!$rootPolicy.matches
   Copy-Item -LiteralPath (Join-Path $PackageRoot 'control/worker_agent/workspace.py') -Destination $target
   Set-Acl -LiteralPath $target -AclObject $originalAcl
-  if((Get-FileHash -LiteralPath $target).Hash.ToLowerInvariant() -cne $package.files.'control/worker_agent/workspace.py'){throw 'WORKSPACE_UPDATE_INTEGRITY_FAILED'}
-  $verified.manifest.'control/worker_agent/workspace.py'=$package.files.'control/worker_agent/workspace.py'
+  if((Get-FileHash -LiteralPath $target).Hash.ToLowerInvariant() -cne (Get-ManifestFileDigest $releaseManifest 'control/worker_agent/workspace.py')){throw 'WORKSPACE_UPDATE_INTEGRITY_FAILED'}
+  $verified.manifest.'control/worker_agent/workspace.py'=(Get-ManifestFileDigest $releaseManifest 'control/worker_agent/workspace.py')
   [IO.File]::WriteAllText($verified.manifest_file,($verified.manifest | ConvertTo-Json -Depth 3))
   Assert-ManagedPrivateAcl $verified.manifest_file $sid -AllowInherited
 } catch {

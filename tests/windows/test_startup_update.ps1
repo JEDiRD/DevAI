@@ -11,7 +11,7 @@ foreach($command in $commands) {
 $temp=Join-Path ([IO.Path]::GetTempPath()) ('devai-update-boundary-'+[Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($temp) | Out-Null
 try {
-  [IO.File]::WriteAllText((Join-Path $temp 'package.json'),'{}')
+  [IO.File]::WriteAllText((Join-Path $temp 'manifest.json'),'{}')
   function Stop-Service {throw 'MUTATION_BEFORE_VALIDATION'}
   function Start-Service {throw 'MUTATION_BEFORE_VALIDATION'}
   function Copy-Item {throw 'MUTATION_BEFORE_VALIDATION'}
@@ -35,7 +35,7 @@ foreach($command in $commands) {
 $temp=Join-Path ([IO.Path]::GetTempPath()) ('devai-workspace-update-boundary-'+[Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($temp) | Out-Null
 try {
-  [IO.File]::WriteAllText((Join-Path $temp 'package.json'),'{}')
+  [IO.File]::WriteAllText((Join-Path $temp 'manifest.json'),'{}')
   function Set-WorkspaceRootPolicy {throw 'ROOT_MUTATION_BEFORE_VALIDATION'}
   try {& $repair -PackageRoot $temp -ExpectedManifestSHA256 ('a'*64) -ExpectedInstallerSHA256 ('a'*64) -PreviousServiceHash ('a'*64) -PreviousWorkspaceHash ('a'*64);throw 'INVALID_WORKSPACE_PACKAGE_ACCEPTED'}
   catch{if($_.Exception.Message -ne 'PACKAGE_MANIFEST_CHANGED'){throw}}

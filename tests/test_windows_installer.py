@@ -72,57 +72,84 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue(report['resume_no_format'])
         self.assertEqual(report['storage_rejection_cases'],8)
 
-    def test_unsupported_runtime_rejected_before_package_or_probe_creation(self):
+    def test_legacy_build_inputs_rejected_and_runtime_not_host_derived(self):
+        """RH-B: legacy build inputs fail closed; runtime is hash-pinned.
+
+        OLD_ASSERTION: with sys.version_info patched to (3,11), main() raised
+        CPYTHON_313_RUNTIME_REQUIRED, the personal probe was not called, and
+        --existing-config was accepted as a build input.
+
+        NEW_ASSERTION: the builder accepts no target-specific input at all, and
+        the shipped runtime is bound to a hash-pinned artifact rather than to
+        whichever interpreter happens to run the build.
+
+        WHY_NOT_WEAKER: the old gate asserted only the BUILDER'S OWN
+        interpreter version. A self-check says nothing about which runtime is
+        shipped, so it would still pass if the wrong runtime were packaged.
+        Binding the artifact by SHA256 and proving host Python cannot influence
+        identity covers the same property more strongly.
+        """
         builder=Path(__file__).parent.parent/'deploy'/'windows'/'build-package.py'
         spec=importlib.util.spec_from_file_location('devai_package_builder_runtime',builder)
         module=importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        self.assertFalse(hasattr(module,'prepare_personal_fixture'))
         with tempfile.TemporaryDirectory(prefix='devai-runtime-guard-') as temp:
             destination=Path(temp)/'package'
-            with patch.object(sys,'version_info',(3,11)),patch.object(sys,'argv',[
-                str(builder),'--destination',str(destination),'--existing-config','unused']),\
-                patch.object(module,'prepare_personal_fixture') as probe:
-                with self.assertRaisesRegex(RuntimeError,'CPYTHON_313_RUNTIME_REQUIRED'):
-                    module.main()
-                probe.assert_not_called()
+            for legacy in (['--existing-config','unused'],
+                           ['--reuse-personal-fixture','unused']):
+                with self.assertRaises(module.BuildError):
+                    module.main(['--destination',str(destination)]+legacy)
             self.assertFalse(destination.exists())
+        lock=module.load_runtime_lock()
+        self.assertEqual('3.13.16',lock['python_version'])
+        self.assertEqual('97dae5274cc54867065e8d5a3226e48c35017ed332a0fdb0e27d5b5821961297',
+                         lock['source_sha256'])
 
-    def test_personal_probe_is_private_and_outside_virtualized_appdata(self):
+    def test_build_creates_no_personal_fixture_and_no_credential(self):
+        """RH-B: the immutable package carries no fixture path or credential.
+
+        OLD_ASSERTION: prepare_personal_fixture(owner) created a private,
+        non-virtualized fixture with a locked-down ACL and supported reuse.
+
+        NEW_ASSERTION: the immutable build contains no personal fixture, no
+        fixture path and no credential material, and is buildable with no
+        worker configuration present.
+
+        WHY_NOT_WEAKER: the denial property itself is NOT removed.
+        worker_agent/windows_service.py remains byte-identical and still
+        enforces service_personal_profile_denied from target-side config; only
+        the builder-MACHINE absolute path is removed from immutable identity.
+        The fixture's ACL properties move to the target, where they belong,
+        and must be re-asserted by the 5A-2 installer tests before any commit.
+        """
         builder=Path(__file__).parent.parent/'deploy'/'windows'/'build-package.py'
-        spec=importlib.util.spec_from_file_location('devai_package_builder',builder)
+        spec=importlib.util.spec_from_file_location('devai_package_builder_pf',builder)
         module=importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        owner=re.search(r'S-1-5-\d+(?:-\d+)+',subprocess.check_output(
-            ['whoami.exe','/user','/fo','csv','/nh'],text=True)).group()
-        with tempfile.TemporaryDirectory(prefix='devai-profile-fixture-') as temp:
-            profile=Path(temp)
-            fixture=module.prepare_personal_fixture(owner,profile=profile)
-            self.assertEqual(fixture,profile/'DevAIWorkerAccessProbe'/'service-access-denial.fixture')
-            self.assertNotIn('AppData',fixture.relative_to(profile).parts)
-            before=fixture.stat().st_mtime_ns
-            self.assertEqual(module.prepare_personal_fixture(owner,reuse=True,profile=profile),fixture)
-            self.assertEqual(fixture.stat().st_mtime_ns,before)
-            with self.assertRaisesRegex(RuntimeError,'PERSONAL_TEST_FIXTURE_ALREADY_EXISTS'):
-                module.prepare_personal_fixture(owner,profile=profile)
-            # Read only ACL metadata, never credentials or exception text.
-            env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}
-            script="""param($Path,$Owner)
-$ErrorActionPreference='Stop'
-foreach($item in @($Path,(Split-Path -Parent $Path))) {
-  $acl=Get-Acl -LiteralPath $item
-  if (!$acl.AreAccessRulesProtected) { exit 10 }
-  $sids=@($acl.Access | ForEach-Object {$_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value})
-  if ($sids.Count -ne 3) { exit 11 }
-  foreach($sid in @('S-1-5-18','S-1-5-32-544',$Owner)) { if($sid -notin $sids) { exit 12 } }
-}
-Write-Output 'PRIVATE_PROFILE_PROBE_VERIFIED'
-"""
-            check=profile/'check-probe.ps1'
-            check.write_text(script)
-            result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-File',str(check),
-                str(fixture),owner],capture_output=True,text=True,timeout=30,env=env)
-            self.assertEqual(result.returncode,0,result.stderr)
-            self.assertIn('PRIVATE_PROFILE_PROBE_VERIFIED',result.stdout)
+        self.assertFalse(hasattr(module,'prepare_personal_fixture'))
+        for forbidden in ('personal_denial_fixture','service.json','worker.dpapi'):
+            self.assertTrue(module._is_forbidden(forbidden),forbidden)
+        with tempfile.TemporaryDirectory(prefix='devai-clean-build-') as temp:
+            dest=Path(temp)/'pkg'
+            module.write_package_files(dest)
+            data=module.build_manifest_document(dest)
+            self.assertEqual('DEVAI_PACKAGE_MANIFEST',module.verify_manifest(dest,data))
+            self.assertFalse((dest/'worker.dpapi').exists())
+            document=json.loads(data.decode('utf-8'))
+            self.assertEqual('DEVAI_PACKAGE_MANIFEST',document['manifest_format'])
+            self.assertIn('requires_personal_profile_denial_fixture',
+                          document['policy_requirements'])
+            # Structural, not substring: the declarative REQUIREMENT legitimately
+            # contains the word "personal"; a concrete fixture PATH must not exist.
+            self.assertNotIn('personal_denial_fixture',document)
+            self.assertNotIn('worker_id',document)
+            self.assertNotIn('api_base_url',document)
+            for entry in document['files']:
+                self.assertNotIn('worker.dpapi',entry['path'].lower())
+                self.assertNotIn('personal_denial_fixture',entry['path'])
+                self.assertNotIn('personal-denial.fixture',entry['path'])
+            self.assertNotIn('dpapi',[e['path'] for e in document['files']])
 
     def test_launcher_preserves_original_location_without_secret_text(self):
         script=Path(__file__).parent/'windows'/'test_install_launcher.ps1'

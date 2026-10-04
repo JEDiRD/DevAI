@@ -11,7 +11,7 @@ foreach($command in $commands) {
 $temp=Join-Path ([IO.Path]::GetTempPath()) ('devai-capacity-update-'+[Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($temp) | Out-Null
 try {
-  [IO.File]::WriteAllText((Join-Path $temp 'package.json'),'{}')
+  [IO.File]::WriteAllText((Join-Path $temp 'manifest.json'),'{}')
   function Stop-Service {throw 'MUTATION_BEFORE_VALIDATION'}
   function Start-Service {throw 'MUTATION_BEFORE_VALIDATION'}
   function Copy-Item {throw 'MUTATION_BEFORE_VALIDATION'}

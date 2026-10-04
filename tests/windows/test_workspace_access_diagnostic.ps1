@@ -45,7 +45,7 @@ if($source -notmatch 'device \? 0x20000u : 0x20080u' -or $source -notmatch 'Get-
 $temp=Join-Path ([IO.Path]::GetTempPath()) ('devai-access-diagnostic-'+[Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($temp) | Out-Null
 try {
-  [IO.File]::WriteAllText((Join-Path $temp 'package.json'),'{}')
+  [IO.File]::WriteAllText((Join-Path $temp 'manifest.json'),'{}')
   try {& $path -PackageRoot $temp -ExpectedManifestSHA256 ('a'*64) -ExpectedInstallerSHA256 ('a'*64) | Out-Null;throw 'INVALID_PACKAGE_ACCEPTED'}
   catch {if($_.Exception.Message -ne 'PACKAGE_MANIFEST_CHANGED'){throw}}
   $native=[DevAIWorkspaceAccessReader]::Read($temp,$false)

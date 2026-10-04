@@ -7,7 +7,7 @@ param(
 )
 $ErrorActionPreference='Stop'
 # Validate the complete package BEFORE loading its support code or stopping SCM.
-if ((Get-FileHash -LiteralPath (Join-Path $PackageRoot 'package.json')).Hash.ToLowerInvariant() -cne $ExpectedManifestSHA256) {throw 'PACKAGE_MANIFEST_CHANGED'}
+if ((Get-FileHash -LiteralPath (Join-Path $PackageRoot 'manifest.json')).Hash.ToLowerInvariant() -cne $ExpectedManifestSHA256) {throw 'PACKAGE_MANIFEST_CHANGED'}
 $installer=Join-Path $PackageRoot 'install-worker.ps1'
 if ((Get-FileHash -LiteralPath $installer).Hash.ToLowerInvariant() -cne $ExpectedInstallerSHA256) {throw 'PACKAGE_INSTALLER_CHANGED'}
 & $installer -PackageRoot $PackageRoot -ValidateOnly
@@ -15,8 +15,12 @@ $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.Window
 if (!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {throw 'ADMINISTRATOR_UPDATE_REQUIRED'}
 $code=Join-Path $env:ProgramFiles 'DevAIWorker'
 $state=Join-Path $env:ProgramData 'DevAIWorker'
-$package=Get-Content -LiteralPath (Join-Path $PackageRoot 'package.json') -Raw | ConvertFrom-Json
 . (Join-Path $PackageRoot 'install-support.ps1')
+  # Immutable release identity. The external caller-supplied digest above
+  # authenticates manifest.json; everything below is verified payload.
+  $releaseManifest=Read-ReleaseManifest $PackageRoot
+  Assert-ManifestPayload $PackageRoot $releaseManifest | Out-Null
+  Assert-ManifestIdentityAggregate $PackageRoot $releaseManifest | Out-Null
 $tokens=$null;$errors=$null
 # Load just the already validated, definitions-only path validator. Do not run
 # the installation branch, decrypt credentials or recreate any volume/service.
@@ -25,7 +29,7 @@ if($errors.Count){throw 'INSTALLER_SYNTAX_INVALID'}
 $entry=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-PackageEntryName'},$true)
 if(!$entry){throw 'PACKAGE_PATH_VALIDATOR_MISSING'}
 . ([ScriptBlock]::Create($entry.Extent.Text))
-$verified=Assert-PartialWorkerInstall $code $state $package -ExistingService -PreviousServiceHash $PreviousServiceHash
+$verified=Assert-PartialWorkerInstall $code $state $releaseManifest -ExistingService -PreviousServiceHash $PreviousServiceHash
 Write-Output (@{installed_runtime_validated=$true;volume=$verified.volume;diagnostic_only=[bool]$DiagnoseOnly;credential_changed=$false;volume_reformatted=$false} | ConvertTo-Json -Depth 4 -Compress)
 if($DiagnoseOnly){return}
 # Stop only the Worker, gracefully. Leave the running volume host intact.
@@ -55,8 +59,8 @@ $originalAcl=Get-Acl -LiteralPath $target
 try {
   Copy-Item -LiteralPath (Join-Path $PackageRoot 'control/worker_agent/windows_service.py') -Destination $target
   Set-Acl -LiteralPath $target -AclObject $originalAcl
-  if((Get-FileHash -LiteralPath $target).Hash.ToLowerInvariant() -cne $package.files.'control/worker_agent/windows_service.py'){throw 'DIAGNOSTIC_UPDATE_INTEGRITY_FAILED'}
-  $verified.manifest.'control/worker_agent/windows_service.py'=$package.files.'control/worker_agent/windows_service.py'
+  if((Get-FileHash -LiteralPath $target).Hash.ToLowerInvariant() -cne (Get-ManifestFileDigest $releaseManifest 'control/worker_agent/windows_service.py')){throw 'DIAGNOSTIC_UPDATE_INTEGRITY_FAILED'}
+  $verified.manifest.'control/worker_agent/windows_service.py'=(Get-ManifestFileDigest $releaseManifest 'control/worker_agent/windows_service.py')
   [IO.File]::WriteAllText($verified.manifest_file,($verified.manifest | ConvertTo-Json -Depth 3))
   # Preserve exact existing ACL, identity, service/recovery policy and all config.
   Assert-ManagedPrivateAcl $verified.manifest_file $verified.config.service_sid -AllowInherited
