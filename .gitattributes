@@ -1,0 +1,46 @@
+# DEVAI checkout normalization policy.
+#
+# RH-B records SHA256 identities for committed release inputs
+# (requirements.in, lock/*.txt) and builds a deterministic release artifact from
+# committed blobs. Those identities are only meaningful if a checkout produces
+# the SAME BYTES on every platform.
+#
+# Without this file, GitHub's windows-* runner images (core.autocrlf=true)
+# rewrite LF -> CRLF on checkout, so the identical commit yields different
+# release-input SHA256 values on Windows than on Linux. STEP 6 observed exactly
+# that: a default Windows checkout produced
+#   requirements.in          6ba8f9b8... instead of 275bdf24...
+#   lock/windows-cp313.txt   1b8f0285... instead of a2647d67...
+#   lock/linux-cp313.txt     27912d49... instead of 05c9744b...
+# and the release-input identity gate correctly failed closed.
+#
+# Force LF in the worktree for every text file so checkout is byte-stable
+# across platforms and architectures.
+
+* text=auto eol=lf
+
+*.py   text eol=lf
+*.ps1  text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.txt  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.in   text eol=lf
+*.cfg  text eol=lf
+*.toml text eol=lf
+
+# Never rewrite binary content.
+*.png  binary
+*.jpg  binary
+*.gif  binary
+*.ico  binary
+*.zip  binary
+*.gz   binary
+*.tar  binary
+*.exe  binary
+*.dll  binary
+*.pdb  binary
+*.lib  binary
+*.whl  binary
+*.vhdx binary
