@@ -1,4 +1,4 @@
-﻿"""F10: dormant contract sentinel for execution_attempts.request_id.
+"""F10: dormant contract sentinel for execution_attempts.request_id.
 
 This is an ACTIVATION TRIPWIRE, not a security assertion.
 
