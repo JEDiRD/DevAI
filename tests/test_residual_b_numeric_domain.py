@@ -2505,7 +2505,7 @@ class DatabaseConstraintTests(unittest.TestCase):
                     "UPDATE model_pricing SET input_per_million_usd=%s "
                     "WHERE pricing_key=%s AND version=1",
                     (Decimal("1e40"), self.pricing_key))
-        self.assertNotEqual(self.CHECK_VIOLATION,
+        self.assertNotEqual(CHECK_VIOLATION,
                             getattr(ctx.exception, "sqlstate", None),
                             "overflow is not a check violation")
         self.assertIsInstance(ctx.exception,
