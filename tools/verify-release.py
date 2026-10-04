@@ -33,6 +33,12 @@ import tarfile
 import tempfile
 from pathlib import Path
 
+# Verification must be side-effect free, exactly like the build. The sibling
+# `release_lib` import and the importlib load of deploy/windows/build-package.py
+# would otherwise write __pycache__/*.pyc into the source checkout, making a
+# read-only verification look like it mutated the tree.
+sys.dont_write_bytecode = True
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from release_lib import (  # noqa: E402
     ALLOWED_TOP_LEVEL, ARTIFACT_FORMAT, RELEASE_FORMAT, RELEASE_NAME,

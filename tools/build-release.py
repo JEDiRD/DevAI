@@ -22,6 +22,17 @@ import argparse
 import importlib.util
 import io
 import sys
+
+# A canonical release build MUST NOT leave build products in the source
+# checkout. Two local imports would otherwise do exactly that:
+#   * `from release_lib import ...` (this file's sibling)
+#   * importlib exec_module of deploy/windows/build-package.py
+# both of which write __pycache__/*.pyc next to their sources.
+# Disabling bytecode writing BEFORE any local import is the narrow fix. It
+# changes nothing about artifact bytes; it only stops polluting the tree.
+# Cleanup-after-the-fact would hide the defect rather than remove its cause.
+sys.dont_write_bytecode = True
+
 import tarfile
 import tempfile
 import zipfile
