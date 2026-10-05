@@ -10,6 +10,67 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+def check_installer_canary(stdout):
+    """Enforce the privilege-aware canary branch (RH-D hardening).
+
+    The harness records its ACTUAL privilege via WindowsPrincipal semantics
+    (CANARY:IS_ADMIN=) and the boundary it reached
+    (CANARY:IDENTITY_GLUE_OK_NEXT=). Non-elevated MUST stop at
+    ADMINISTRATOR_INSTALL_REQUIRED; elevated MUST stop at
+    MUTATION_INTERCEPTED. Anything else — wrong branch, identity code, or
+    missing markers — raises AssertionError with a distinct message, so the
+    four bad states are distinguishable. Returns (is_admin, next_code).
+    """
+    m_admin=re.search(r'^CANARY:IS_ADMIN=(True|False)\s*$',stdout,re.M)
+    if not m_admin:
+        raise AssertionError('CANARY_MARKER_MISSING:IS_ADMIN')
+    is_admin=(m_admin.group(1)=='True')
+    m_next=re.search(r'^CANARY:IDENTITY_GLUE_OK_NEXT=(\S+)\s*$',stdout,re.M)
+    if not m_next:
+        raise AssertionError('CANARY_MARKER_MISSING:IDENTITY_GLUE_OK_NEXT')
+    nxt=m_next.group(1)
+    if re.match(r'^(EXISTING_CONFIG_|WORKER_ID_|API_BASE_URL_|INVALID_)',nxt):
+        raise AssertionError('CANARY_IDENTITY_FAILURE:'+nxt)
+    expected='MUTATION_INTERCEPTED' if is_admin else 'ADMINISTRATOR_INSTALL_REQUIRED'
+    if nxt!=expected:
+        raise AssertionError('CANARY_WRONG_BRANCH:is_admin=%r got=%s want=%s'
+                             % (is_admin,nxt,expected))
+    return is_admin,nxt
+
+
+class CanaryParserTests(unittest.TestCase):
+    """Deterministic coverage of BOTH canary branches at the parser layer.
+
+    No elevation is faked: these are synthetic harness-output strings that
+    prove the branch-selection logic requires the matching boundary. They
+    are not native elevated runtime evidence.
+    """
+    def test_non_admin_requires_admin_boundary(self):
+        self.assertEqual(check_installer_canary(
+            'CANARY:IS_ADMIN=False\nCANARY:IDENTITY_GLUE_OK_NEXT=ADMINISTRATOR_INSTALL_REQUIRED\n'),
+            (False,'ADMINISTRATOR_INSTALL_REQUIRED'))
+    def test_admin_requires_interception_boundary(self):
+        self.assertEqual(check_installer_canary(
+            'CANARY:IS_ADMIN=True\nCANARY:IDENTITY_GLUE_OK_NEXT=MUTATION_INTERCEPTED\n'),
+            (True,'MUTATION_INTERCEPTED'))
+    def test_non_admin_with_interception_fails(self):
+        with self.assertRaisesRegex(AssertionError,'CANARY_WRONG_BRANCH'):
+            check_installer_canary(
+                'CANARY:IS_ADMIN=False\nCANARY:IDENTITY_GLUE_OK_NEXT=MUTATION_INTERCEPTED\n')
+    def test_admin_with_admin_boundary_fails(self):
+        with self.assertRaisesRegex(AssertionError,'CANARY_WRONG_BRANCH'):
+            check_installer_canary(
+                'CANARY:IS_ADMIN=True\nCANARY:IDENTITY_GLUE_OK_NEXT=ADMINISTRATOR_INSTALL_REQUIRED\n')
+    def test_identity_regression_fails(self):
+        with self.assertRaisesRegex(AssertionError,'CANARY_IDENTITY_FAILURE'):
+            check_installer_canary(
+                'CANARY:IS_ADMIN=False\nCANARY:IDENTITY_GLUE_OK_NEXT=EXISTING_CONFIG_WORKER_ID_MISSING\n')
+    def test_missing_markers_fail(self):
+        with self.assertRaisesRegex(AssertionError,'CANARY_MARKER_MISSING'):
+            check_installer_canary('INSTALLER_GLUE_CASES_PASSED\n')
+        with self.assertRaisesRegex(AssertionError,'CANARY_MARKER_MISSING'):
+            check_installer_canary('CANARY:IS_ADMIN=False\n')
+
 @unittest.skipUnless(sys.platform=='win32','Windows PowerShell required')
 class InstallerTests(unittest.TestCase):
     def test_installer_identity_glue_no_collision_and_real_resolution_path(self):
@@ -19,8 +80,9 @@ class InstallerTests(unittest.TestCase):
         EXISTING_CONFIG_WORKER_ID_MISSING. The harness audits the whole
         deploy/windows surface by AST, exercises the real identity glue for
         CLI-only / config-only / matching / conflicting / missing inputs,
-        proves the config object (not a String) reaches resolution, and proves
-        valid CLI-only input reaches ADMINISTRATOR_INSTALL_REQUIRED."""
+        proves the config object (not a String) reaches resolution, and
+        records its actual privilege plus the boundary it reached; the
+        parser requires the matching boundary for that privilege."""
         script=Path(__file__).parent/'windows'/'test_installer_identity_glue.ps1'
         env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}
         result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
@@ -28,20 +90,16 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertIn('VARIABLE_COLLISION_AUDIT_PASSED',result.stdout)
         self.assertIn('INSTALLER_GLUE_CASES_PASSED',result.stdout)
-        # The progress canary legitimately stops at either boundary: the
-        # privilege boundary on non-elevated hosts, or the mutation
-        # interceptors on elevated hosts (e.g. hosted CI runners run as
-        # Administrator). Both prove the identity glue resolved. Any identity
-        # code before either boundary fails the harness first.
-        self.assertIn('INSTALLER_GLUE_CANARY_PASSED:',result.stdout)
+        # Privilege-aware canary: the harness reports its actual privilege and
+        # the parser requires the matching boundary (never "either is fine").
+        is_admin,nxt=check_installer_canary(result.stdout)
         self.assertIn('OUTPUT_CONTRACTS_PASSED',result.stdout)
         report=json.loads(result.stdout.strip().splitlines()[-1])
         self.assertTrue(report['passed'])
         self.assertEqual(report['collision_sites'],0)
+        self.assertEqual(report.get('is_admin'),is_admin)
         canary=[c for c in report['glue_cases'] if c.startswith('CANARY:IDENTITY_GLUE_OK_NEXT=')]
-        self.assertEqual(len(canary),1)
-        self.assertIn(canary[0].split('=',1)[1],
-                      ('ADMINISTRATOR_INSTALL_REQUIRED','MUTATION_INTERCEPTED'))
+        self.assertEqual(canary,['CANARY:IDENTITY_GLUE_OK_NEXT='+nxt])
         for marker in ('A:CLI_ONLY_PASS','B:CONFIG_ONLY_PASS','C:MATCHING_PASS',
                        'D:CONFLICT_FAILS_CLOSED','E:MISSING_FAILS_CLOSED'):
             self.assertIn(marker,report['glue_cases'])

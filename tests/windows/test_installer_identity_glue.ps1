@@ -168,6 +168,12 @@ try {
 
   $admin = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
   $elevated = $admin.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  # Privilege context is RECORDED from the same WindowsPrincipal semantics the
+  # installer itself uses, never inferred from the CI provider. The Python
+  # assertion requires the branch matching this marker: non-elevated must stop
+  # at ADMINISTRATOR_INSTALL_REQUIRED, elevated at MUTATION_INTERCEPTED.
+  Write-Output ('CANARY:IS_ADMIN=' + $elevated)
+  $report.is_admin = $elevated
   try {
     $null = & $Installer -PackageRoot $pkg -WorkerId $GuidCli -ApiBaseUrl $UrlCli
     throw 'GLUE_CANARY_UNEXPECTED_SUCCESS'
@@ -175,8 +181,14 @@ try {
     $code = $_.Exception.Message
     if ($code -match '^(EXISTING_CONFIG_|WORKER_ID_|API_BASE_URL_|INVALID_)') { throw ('GLUE_CANARY_IDENTITY_FAILURE:' + $code) }
     if (-not $elevated -and $code -ne 'ADMINISTRATOR_INSTALL_REQUIRED') { throw ('GLUE_CANARY_WRONG_BOUNDARY:' + $code) }
+    # Elevated branch safety: the ONLY throwers of MUTATION_INTERCEPTED are
+    # the six stub functions above, which replace the real cmdlets in this
+    # scope and throw before delegating. Reaching one therefore proves valid
+    # identity plus valid elevation arrived at a mutation call site, and no
+    # real cmdlet executed.
     if ($elevated -and $code -ne 'MUTATION_INTERCEPTED') { throw ('GLUE_CANARY_ELEVATED_UNEXPECTED:' + $code) }
     $report.glue_cases += ('CANARY:IDENTITY_GLUE_OK_NEXT=' + $code)
+    Write-Output ('CANARY:IDENTITY_GLUE_OK_NEXT=' + $code)
     Write-Output ('INSTALLER_GLUE_CANARY_PASSED:' + $code)
   }
   # Missing identity must fail closed BEFORE any privilege boundary, proving
@@ -260,4 +272,4 @@ try {
 Write-Output 'OUTPUT_CONTRACTS_PASSED'
 
 $report.passed = $true
-Write-Output (@{collision_sites = $report.collision_sites.Count; glue_cases = $report.glue_cases; output_contracts = $contracts; passed = $true} | ConvertTo-Json -Compress)
+Write-Output (@{collision_sites = $report.collision_sites.Count; glue_cases = $report.glue_cases; output_contracts = $contracts; is_admin = [bool]$report.is_admin; passed = $true} | ConvertTo-Json -Compress)
