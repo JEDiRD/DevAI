@@ -35,13 +35,7 @@ if ($ValidateOnly) { Write-Output 'DEVAI_PACKAGE_VALIDATED'; return }
 # explicit-only and validated here. Disagreement between CLI and config fails
 # closed: there is deliberately NO precedence rule.
 $stateRoot=Join-Path $env:ProgramData 'DevAIWorker'
-$existingConfig=$null
-if ($ExistingConfig) {
-  if (!(Test-Path -LiteralPath $ExistingConfig -PathType Leaf)) { throw 'EXISTING_CONFIG_MISSING' }
-  $existingConfig=Read-TargetServiceConfig $ExistingConfig
-  if ($null -eq $existingConfig) { throw 'EXISTING_CONFIG_INVALID' }
-}
-$identity=Resolve-TargetIdentity -CliWorkerId $WorkerId -CliApiBaseUrl $ApiBaseUrl -Config $existingConfig
+$identity=Resolve-InstallerTargetIdentity -WorkerId $WorkerId -ApiBaseUrl $ApiBaseUrl -ExistingConfig $ExistingConfig
 
 # Installation boundary: package validation above performs read-only operations.
 $admin=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())

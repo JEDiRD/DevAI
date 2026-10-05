@@ -591,10 +591,32 @@ function Resolve-TargetIdentity {
   return [pscustomobject]@{ WorkerId=$workerId; ApiBaseUrl=$apiBaseUrl }
 }
 
+function Resolve-InstallerTargetIdentity {
+  # Single implementation of the install-worker.ps1 TARGET IDENTITY glue.
+  # The -ExistingConfig PATH parameter and the loaded config OBJECT must never
+  # share a case-insensitive PowerShell name: $ExistingConfig is a typed
+  # [string], so assigning the config object to a same-spelled local would
+  # coerce $null to '' and the object to String, and every fresh install
+  # would fail closed with EXISTING_CONFIG_WORKER_ID_MISSING. The loaded
+  # object therefore lives in $loadedExistingConfig, which is spelled
+  # distinctly. Read-only; never mutates the target.
+  param([string]$WorkerId,[string]$ApiBaseUrl,[string]$ExistingConfig)
+  $loadedExistingConfig=$null
+  if (-not [string]::IsNullOrWhiteSpace($ExistingConfig)) {
+    if (!(Test-Path -LiteralPath $ExistingConfig -PathType Leaf)) { throw 'EXISTING_CONFIG_MISSING' }
+    $loadedExistingConfig=Read-TargetServiceConfig -ConfigFile $ExistingConfig
+    if ($null -eq $loadedExistingConfig) { throw 'EXISTING_CONFIG_INVALID' }
+  }
+  return Resolve-TargetIdentity -CliWorkerId $WorkerId -CliApiBaseUrl $ApiBaseUrl -Config $loadedExistingConfig
+}
+
 function Read-TargetServiceConfig {
   param([Parameter(Mandatory=$true)][string]$ConfigFile)
   if (!(Test-Path -LiteralPath $ConfigFile -PathType Leaf)) { return $null }
-  Assert-ManagedNoReparse $ConfigFile
+  # Out-Null is load-bearing: Assert-ManagedNoReparse returns the item, and
+  # without this the FileInfo would join the config object in this function's
+  # output, so callers would receive Object[] instead of the config document.
+  Assert-ManagedNoReparse $ConfigFile | Out-Null
   return (Get-Content -LiteralPath $ConfigFile -Raw | ConvertFrom-Json)
 }
 

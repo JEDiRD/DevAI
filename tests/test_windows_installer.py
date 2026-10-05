@@ -12,6 +12,30 @@ from unittest.mock import patch
 
 @unittest.skipUnless(sys.platform=='win32','Windows PowerShell required')
 class InstallerTests(unittest.TestCase):
+    def test_installer_identity_glue_no_collision_and_real_resolution_path(self):
+        """RH-D: install-worker.ps1 used $existingConfig as if it were distinct
+        from the [string] $ExistingConfig parameter. PowerShell is
+        case-insensitive, so fresh installs always failed closed with
+        EXISTING_CONFIG_WORKER_ID_MISSING. The harness audits the whole
+        deploy/windows surface by AST, exercises the real identity glue for
+        CLI-only / config-only / matching / conflicting / missing inputs,
+        proves the config object (not a String) reaches resolution, and proves
+        valid CLI-only input reaches ADMINISTRATOR_INSTALL_REQUIRED."""
+        script=Path(__file__).parent/'windows'/'test_installer_identity_glue.ps1'
+        env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}
+        result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+            '-File',str(script)],capture_output=True,text=True,timeout=180,env=env)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('VARIABLE_COLLISION_AUDIT_PASSED',result.stdout)
+        self.assertIn('INSTALLER_GLUE_CASES_PASSED',result.stdout)
+        self.assertIn('INSTALLER_GLUE_CANARY_PASSED:ADMINISTRATOR_INSTALL_REQUIRED',result.stdout)
+        report=json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(report['passed'])
+        self.assertEqual(report['collision_sites'],0)
+        for marker in ('A:CLI_ONLY_PASS','B:CONFIG_ONLY_PASS','C:MATCHING_PASS',
+                       'D:CONFLICT_FAILS_CLOSED','E:MISSING_FAILS_CLOSED'):
+            self.assertIn(marker,report['glue_cases'])
+
     def test_service_access_update_restores_both_files_and_manifest_on_integrity_failure(self):
         script=Path(__file__).parent/'windows'/'test_access_update_rollback.ps1'
         env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}
