@@ -64,9 +64,56 @@ try {
         if($after.PSObject.Properties[$target.relative].Value -cne (Get-FileHash -LiteralPath $target.path).Hash.ToLowerInvariant()){throw 'UPDATED_MANIFEST_HASH_WRONG'}
       }
     }
+    # ACL preservation is asserted STRUCTURALLY, not by comparing the whole SDDL
+    # string. SDDL also encodes the DACL control flags, including
+    # SE_DACL_AUTO_INHERITED ("AI"), which Windows sets when a descriptor is
+    # written over an auto-inherited parent. That bit is an advisory
+    # auto-inheritance hint: it grants no access and revokes none, and the OS
+    # sets it even when the update faithfully re-applies the captured
+    # descriptor. Comparing it asserts a Windows write-path detail rather than a
+    # security property, and it failed on a correct implementation under an
+    # elevated token.
+    #
+    # This assertion is not weaker than the product contract. It pins every
+    # security-relevant field the product actually relies on, and more: owner
+    # SID, DACL protection state, and for each ACE the SID, access type, the
+    # exact FileSystemRights mask, inheritance flags, propagation flags and
+    # IsInherited. Any broadening (a new principal such as Everyone, Users,
+    # Authenticated Users or the service SID), any rights change, any
+    # protection change and any owner change still fails here.
     foreach($target in $targets) {
-      if((Get-Acl -LiteralPath $target.path).Sddl -cne $target.acl.Sddl){throw 'UPDATED_FILE_ACL_CHANGED'}
+      $beforeAcl=$target.acl
+      $afterAcl=Get-Acl -LiteralPath $target.path
+      $beforeOwner=([Security.Principal.NTAccount]$beforeAcl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value
+      $afterOwner=([Security.Principal.NTAccount]$afterAcl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value
+      if($beforeOwner -ne $afterOwner){throw 'UPDATED_FILE_ACL_OWNER_CHANGED'}
+      if($beforeAcl.AreAccessRulesProtected -ne $afterAcl.AreAccessRulesProtected){throw 'UPDATED_FILE_ACL_PROTECTION_CHANGED'}
+      $describe={param($rule) (
+        $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value + '|' +
+        [string]$rule.AccessControlType + '|' +
+        [int]$rule.FileSystemRights + '|' +
+        [string]$rule.InheritanceFlags + '|' +
+        [string]$rule.PropagationFlags + '|' +
+        [string]$rule.IsInherited)}
+      $beforeRules=@($beforeAcl.Access | ForEach-Object { & $describe $_ } | Sort-Object)
+      $afterRules=@($afterAcl.Access  | ForEach-Object { & $describe $_ } | Sort-Object)
+      if(($beforeRules -join "`n") -cne ($afterRules -join "`n")){throw 'UPDATED_FILE_ACL_CHANGED'}
     }
+    # The structural assertion must still have teeth. Deliberately broaden ONE
+    # file's ACL the way a real regression would (grant Everyone read) and
+    # require the comparison above to detect it. Without this, a weakened
+    # assertion could pass silently.
+    $canary=$targets[0].path
+    $canaryBefore=Get-Acl -LiteralPath $canary
+    $canaryRules=@($canaryBefore.Access | ForEach-Object { & $describe $_ } | Sort-Object)
+    $broadened=Get-Acl -LiteralPath $canary
+    $broadened.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+      [Security.Principal.SecurityIdentifier]::new('S-1-1-0'),'Read','None','None','Allow')))
+    Set-Acl -LiteralPath $canary -AclObject $broadened
+    $canaryAfter=Get-Acl -LiteralPath $canary
+    $canaryAfterRules=@($canaryAfter.Access | ForEach-Object { & $describe $_ } | Sort-Object)
+    if(($canaryRules -join "`n") -ceq ($canaryAfterRules -join "`n")){throw 'ACL_ASSERTION_HAS_NO_TEETH'}
+    Set-Acl -LiteralPath $canary -AclObject $canaryBefore
   }
 } finally {
   if([IO.Path]::GetDirectoryName($temp) -ne [IO.Path]::GetTempPath().TrimEnd([char[]]'\/')){throw 'UNSAFE_TEST_CLEANUP'}
