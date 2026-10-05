@@ -28,11 +28,20 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertIn('VARIABLE_COLLISION_AUDIT_PASSED',result.stdout)
         self.assertIn('INSTALLER_GLUE_CASES_PASSED',result.stdout)
-        self.assertIn('INSTALLER_GLUE_CANARY_PASSED:ADMINISTRATOR_INSTALL_REQUIRED',result.stdout)
+        # The progress canary legitimately stops at either boundary: the
+        # privilege boundary on non-elevated hosts, or the mutation
+        # interceptors on elevated hosts (e.g. hosted CI runners run as
+        # Administrator). Both prove the identity glue resolved. Any identity
+        # code before either boundary fails the harness first.
+        self.assertIn('INSTALLER_GLUE_CANARY_PASSED:',result.stdout)
         self.assertIn('OUTPUT_CONTRACTS_PASSED',result.stdout)
         report=json.loads(result.stdout.strip().splitlines()[-1])
         self.assertTrue(report['passed'])
         self.assertEqual(report['collision_sites'],0)
+        canary=[c for c in report['glue_cases'] if c.startswith('CANARY:IDENTITY_GLUE_OK_NEXT=')]
+        self.assertEqual(len(canary),1)
+        self.assertIn(canary[0].split('=',1)[1],
+                      ('ADMINISTRATOR_INSTALL_REQUIRED','MUTATION_INTERCEPTED'))
         for marker in ('A:CLI_ONLY_PASS','B:CONFIG_ONLY_PASS','C:MATCHING_PASS',
                        'D:CONFLICT_FAILS_CLOSED','E:MISSING_FAILS_CLOSED'):
             self.assertIn(marker,report['glue_cases'])
