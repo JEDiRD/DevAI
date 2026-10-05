@@ -988,6 +988,41 @@ class IncompletePackageRegressionTests(unittest.TestCase):
         combined = expect_failure(self, path, "INCOMPLETE_RUNTIME_PAYLOAD")
         self.assertNotIn("RELEASE_VERIFIED", combined)
 
+    def test_sandbox_byte_flip_rejected_by_production_cli(self):
+        """Mirror content identity, not just shape: flip ONE byte of a
+        sandbox runtime dependency, regenerate a self-consistent manifest,
+        and require production verify-release to FAIL with the exact
+        member. Member names match but bytes differ, so only a
+        content-aware mirror gate can catch it."""
+        target = "package/sandbox-runtime/DLLs/_socket.pyd"
+        members = dict(self.members.items())
+        flipped = bytearray(members[target])
+        flipped[0] ^= 0x01
+        members[target] = bytes(flipped)
+        members = _rebuild_identities(members)
+        # Self-consistency still holds on disk: digests were regenerated
+        # over the flipped bytes, so integrity checks alone cannot see it.
+        materialized = self.work / "flipped"
+        materialized.mkdir()
+        for name, data in members.items():
+            if not name.startswith("package/"):
+                continue
+            dest = materialized / name[len("package/"):]
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+        builder = load_builder()
+        self.assertEqual(
+            "DEVAI_PACKAGE_MANIFEST",
+            builder.verify_manifest(
+                materialized,
+                members["package/manifest.json"]))
+        path = self.work / "flipped.tar"
+        write_tar(path, list(members.items()), self.epoch)
+        combined = expect_failure(
+            self, path,
+            "RUNTIME_MIRROR_MISMATCH:sandbox-runtime/DLLs/_socket.pyd")
+        self.assertNotIn("RELEASE_VERIFIED", combined)
+
 
 if __name__ == "__main__":
     unittest.main()
