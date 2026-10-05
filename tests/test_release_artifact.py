@@ -27,6 +27,13 @@ TOOLS = REPO / "tools"
 BUILD = TOOLS / "build-release.py"
 VERIFY = TOOLS / "verify-release.py"
 
+# This module imports release_lib from the release tooling path, so it must
+# disable bytecode BEFORE that import. tools/build-release.py and
+# tools/verify-release.py set the same guard for their own imports; without it
+# here, running the suite wrote tools/__pycache__/release_lib.cpython-*.pyc
+# into the source checkout, which the source-pollution gate correctly rejects.
+sys.dont_write_bytecode = True
+
 sys.path.insert(0, str(TOOLS))
 import release_lib as rl  # noqa: E402
 
