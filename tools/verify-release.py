@@ -43,6 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from release_lib import (  # noqa: E402
     ALLOWED_TOP_LEVEL, ARTIFACT_FORMAT, RELEASE_FORMAT, RELEASE_NAME,
     RELEASE_SCHEMA_VERSION, ReleaseError, assert_no_target_state_keys, assert_required_package_members,
+    assert_runtime_payload_complete,
     check_member_name, commit_timestamp, commit_tree, find_identity_leak,
     parse_sidecar, require_git_oid, require_hex64, sha256_bytes, tree_of,
 )
@@ -347,6 +348,10 @@ def verify_package(document: dict, members: dict) -> str:
     # A packaging bug that silently drops a committed subtree would otherwise
     # produce a self-consistent artifact that still passes every digest check.
     assert_required_package_members(package_members)
+    # Runtime install payload must be complete when present at all: a dropped
+    # sandbox-runtime beside a present host-runtime verified clean and then
+    # failed install with PathNotFound.
+    assert_runtime_payload_complete(package_members)
 
     # Materialise ONLY already-validated regular files into a scratch directory
     # so the single authoritative 5A verifier can run. No archive extraction of

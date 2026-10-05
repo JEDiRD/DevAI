@@ -17,10 +17,20 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+import shutil
+import zipfile
 
 REPO = Path(__file__).resolve().parent.parent
 BUILDER = REPO / "deploy" / "windows" / "build-package.py"
 SECURITY_HEAD = "0bd8ebfb0326935a1e7d910a971be18cb384ec42"
+
+# This module imports release_lib from the release tooling path, so bytecode
+# is disabled BEFORE that import (same discipline as the builder/verifier and
+# test_release_artifact.py): running the suite must not write
+# tools/__pycache__/*.pyc into the source checkout.
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(REPO / "tools"))
+import release_lib as rl  # noqa: E402
 
 # Stage-B historical aggregates, over the four-root production boundary.
 V1_PRODUCTION = "1a36525ec655967e7ae9fbda9c968e49eace64983c906e7c99c7fcb28542e03b"
@@ -551,6 +561,177 @@ class ManifestV1HistoricalTests(unittest.TestCase):
             builder.parse_manifest_v1(b"# has a header\r\n")
         with self.assertRaises(builder.BuildError):
             builder.parse_manifest(v1)
+
+
+# ----------------------------------------------------------------------
+# Sandbox-runtime install-payload contract (RH-D remediation).
+# ----------------------------------------------------------------------
+class SandboxRuntimeContractTests(unittest.TestCase):
+    """The builder declared RUNTIME_DIRS=("host-runtime","sandbox-runtime")
+    but populated only RUNTIME_DIRS[0]. The manifest stayed self-consistent,
+    release verification passed, and fresh install died with PathNotFound at
+    the installer copy loop.
+
+    These tests consume the REAL builder with a synthetic deterministic
+    runtime archive (fixed bytes per core member, fixed zip timestamps), so
+    no network and no pinned artifact are needed; identical inputs still
+    give identical outputs. The synthetic input is clearly labeled and never
+    confused with the pinned canonical runtime.
+    """
+    INSTALLER = REPO / "deploy" / "windows" / "install-worker.ps1"
+    ENABLED = os.name == "nt" and bool(os.environ.get("SystemRoot"))
+    GUID = "11111111-2222-3333-4444-555555555555"
+    URL = "http://127.0.0.1/"
+
+    def _synthetic_runtime_zip(self, path):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        builder = load_builder()
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name in builder.RUNTIME_CORE:
+                info = zipfile.ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0))
+                info.compress_type = zipfile.ZIP_DEFLATED
+                archive.writestr(
+                    info, b"RHB-SYNTHETIC-RUNTIME:" + name.encode("utf-8"))
+
+    def _build(self, work):
+        """Run the real producer into work/package; return (builder, package)."""
+        builder = load_builder()
+        package = work / "package"
+        archive = work / "runtime.zip"
+        self._synthetic_runtime_zip(archive)
+        builder.write_package_files(package, runtime_artifact=archive)
+        return builder, package
+
+    def _manifest_bytes(self, builder, package):
+        return builder.build_manifest_document(package)
+
+    def test_sandbox_runtime_populated_from_deterministic_inputs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            builder, package = self._build(Path(temp))
+            sandbox_python = package / "sandbox-runtime" / "python.exe"
+            self.assertTrue(sandbox_python.is_file())
+            # Interpreter bytes come from the runtime input, never the host.
+            self.assertEqual(
+                (package / "host-runtime" / "python.exe").read_bytes(),
+                sandbox_python.read_bytes())
+            # Payload bytes come from the first-party source tree.
+            self.assertEqual(
+                (REPO / "worker_agent" / "synthetic_process.py").read_bytes(),
+                (package / "sandbox-runtime" / "synthetic_process.py").read_bytes())
+
+    def test_manifest_includes_sandbox_members(self):
+        with tempfile.TemporaryDirectory() as temp:
+            builder, package = self._build(Path(temp))
+            document = json.loads(self._manifest_bytes(builder, package))
+            paths = {entry["path"] for entry in document["files"]}
+            for member in ("host-runtime/python.exe",
+                           "sandbox-runtime/python.exe",
+                           "sandbox-runtime/synthetic_process.py"):
+                self.assertIn(member, paths)
+
+    def test_sandbox_omission_is_self_consistent_but_rejected(self):
+        """The exact f1210a6 shape: manifest accurately describes a payload
+        without sandbox-runtime. Self-consistency passes; the release
+        semantic gate must still refuse it."""
+        with tempfile.TemporaryDirectory() as temp:
+            builder, package = self._build(Path(temp))
+            shutil.rmtree(package / "sandbox-runtime")
+            manifest = self._manifest_bytes(builder, package)
+            # Self-consistency holds: this is what made the defect latent.
+            self.assertEqual("DEVAI_PACKAGE_MANIFEST",
+                             builder.verify_manifest(package, manifest))
+            # In a real artifact manifest.json itself is a member; the disk
+            # scan that regenerates the manifest never lists it.
+            present = [entry["path"]
+                       for entry in json.loads(manifest)["files"]]
+            present.append("manifest.json")
+            with self.assertRaisesRegex(
+                    rl.ReleaseError,
+                    r"INCOMPLETE_RUNTIME_PAYLOAD:sandbox-runtime/python\.exe"):
+                rl.assert_runtime_payload_complete(present)
+
+    def test_single_member_omission_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            builder, package = self._build(Path(temp))
+            (package / "sandbox-runtime" / "synthetic_process.py").unlink()
+            manifest = self._manifest_bytes(builder, package)
+            self.assertEqual("DEVAI_PACKAGE_MANIFEST",
+                             builder.verify_manifest(package, manifest))
+            present = [entry["path"]
+                       for entry in json.loads(manifest)["files"]]
+            present.append("manifest.json")
+            with self.assertRaisesRegex(
+                    rl.ReleaseError,
+                    r"INCOMPLETE_RUNTIME_PAYLOAD:sandbox-runtime/synthetic_process\.py"):
+                rl.assert_runtime_payload_complete(present)
+
+    def test_two_builds_are_byte_identical(self):
+        with tempfile.TemporaryDirectory() as temp:
+            work = Path(temp)
+            trees = []
+            for tag in ("a", "b"):
+                builder, package = self._build(work / tag)
+                trees.append(sorted(
+                    (p.relative_to(package).as_posix(), p.read_bytes())
+                    for p in package.rglob("*") if p.is_file()))
+            self.assertEqual(trees[0], trees[1])
+
+    @staticmethod
+    def _ps(script, *args):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            path = tmp / "probe.ps1"
+            path.write_text(script, encoding="utf-8")
+            env = {**os.environ,
+                   "PSModulePath": str(Path(os.environ["SystemRoot"]) / "System32"
+                                       / "WindowsPowerShell" / "v1.0" / "Modules")}
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive",
+                 "-ExecutionPolicy", "Bypass", "-File", str(path), *args],
+                capture_output=True, text=True, timeout=180, env=env)
+            return result.returncode, result.stdout, result.stderr
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @unittest.skipUnless(ENABLED, "Windows PowerShell required")
+    def test_real_built_package_reaches_beyond_prior_pathnotfound(self):
+        """The REAL producer output passes the installer preflight and
+        identity on the way to the privilege/mutation boundary: no
+        INSTALL_PAYLOAD_INCOMPLETE and no PathNotFound. The expected
+        boundary is read from the host's actual privilege (same
+        branch-strict rule as the identity canary)."""
+        with tempfile.TemporaryDirectory() as temp:
+            builder, package = self._build(Path(temp))
+            manifest = self._manifest_bytes(builder, package)
+            (package / "manifest.json").write_bytes(manifest)
+            code, out, _ = self._ps(
+                "$admin=[Security.Principal.WindowsPrincipal]::new("
+                "[Security.Principal.WindowsIdentity]::GetCurrent());"
+                "Write-Output ('PROBE_IS_ADMIN='+$admin.IsInRole("
+                "[Security.Principal.WindowsBuiltInRole]::Administrator))")
+            elevated = "PROBE_IS_ADMIN=True" in out
+            expected = ("MUTATION_INTERCEPTED" if elevated
+                        else "ADMINISTRATOR_INSTALL_REQUIRED")
+            preamble = (
+                "$ErrorActionPreference='Stop'\n"
+                "function New-Item { throw 'MUTATION_INTERCEPTED' }\n"
+                "function Set-Acl { throw 'MUTATION_INTERCEPTED' }\n"
+                "function Copy-Item { throw 'MUTATION_INTERCEPTED' }\n"
+                "function New-Service { throw 'MUTATION_INTERCEPTED' }\n"
+                "function Start-Service { throw 'MUTATION_INTERCEPTED' }\n"
+                "function Remove-Item { throw 'MUTATION_INTERCEPTED' }\n"
+                "try { & $args[0] -PackageRoot $args[1] "
+                "-WorkerId $args[2] -ApiBaseUrl $args[3]; exit 0 }\n"
+                "catch { Write-Output ('INSTALLER_CODE='+$_.Exception.Message);"
+                " exit 3 }\n")
+            rc, out, err = self._ps(
+                preamble, str(self.INSTALLER), str(package),
+                self.GUID, self.URL)
+            self.assertIn("INSTALLER_CODE=" + expected, out,
+                          "rc=%r out=%r err=%r" % (rc, out, err))
+            self.assertNotIn("INSTALL_PAYLOAD_INCOMPLETE", out)
+            self.assertNotIn("PathNotFound", err)
 
 
 if __name__ == "__main__":

@@ -131,17 +131,20 @@ try {
 $pkg = Join-Path ([IO.Path]::GetTempPath()) ('devai-glue-package-' + [Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($pkg) | Out-Null
 try {
-  $required = @('install-worker.ps1', 'install-support.ps1', 'control/worker_agent/windows_service.py')
+  $required = @('install-worker.ps1', 'install-support.ps1', 'control/worker_agent/windows_service.py', 'control/worker_agent/volume_host.py')
+  $runtimeRequired = @('host-runtime/python.exe', 'sandbox-runtime/python.exe', 'sandbox-runtime/synthetic_process.py')
   $repoRoot = Split-Path -Parent (Split-Path -Parent $DeployRoot)
-  foreach ($relative in $required) {
+  foreach ($relative in ($required + $runtimeRequired)) {
     $p = Join-Path $pkg $relative
     [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($p)) | Out-Null
     if ($relative -like 'control/worker_agent/*') { $src = Join-Path $repoRoot (($relative -replace '^control/', '') -replace '/', [IO.Path]::DirectorySeparatorChar) }
-    else { $src = Join-Path $DeployRoot $relative }
-    Copy-Item -LiteralPath $src -Destination $p
+    elseif ($relative -in $required) { $src = Join-Path $DeployRoot $relative }
+    else { $src = $null }
+    if ($src) { Copy-Item -LiteralPath $src -Destination $p }
+    else { [IO.File]::WriteAllText($p, 'non-secret fixture runtime') }
   }
   $entries = @()
-  foreach ($relative in $required) {
+  foreach ($relative in ($required + $runtimeRequired)) {
     $p = Join-Path $pkg $relative
     $entries += @{path = $relative; sha256 = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant(); size = (Get-Item -LiteralPath $p).Length}
   }

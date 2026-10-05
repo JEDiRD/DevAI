@@ -100,6 +100,15 @@ function Get-VerifiedWorkspaceVolume([string]$VhdPath,[string]$Mount,[string]$Ex
   return @{disk_number=[uint32]$disk.Number;file_backed=$true;disk_bytes=134217728;filesystem='NTFS';no_drive_letter=$true;mount_verified=$true}
 }
 
+function Get-RequiredInstallPayloadMembers {
+  # Single source for the install-payload allowlist, shared by the installer
+  # preflight (package root) and the resume validator (installed tree).
+  # Package-relative forward-slash names. Keep aligned with the release
+  # contract (REQUIRED_PACKAGE_MEMBERS in tools/release_lib.py) and the
+  # builder sandbox contract.
+  return @('host-runtime/python.exe','sandbox-runtime/python.exe','sandbox-runtime/synthetic_process.py','control/worker_agent/windows_service.py','control/worker_agent/volume_host.py')
+}
+
 function Assert-PartialWorkerInstall([string]$InstallRoot,[string]$StateRoot,$ReleaseManifest,[switch]$ExistingService,[string]$PreviousServiceHash,[string]$PreviousWorkspaceHash) {
   # RELEASE IDENTITY ONLY. This validator receives a validated release manifest from
   # Read-ReleaseManifest. There is deliberately no dual-shape handling and no
@@ -190,7 +199,7 @@ function Assert-PartialWorkerInstall([string]$InstallRoot,[string]$StateRoot,$Re
       elseif ($file.FullName -ne $manifestFile -and !$verified.Contains($file.FullName)) { throw 'INSTALLED_RUNTIME_UNMANIFESTED_FILE' }
     }
   }
-  foreach ($required in @('host-runtime/python.exe','sandbox-runtime/python.exe','sandbox-runtime/synthetic_process.py','control/worker_agent/windows_service.py','control/worker_agent/volume_host.py')) {
+  foreach ($required in (Get-RequiredInstallPayloadMembers)) {
     if (!$verified.Contains([IO.Path]::GetFullPath((Join-Path $InstallRoot $required)))) { throw 'INSTALLED_RUNTIME_REQUIRED_FILE_MISSING' }
   }
   if ($config.sandbox_executable_sha256 -ne $manifest.'sandbox-runtime/python.exe' -or

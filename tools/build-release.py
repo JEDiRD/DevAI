@@ -41,7 +41,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from release_lib import (  # noqa: E402
     PLATFORM, RELEASE_FORMAT, RELEASE_SCHEMA_VERSION, RELEASE_NAME,
-    ReleaseError, assert_required_package_members, blob, check_member_name,
+    ReleaseError, assert_required_package_members,
+    assert_runtime_payload_complete, blob, check_member_name,
     commit_timestamp, commit_tree, find_identity_leak, pretty_json_bytes,
     require_hex64, resolve_commit, sha256_bytes, sidecar_bytes,
     tree_of, worktree_is_clean,
@@ -294,8 +295,12 @@ def main(argv=None) -> int:
             manifest_path.write_bytes(manifest_bytes)
 
             # Self-check with the AUTHORITATIVE 5A verifier before packaging.
-            # Fail closed if an entire committed subtree failed to stage.
+            # Fail closed if an entire committed subtree failed to stage, or
+            # if a runtime payload is present but incomplete.
             assert_required_package_members(
+                [rel for rel, _full in builder._iter_payload_files(staging)] +
+                [builder.MANIFEST_NAME])
+            assert_runtime_payload_complete(
                 [rel for rel, _full in builder._iter_payload_files(staging)] +
                 [builder.MANIFEST_NAME])
             builder.verify_manifest(staging, manifest_bytes)

@@ -82,6 +82,30 @@ REQUIRED_PACKAGE_MEMBERS = (
 )
 
 
+# Runtime install-payload completeness. A package that carries ANY runtime
+# payload member must carry ALL of them: the proven failure was a dropped
+# sandbox-runtime alongside a present host-runtime, whose manifest stayed
+# self-consistent, verified clean, then died at install with PathNotFound.
+# (A wholly runtime-less package is still rejected at install time by the
+# installer payload preflight; the fast runtime-less build mode used by
+# tests stays usable.) Keep aligned with Get-RequiredInstallPayloadMembers
+# and the builder sandbox contract.
+RUNTIME_PAYLOAD_MEMBERS = (
+    "host-runtime/python.exe",
+    "sandbox-runtime/python.exe",
+    "sandbox-runtime/synthetic_process.py",
+)
+
+
+def assert_runtime_payload_complete(present,
+                                    code: str = "INCOMPLETE_RUNTIME_PAYLOAD"):
+    have = set(present)
+    if any(member in have for member in RUNTIME_PAYLOAD_MEMBERS):
+        for member in RUNTIME_PAYLOAD_MEMBERS:
+            if member not in have:
+                raise ReleaseError("%s:%s" % (code, member))
+
+
 def assert_required_package_members(present, code: str = "REQUIRED_PACKAGE_MEMBER_MISSING"):
     have = set(present)
     for member in REQUIRED_PACKAGE_MEMBERS:

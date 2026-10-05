@@ -109,6 +109,25 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue(any(m.startswith('NegativeControl:leak-detected-count=') and not m.endswith('=1')
                             for m in report['output_contracts']))
 
+    def test_installer_payload_preflight_rejects_incomplete_package(self):
+        """RH-D: a dropped sandbox-runtime verified clean and died with
+        PathNotFound at the copy loop. The installer preflights required
+        payload dirs/members before identity, elevation and any mutation;
+        a complete package proceeds past both validation and preflight."""
+        script=Path(__file__).parent/'windows'/'test_installer_payload_preflight.ps1'
+        env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}
+        result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+            '-File',str(script)],capture_output=True,text=True,timeout=180,env=env)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('INSTALLER_PREFLIGHT_CASES_PASSED',result.stdout)
+        report=json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(report['passed'])
+        for marker in ('POSITIVE:BEYOND_COPY_POINT',
+                       'NEGATIVE_DIR:FAIL_CLOSED_PRE_MUTATION',
+                       'NEGATIVE_MEMBER:FAIL_CLOSED_PRE_MUTATION',
+                       'MANIFEST_GATE:INTACT'):
+            self.assertIn(marker,report['cases'])
+
     def test_service_access_update_restores_both_files_and_manifest_on_integrity_failure(self):
         script=Path(__file__).parent/'windows'/'test_access_update_rollback.ps1'
         env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}

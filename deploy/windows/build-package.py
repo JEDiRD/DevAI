@@ -58,6 +58,16 @@ PAYLOAD = (
 RUNTIME_DIRS = ("host-runtime", "sandbox-runtime")
 RUNTIME_CORE = ("python.exe", "python313.dll", "python3.dll",
                 "vcruntime140.dll", "vcruntime140_1.dll")
+# Sandbox install-payload contract, derived from the frozen consumers
+# (Assert-PartialWorkerInstall requires exactly these members, and the
+# installer records their digests into service.json):
+#   sandbox-runtime/python.exe         <- pinned embeddable runtime archive
+#   sandbox-runtime/synthetic_process.py <- first-party worker_agent source
+# Nothing else is required there; in particular the sandbox is not a second
+# full runtime copy. Keep this list aligned with the installer allowlist.
+SANDBOX_PYTHON = "python.exe"
+SANDBOX_PAYLOAD = "synthetic_process.py"
+SANDBOX_SOURCE = "worker_agent/synthetic_process.py"
 
 
 class BuildError(RuntimeError):
@@ -160,6 +170,25 @@ def _install_runtime(destination, runtime_artifact):
     for name in RUNTIME_CORE:
         if not (destination / RUNTIME_DIRS[0] / name).is_file():
             raise BuildError("RUNTIME_COMPONENT_MISSING:%s" % name)
+
+    # Populate the sandbox directory from deterministic inputs only: the
+    # interpreter bytes come from the verified archive (via the extracted
+    # primary runtime, never from the host), the payload from the first-party
+    # source tree. An absent sandbox member is a hard failure, never an
+    # empty directory: the installer copies this subtree and records its
+    # digests, so a silent gap would ship an uninstallable package.
+    sandbox = destination / RUNTIME_DIRS[1]
+    sandbox.mkdir(parents=True, exist_ok=True)
+    host_python = destination / RUNTIME_DIRS[0] / SANDBOX_PYTHON
+    (sandbox / SANDBOX_PYTHON).write_bytes(host_python.read_bytes())
+    payload_src = REPO_ROOT / SANDBOX_SOURCE
+    if not payload_src.is_file():
+        raise BuildError("PAYLOAD_MISSING:%s" % SANDBOX_SOURCE)
+    (sandbox / SANDBOX_PAYLOAD).write_bytes(payload_src.read_bytes())
+    for name in (SANDBOX_PYTHON, SANDBOX_PAYLOAD):
+        if not (sandbox / name).is_file():
+            raise BuildError("RUNTIME_COMPONENT_MISSING:%s/%s"
+                             % (RUNTIME_DIRS[1], name))
     del artifact
 
 
