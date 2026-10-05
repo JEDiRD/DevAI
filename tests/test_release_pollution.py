@@ -52,14 +52,21 @@ def scan_pollution(root: Path) -> list[str]:
 
 
 # Synthetic runtime payload completing an offline-built test artifact.
-# Same fixture discipline as test_release_artifact: the offline build carries
-# no pinned runtime, while production verification strictly requires a
-# complete one. Fixed labeled bytes; digests recomputed over actual bytes.
+# Same fixture discipline as test_release_artifact: a mirrored synthetic
+# host tree plus the payload, with digests recomputed over actual bytes.
 _SYNTHETIC_RUNTIME = (
     ("package/host-runtime/python.exe",
      b"RHB-TEST-FIXTURE-RUNTIME:host-python"),
+    ("package/host-runtime/Lib/os.py",
+     b"RHB-TEST-FIXTURE-RUNTIME:lib-os"),
+    ("package/host-runtime/DLLs/_socket.pyd",
+     b"RHB-TEST-FIXTURE-RUNTIME:ext-socket"),
     ("package/sandbox-runtime/python.exe",
-     b"RHB-TEST-FIXTURE-RUNTIME:sandbox-python"),
+     b"RHB-TEST-FIXTURE-RUNTIME:host-python"),
+    ("package/sandbox-runtime/Lib/os.py",
+     b"RHB-TEST-FIXTURE-RUNTIME:lib-os"),
+    ("package/sandbox-runtime/DLLs/_socket.pyd",
+     b"RHB-TEST-FIXTURE-RUNTIME:ext-socket"),
     ("package/sandbox-runtime/synthetic_process.py",
      b"RHB-TEST-FIXTURE-RUNTIME:synthetic-payload"),
 )

@@ -37,8 +37,11 @@ $root=Join-Path ([IO.Path]::GetTempPath()) ('devai-installer-validation-'+[Guid]
 try {
   # RH-B 5A-2A: the release contract is manifest.json. No target value
   # (worker_id, api_base_url, personal_denial_fixture) and no credential may
-  # appear in the artifact.
-  $required=@('install-worker.ps1','install-support.ps1','control/worker_agent/windows_service.py')
+  # appear in the artifact. The fixture payload is always complete (runtime
+  # dirs + members): the installer preflights payload completeness before
+  # ValidateOnly success, so manifest failures stay distinguishable from
+  # payload failures.
+  $required=@('install-worker.ps1','install-support.ps1','control/worker_agent/windows_service.py','control/worker_agent/volume_host.py','host-runtime/python.exe','sandbox-runtime/python.exe','sandbox-runtime/synthetic_process.py')
   foreach ($relative in $required) {
     $path=Join-Path $root $relative
     [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path)) | Out-Null

@@ -43,7 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from release_lib import (  # noqa: E402
     ALLOWED_TOP_LEVEL, ARTIFACT_FORMAT, RELEASE_FORMAT, RELEASE_NAME,
     RELEASE_SCHEMA_VERSION, ReleaseError, assert_no_target_state_keys, assert_required_package_members,
-    assert_runtime_payload_complete,
+    assert_runtime_mirror_complete, assert_runtime_payload_complete,
     check_member_name, commit_timestamp, commit_tree, find_identity_leak,
     parse_sidecar, require_git_oid, require_hex64, sha256_bytes, tree_of,
 )
@@ -352,6 +352,10 @@ def verify_package(document: dict, members: dict) -> str:
     # sandbox-runtime beside a present host-runtime verified clean and then
     # failed install with PathNotFound.
     assert_runtime_payload_complete(package_members)
+    # And the sandbox runtime must mirror the host runtime byte for byte: a
+    # partial sandbox (proven: lone python.exe dies with STATUS_DLL_NOT_FOUND)
+    # cannot execute the payload, even with the anchor files present.
+    assert_runtime_mirror_complete(package_members)
 
     # Materialise ONLY already-validated regular files into a scratch directory
     # so the single authoritative 5A verifier can run. No archive extraction of

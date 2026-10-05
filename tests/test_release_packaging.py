@@ -702,6 +702,28 @@ class SandboxRuntimeContractTests(unittest.TestCase):
                     r"INCOMPLETE_RUNTIME_PAYLOAD:sandbox-runtime/synthetic_process\.py"):
                 rl.assert_runtime_payload_complete(present)
 
+    def test_embedded_dependency_omission_breaks_mirror(self):
+        """Closure 2 proof: remove one operationally required sandbox
+        runtime dependency (an extension module) and regenerate a
+        self-consistent manifest. Anchors are all present, so only the
+        mirror invariant can catch it -- and must, with the exact member."""
+        with tempfile.TemporaryDirectory() as temp:
+            builder, package = self._build(Path(temp))
+            (package / "sandbox-runtime" / "DLLs" / "_socket.pyd").unlink()
+            manifest = self._manifest_bytes(builder, package)
+            self.assertEqual("DEVAI_PACKAGE_MANIFEST",
+                             builder.verify_manifest(package, manifest))
+            blobs = {}
+            for entry in json.loads(manifest)["files"]:
+                rel = entry["path"]
+                if rel == "manifest.json":
+                    continue
+                blobs[rel] = (package / rel).read_bytes()
+            with self.assertRaisesRegex(
+                    rl.ReleaseError,
+                    r"RUNTIME_MIRROR_MISMATCH:sandbox-runtime/DLLs/_socket\.pyd"):
+                rl.assert_runtime_mirror_complete(blobs)
+
     def test_two_builds_are_byte_identical(self):
         with tempfile.TemporaryDirectory() as temp:
             work = Path(temp)

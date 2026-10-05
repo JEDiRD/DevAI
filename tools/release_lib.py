@@ -124,6 +124,49 @@ def assert_runtime_payload_complete(present,
             raise ReleaseError("%s:%s" % (code, member))
 
 
+def assert_runtime_mirror_complete(files,
+                                   code: str = "RUNTIME_MIRROR_MISMATCH"):
+    """The sandbox runtime must mirror the host runtime, byte for byte.
+
+    files: mapping of package-relative path -> bytes. Production executes
+    sandbox-runtime/python.exe directly, and a partial sandbox (proven: a
+    lone python.exe dies with STATUS_DLL_NOT_FOUND) cannot run the payload.
+    The required embedded-runtime member set is whatever the pinned runtime
+    input produced for host-runtime: sandbox-runtime must contain exactly
+    those bytes plus the sandbox-specific synthetic_process.py. No
+    hand-maintained DLL list that could rot; the mirror IS the contract.
+
+    Vacuous only when neither runtime carries any file at all (the
+    deliberate runtime-less fast-build test mode). A one-sided or partial
+    runtime always fails. Member names in the error are safe: they are
+    package-relative contract paths, never secrets or target state.
+    """
+    host = {name[len("host-runtime/"):]: data
+            for name, data in files.items()
+            if name.startswith("host-runtime/")}
+    sand = {name[len("sandbox-runtime/"):]: data
+            for name, data in files.items()
+            if name.startswith("sandbox-runtime/")}
+    if not host and not sand:
+        return
+    payload = sand.pop("synthetic_process.py", None)
+    if payload is None:
+        raise ReleaseError("%s:%s" % (code, "sandbox-runtime/synthetic_process.py"))
+    if sand != host:
+        only_host = sorted(set(host) - set(sand))
+        only_sand = sorted(set(sand) - set(host))
+        differ = sorted(n for n in set(host) & set(sand)
+                        if host[n] != sand[n])
+        first = (only_host or only_sand or differ)[:1]
+        detail = first[0] if first else "unknown"
+        # Defensive: the detail must be a full package-relative member path.
+        # A bare fragment here would mean the comparison above is not
+        # operating on the intended keys, and must fail loudly rather than
+        # emit a misleading code.
+        assert isinstance(detail, str) and "/" in detail, repr(detail)
+        raise ReleaseError("%s:%s" % (code, "sandbox-runtime/" + detail))
+
+
 def assert_required_package_members(present, code: str = "REQUIRED_PACKAGE_MEMBER_MISSING"):
     have = set(present)
     for member in REQUIRED_PACKAGE_MEMBERS:

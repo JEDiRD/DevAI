@@ -42,7 +42,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from release_lib import (  # noqa: E402
     PLATFORM, RELEASE_FORMAT, RELEASE_SCHEMA_VERSION, RELEASE_NAME,
     ReleaseError, assert_required_package_members,
-    assert_runtime_payload_complete, blob, check_member_name,
+    assert_runtime_mirror_complete, assert_runtime_payload_complete, blob,
+    check_member_name,
     commit_timestamp, commit_tree, find_identity_leak, pretty_json_bytes,
     require_hex64, resolve_commit, sha256_bytes, sidecar_bytes,
     tree_of, worktree_is_clean,
@@ -308,6 +309,9 @@ def main(argv=None) -> int:
                 [rel for rel, _full in builder._iter_payload_files(staging)] +
                 [builder.MANIFEST_NAME],
                 allow_absent=runtime_artifact is None)
+            assert_runtime_mirror_complete({
+                rel: full.read_bytes()
+                for rel, full in builder._iter_payload_files(staging)})
             builder.verify_manifest(staging, manifest_bytes)
             builder.verify_identity_aggregate(staging, manifest_bytes)
             manifest = json.loads(manifest_bytes.decode("utf-8"))

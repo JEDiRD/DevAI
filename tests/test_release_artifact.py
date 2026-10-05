@@ -48,16 +48,25 @@ _DIGEST = ""
 # The offline test build carries no pinned runtime (the pinned 11 MB archive
 # is a CI/production input, not a unit-test input), so the artifact built in
 # setUpModule is runtime-less. Production verification strictly requires a
-# complete runtime payload, therefore the test artifact is completed here
-# with clearly-labeled synthetic runtime members plus regenerated
-# manifest/release/sidecar digests recomputed over the actual bytes.
-# Production builds always carry the real runtime (STEP6 passes
-# --runtime-artifact); nothing here weakens that contract.
+# complete AND mirrored runtime, therefore the test artifact is completed
+# here: the synthetic host tree is mirrored byte-identically into the
+# sandbox (plus the payload), with manifest/release/sidecar digests
+# recomputed over the actual bytes. Production builds always carry the real
+# runtime (STEP6 passes --runtime-artifact); nothing here weakens that
+# contract.
 _SYNTHETIC_RUNTIME = (
     ("package/host-runtime/python.exe",
      b"RHB-TEST-FIXTURE-RUNTIME:host-python"),
+    ("package/host-runtime/Lib/os.py",
+     b"RHB-TEST-FIXTURE-RUNTIME:lib-os"),
+    ("package/host-runtime/DLLs/_socket.pyd",
+     b"RHB-TEST-FIXTURE-RUNTIME:ext-socket"),
     ("package/sandbox-runtime/python.exe",
-     b"RHB-TEST-FIXTURE-RUNTIME:sandbox-python"),
+     b"RHB-TEST-FIXTURE-RUNTIME:host-python"),
+    ("package/sandbox-runtime/Lib/os.py",
+     b"RHB-TEST-FIXTURE-RUNTIME:lib-os"),
+    ("package/sandbox-runtime/DLLs/_socket.pyd",
+     b"RHB-TEST-FIXTURE-RUNTIME:ext-socket"),
     ("package/sandbox-runtime/synthetic_process.py",
      b"RHB-TEST-FIXTURE-RUNTIME:synthetic-payload"),
 )
@@ -951,9 +960,11 @@ class IncompletePackageRegressionTests(unittest.TestCase):
         must still refuse it, because no installer/runtime contract can be
         satisfied. This is the whole-payload variant of the f1210a6
         dropped-sandbox shape."""
+        runtime_names = {name for name, _ in _SYNTHETIC_RUNTIME}
         members = {k: v for k, v in self.members.items()
-                   if k not in (name for name, _ in _SYNTHETIC_RUNTIME)}
-        self.assertEqual(3, len(self.members) - len(members))
+                   if k not in runtime_names}
+        self.assertEqual(len(runtime_names),
+                         len(self.members) - len(members))
         members = _rebuild_identities(members)
         # Self-consistency holds on disk: materialize the package subtree
         # (manifest entries are package-relative) and run the builder's own

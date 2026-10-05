@@ -27,20 +27,22 @@ Assert-ManifestRequiredMembers $manifest @(
 # Recompute the V2 identity aggregate from verified payload bytes and compare.
 Assert-ManifestIdentityAggregate $PackageRoot $manifest | Out-Null
 
-if ($ValidateOnly) { Write-Output 'DEVAI_PACKAGE_VALIDATED'; return }
-
-# --- INSTALL PAYLOAD PREFLIGHT (read-only; before identity/elevation/mutation) ---
+# --- INSTALL PAYLOAD PREFLIGHT (read-only; before ValidateOnly success) ---
 # A manifest can be internally self-consistent yet describe an uninstallable
 # payload (observed: a silently dropped sandbox-runtime verified clean, then
-# failed install with PathNotFound at the copy loop). Fail closed here,
-# before ProgramData/ProgramFiles/ACL/service/credential mutation. Test-Path
-# only, so the read-only boundary above is preserved.
+# failed install with PathNotFound at the copy loop). ValidateOnly success
+# must therefore mean structurally installable, not merely manifest-valid:
+# fail closed here, before the ValidateOnly return and before identity,
+# elevation and any target mutation (ProgramData/Files, ACLs, services,
+# credentials). Test-Path only, so the read-only boundary above is preserved.
 foreach ($directory in @('control','host-runtime','sandbox-runtime')) {
   if (!(Test-Path -LiteralPath (Join-Path $PackageRoot $directory) -PathType Container)) { throw "INSTALL_PAYLOAD_INCOMPLETE:$directory" }
 }
 foreach ($required in (Get-RequiredInstallPayloadMembers)) {
   if (!(Test-Path -LiteralPath (Join-Path $PackageRoot ($required -replace '/', [IO.Path]::DirectorySeparatorChar)) -PathType Leaf)) { throw "INSTALL_PAYLOAD_INCOMPLETE:$required" }
 }
+
+if ($ValidateOnly) { Write-Output 'DEVAI_PACKAGE_VALIDATED'; return }
 
 # --- TARGET IDENTITY (read-only; never mutates the target) ---
 # Identity and endpoint are TARGET CONFIG. They are never concrete data in

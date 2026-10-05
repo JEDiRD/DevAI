@@ -51,16 +51,26 @@ def make_package(root: Path, *, extra_files=(), runtime=False):
 
     manifest.json is OUTSIDE files[] (it cannot hash itself); every other
     immutable member is inside.
+
+    The fixture runtime payload is always complete (host + mirrored sandbox
+    + payload): since the installer preflights payload completeness before
+    ValidateOnly success, a fixture without it could never validate, and no
+    test could distinguish manifest failures from payload failures. The
+    legacy `runtime` flag is retained for compatibility but no longer changes
+    the payload: fixture bytes are clearly non-executable test data, never
+    confused with the pinned canonical runtime.
     """
     (root / "control" / "worker_agent").mkdir(parents=True, exist_ok=True)
     (root / "control" / "worker_agent" / "windows_service.py").write_bytes(b"# svc\n")
     (root / "control" / "worker_agent" / "provision.py").write_bytes(b"# prov\n")
+    (root / "control" / "worker_agent" / "volume_host.py").write_bytes(b"# volhost\n")
     shutil.copy2(INSTALLER, root / "install-worker.ps1")
     shutil.copy2(SUPPORT, root / "install-support.ps1")
-    if runtime:
-        rt = root / "host-runtime"
-        rt.mkdir(parents=True, exist_ok=True)
-        (rt / "python.exe").write_bytes(b"MZfake")
+    for directory in ("host-runtime", "sandbox-runtime"):
+        (root / directory).mkdir(parents=True, exist_ok=True)
+    (root / "host-runtime" / "python.exe").write_bytes(b"MZfixture")
+    (root / "sandbox-runtime" / "python.exe").write_bytes(b"MZfixture")
+    (root / "sandbox-runtime" / "synthetic_process.py").write_bytes(b"# fixture\n")
     for name, body in extra_files:
         (root / name).write_bytes(body)
 

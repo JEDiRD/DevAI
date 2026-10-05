@@ -195,6 +195,35 @@ def _install_runtime(destination, runtime_artifact):
     if not (sandbox / SANDBOX_PAYLOAD).is_file():
         raise BuildError("RUNTIME_COMPONENT_MISSING:%s/%s"
                          % (RUNTIME_DIRS[1], SANDBOX_PAYLOAD))
+    # Mirror invariant: sandbox-runtime must equal host-runtime byte for
+    # byte, plus the payload. A partial sandbox cannot execute the payload
+    # (proven: STATUS_DLL_NOT_FOUND), so anything less than an exact mirror
+    # is a hard failure here, not a latent install defect.
+    host_files = {}
+    for dirpath, dirnames, filenames in os.walk(destination / RUNTIME_DIRS[0]):
+        dirnames[:] = sorted(d for d in dirnames
+                             if d not in ("__pycache__", ".git"))
+        for name in sorted(filenames):
+            full = Path(dirpath) / name
+            host_files[full.relative_to(destination / RUNTIME_DIRS[0]).as_posix()] = \
+                full.read_bytes()
+    sand_files = {}
+    for dirpath, dirnames, filenames in os.walk(sandbox):
+        dirnames[:] = sorted(d for d in dirnames
+                             if d not in ("__pycache__", ".git"))
+        for name in sorted(filenames):
+            full = Path(dirpath) / name
+            rel = full.relative_to(sandbox).as_posix()
+            if rel == SANDBOX_PAYLOAD:
+                continue
+            sand_files[rel] = full.read_bytes()
+    if sand_files != host_files:
+        missing = sorted(set(host_files) - set(sand_files))
+        extra = sorted(set(sand_files) - set(host_files))
+        differ = sorted(n for n in set(host_files) & set(sand_files)
+                        if host_files[n] != sand_files[n])
+        first = (missing or extra or differ)[:1]
+        raise BuildError("RUNTIME_MIRROR_MISMATCH:%s" % (first[0] if first else "?"))
     del artifact
 
 
