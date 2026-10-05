@@ -456,7 +456,10 @@ function Assert-ManifestPathSafe {
 function Assert-ManifestPayload {
   # Full immutable integrity gate. Everything here precedes any target mutation.
   param([Parameter(Mandatory=$true)][string]$PackageRoot,$Manifest)
-  Assert-ManagedNoReparse $PackageRoot
+  # Out-Null is load-bearing: Assert-ManagedNoReparse returns the item, and
+  # without this a DirectoryInfo would join the $verified table in this
+  # function's output, so callers would receive Object[] instead of Hashtable.
+  Assert-ManagedNoReparse $PackageRoot | Out-Null
   for ($parent=$PackageRoot; $null -ne $parent; $parent=$parent.Parent) {
     if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'PACKAGE_ANCESTOR_REPARSE_POINT' }
   }
@@ -670,7 +673,7 @@ function New-TargetPersonalDenialFixture {
         [Security.Principal.SecurityIdentifier]::new($identity),'FullControl','None','None','Allow')))
     }
   }
-  if (Test-Path -LiteralPath $fixture) { Assert-ManagedNoReparse $fixture }
+  if (Test-Path -LiteralPath $fixture) { Assert-ManagedNoReparse $fixture | Out-Null }
   else { [IO.File]::WriteAllText($fixture,"Non-secret DevAI dedicated-service ACL acceptance fixture.`n") }
   # Applied after creation so an existing file is normalised to the same model.
   ([IO.FileInfo]$fixture).SetAccessControl($fileAcl)

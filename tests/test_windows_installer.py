@@ -29,12 +29,18 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('VARIABLE_COLLISION_AUDIT_PASSED',result.stdout)
         self.assertIn('INSTALLER_GLUE_CASES_PASSED',result.stdout)
         self.assertIn('INSTALLER_GLUE_CANARY_PASSED:ADMINISTRATOR_INSTALL_REQUIRED',result.stdout)
+        self.assertIn('OUTPUT_CONTRACTS_PASSED',result.stdout)
         report=json.loads(result.stdout.strip().splitlines()[-1])
         self.assertTrue(report['passed'])
         self.assertEqual(report['collision_sites'],0)
         for marker in ('A:CLI_ONLY_PASS','B:CONFIG_ONLY_PASS','C:MATCHING_PASS',
                        'D:CONFLICT_FAILS_CLOSED','E:MISSING_FAILS_CLOSED'):
             self.assertIn(marker,report['glue_cases'])
+        for marker in ('ManifestPayload:1xHashtable','ReadConfig:1xPSCustomObject',
+                       'Fixture:1xString-fresh-and-existing'):
+            self.assertIn(marker,report['output_contracts'])
+        self.assertTrue(any(m.startswith('NegativeControl:leak-detected-count=') and not m.endswith('=1')
+                            for m in report['output_contracts']))
 
     def test_service_access_update_restores_both_files_and_manifest_on_integrity_failure(self):
         script=Path(__file__).parent/'windows'/'test_access_update_rollback.ps1'

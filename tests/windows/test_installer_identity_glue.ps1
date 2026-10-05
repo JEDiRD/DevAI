@@ -194,5 +194,70 @@ try {
   [IO.Directory]::Delete($pkg, $true)
 }
 
+# ---------- Part 4: load-bearing helper return contracts ----------
+# Pipeline leakage (a bare command emitting an object inside a helper) changes
+# the caller's received value/type. Each contract below asserts the exact
+# output shape at runtime; the negative control proves the assertions bite.
+$contracts = @()
+
+$pkg2 = Join-Path ([IO.Path]::GetTempPath()) ('devai-output-contract-' + [Guid]::NewGuid().ToString('N'))
+[IO.Directory]::CreateDirectory($pkg2) | Out-Null
+try {
+  [IO.File]::WriteAllText((Join-Path $pkg2 'a.txt'), 'payload')
+  $pdata = [IO.File]::ReadAllBytes((Join-Path $pkg2 'a.txt'))
+  $psha = [Security.Cryptography.SHA256]::Create()
+  try { $pdigest = ([BitConverter]::ToString($psha.ComputeHash($pdata))).Replace('-', '').ToLowerInvariant() }
+  finally { $psha.Dispose() }
+  $pman = @{ Files = @{ 'a.txt' = @{ size = $pdata.Length; sha256 = $pdigest } } }
+  $r = @(Assert-ManifestPayload $pkg2 $pman)
+  if ($r.Count -ne 1) { throw ('CONTRACT_MANIFESTPAYLOAD_COUNT:' + $r.Count) }
+  if ($r[0].GetType().FullName -ne 'System.Collections.Hashtable') { throw ('CONTRACT_MANIFESTPAYLOAD_TYPE:' + $r[0].GetType().FullName) }
+  $contracts += 'ManifestPayload:1xHashtable'
+} finally { [IO.Directory]::Delete($pkg2, $true) }
+
+$cfg2 = Join-Path ([IO.Path]::GetTempPath()) ('devai-output-contract-' + [Guid]::NewGuid().ToString('N') + '.json')
+[IO.File]::WriteAllText($cfg2, (@{worker_id = $GuidCli; api_base_url = $UrlCli} | ConvertTo-Json))
+try {
+  $r = @(Read-TargetServiceConfig -ConfigFile $cfg2)
+  if ($r.Count -ne 1) { throw ('CONTRACT_READCONFIG_COUNT:' + $r.Count) }
+  if ($r[0].GetType().FullName -ne 'System.Management.Automation.PSCustomObject') { throw ('CONTRACT_READCONFIG_TYPE:' + $r[0].GetType().FullName) }
+  $contracts += 'ReadConfig:1xPSCustomObject'
+} finally { [IO.File]::Delete($cfg2) }
+
+$prof2 = Join-Path $env:USERPROFILE ('rhb-output-contract-' + [Guid]::NewGuid().ToString('N'))
+$owner2 = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+try {
+  $r = @(New-TargetPersonalDenialFixture -ProfileRoot $prof2 -OwnerSid $owner2)
+  if ($r.Count -ne 1 -or $r[0].GetType().FullName -ne 'System.String') { throw ('CONTRACT_FIXTURE_FRESH:' + $r.Count + ':' + $r[0].GetType().FullName) }
+  # Pre-existing fixture must return the identical shape: a second object
+  # (the reparse assertion's FileInfo) used to leak here, turning the
+  # caller's $fixture into Object[] on reinstall paths.
+  $r = @(New-TargetPersonalDenialFixture -ProfileRoot $prof2 -OwnerSid $owner2)
+  if ($r.Count -ne 1 -or $r[0].GetType().FullName -ne 'System.String') { throw ('CONTRACT_FIXTURE_EXISTING:' + $r.Count + ':' + $r[0].GetType().FullName) }
+  $contracts += 'Fixture:1xString-fresh-and-existing'
+} finally {
+  if ($prof2.StartsWith($env:USERPROFILE, [StringComparison]::OrdinalIgnoreCase) -and
+      $prof2 -ne $env:USERPROFILE -and (Test-Path -LiteralPath $prof2)) {
+    [IO.Directory]::Delete($prof2, $true)
+  }
+}
+
+# Negative control: a synthetic helper with the pre-fix shape (bare
+# Assert-ManagedNoReparse leaking FileInfo alongside the intended value).
+# The contract assertion must REJECT it, or the test is blind.
+function TestOnly-LeakingReader {
+  param([string]$ConfigFile)
+  Assert-ManagedNoReparse $ConfigFile
+  return (Get-Content -LiteralPath $ConfigFile -Raw | ConvertFrom-Json)
+}
+$cfg3 = Join-Path ([IO.Path]::GetTempPath()) ('devai-output-contract-neg-' + [Guid]::NewGuid().ToString('N') + '.json')
+[IO.File]::WriteAllText($cfg3, (@{worker_id = $GuidCli; api_base_url = $UrlCli} | ConvertTo-Json))
+try {
+  $r = @(TestOnly-LeakingReader -ConfigFile $cfg3)
+  if ($r.Count -eq 1) { throw 'NEGATIVE_CONTROL_BLIND' }
+  $contracts += ('NegativeControl:leak-detected-count=' + $r.Count)
+} finally { [IO.File]::Delete($cfg3) }
+Write-Output 'OUTPUT_CONTRACTS_PASSED'
+
 $report.passed = $true
-Write-Output (@{collision_sites = $report.collision_sites.Count; glue_cases = $report.glue_cases; passed = $true} | ConvertTo-Json -Compress)
+Write-Output (@{collision_sites = $report.collision_sites.Count; glue_cases = $report.glue_cases; output_contracts = $contracts; passed = $true} | ConvertTo-Json -Compress)
