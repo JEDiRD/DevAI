@@ -295,14 +295,19 @@ def main(argv=None) -> int:
             manifest_path.write_bytes(manifest_bytes)
 
             # Self-check with the AUTHORITATIVE 5A verifier before packaging.
-            # Fail closed if an entire committed subtree failed to stage, or
-            # if a runtime payload is present but incomplete.
+            # Fail closed if an entire committed subtree failed to stage.
+            # Runtime completeness is required exactly when a runtime was
+            # requested: a build that was given --runtime-artifact but dropped
+            # part of it fails here, while the deliberate runtime-less
+            # fast-build test mode (no runtime requested) stays usable.
+            # Production release verification itself is always strict.
             assert_required_package_members(
                 [rel for rel, _full in builder._iter_payload_files(staging)] +
                 [builder.MANIFEST_NAME])
             assert_runtime_payload_complete(
                 [rel for rel, _full in builder._iter_payload_files(staging)] +
-                [builder.MANIFEST_NAME])
+                [builder.MANIFEST_NAME],
+                allow_absent=runtime_artifact is None)
             builder.verify_manifest(staging, manifest_bytes)
             builder.verify_identity_aggregate(staging, manifest_bytes)
             manifest = json.loads(manifest_bytes.decode("utf-8"))

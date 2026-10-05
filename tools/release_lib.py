@@ -98,12 +98,30 @@ RUNTIME_PAYLOAD_MEMBERS = (
 
 
 def assert_runtime_payload_complete(present,
-                                    code: str = "INCOMPLETE_RUNTIME_PAYLOAD"):
+                                    code: str = "INCOMPLETE_RUNTIME_PAYLOAD",
+                                    *, allow_absent: bool = False):
+    """Completeness of the runtime install payload.
+
+    Strict by default: every listed member must be present. A manifest that
+    accurately describes a runtime-less or runtime-partial payload is
+    self-consistent yet uninstallable (observed: dropped sandbox-runtime
+    verified clean, then failed install with PathNotFound), so production
+    release verification must refuse it -- and does, because the release
+    verifier never passes allow_absent.
+
+    allow_absent=True is ONLY for the build staging self-check, which must
+    stay usable in the deliberate runtime-less fast-build test mode (the
+    pinned 11 MB runtime archive is a CI/production input, not a unit-test
+    input). A build that was GIVEN a runtime but dropped part of it still
+    fails: callers pass allow_absent only when no runtime was requested.
+    """
     have = set(present)
-    if any(member in have for member in RUNTIME_PAYLOAD_MEMBERS):
-        for member in RUNTIME_PAYLOAD_MEMBERS:
-            if member not in have:
-                raise ReleaseError("%s:%s" % (code, member))
+    if allow_absent and not any(member in have
+                                for member in RUNTIME_PAYLOAD_MEMBERS):
+        return
+    for member in RUNTIME_PAYLOAD_MEMBERS:
+        if member not in have:
+            raise ReleaseError("%s:%s" % (code, member))
 
 
 def assert_required_package_members(present, code: str = "REQUIRED_PACKAGE_MEMBER_MISSING"):

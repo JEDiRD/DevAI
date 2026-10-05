@@ -587,12 +587,22 @@ class SandboxRuntimeContractTests(unittest.TestCase):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         builder = load_builder()
+        # Core files plus a stdlib module and an extension module: the mirror
+        # assertion below then covers executable layout, package tree and
+        # extension layout generically. Fixed bytes and fixed timestamps keep
+        # the input deterministic (only entry bytes are consumed anyway).
+        extra = {"Lib/os.py": b"RHB-SYNTHETIC-RUNTIME:lib-os",
+                 "DLLs/_socket.pyd": b"RHB-SYNTHETIC-RUNTIME:ext-socket"}
         with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
-            for name in builder.RUNTIME_CORE:
+            for name in list(builder.RUNTIME_CORE):
                 info = zipfile.ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0))
                 info.compress_type = zipfile.ZIP_DEFLATED
                 archive.writestr(
                     info, b"RHB-SYNTHETIC-RUNTIME:" + name.encode("utf-8"))
+            for name, data in extra.items():
+                info = zipfile.ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0))
+                info.compress_type = zipfile.ZIP_DEFLATED
+                archive.writestr(info, data)
 
     def _build(self, work):
         """Run the real producer into work/package; return (builder, package)."""
@@ -609,16 +619,42 @@ class SandboxRuntimeContractTests(unittest.TestCase):
     def test_sandbox_runtime_populated_from_deterministic_inputs(self):
         with tempfile.TemporaryDirectory() as temp:
             builder, package = self._build(Path(temp))
-            sandbox_python = package / "sandbox-runtime" / "python.exe"
-            self.assertTrue(sandbox_python.is_file())
+            sandbox = package / "sandbox-runtime"
+            host = package / "host-runtime"
+            self.assertTrue((sandbox / "python.exe").is_file())
             # Interpreter bytes come from the runtime input, never the host.
             self.assertEqual(
-                (package / "host-runtime" / "python.exe").read_bytes(),
-                sandbox_python.read_bytes())
+                (host / "python.exe").read_bytes(),
+                (sandbox / "python.exe").read_bytes())
+            # The sandbox is a FULL runtime copy (a lone python.exe cannot
+            # start: STATUS_DLL_NOT_FOUND), so every host-runtime file must
+            # exist byte-identically under sandbox-runtime.
+            for path in sorted(host.rglob("*")):
+                if not path.is_file():
+                    continue
+                rel = path.relative_to(host)
+                self.assertEqual(
+                    path.read_bytes(), (sandbox / rel).read_bytes(),
+                    "sandbox-runtime/%s differs from host-runtime" % rel.as_posix())
             # Payload bytes come from the first-party source tree.
             self.assertEqual(
                 (REPO / "worker_agent" / "synthetic_process.py").read_bytes(),
-                (package / "sandbox-runtime" / "synthetic_process.py").read_bytes())
+                (sandbox / "synthetic_process.py").read_bytes())
+
+    def test_sandbox_core_present_in_both_runtimes(self):
+        """The builder post-condition: every RUNTIME_CORE member exists in
+        BOTH runtime directories. A lone python.exe cannot start
+        (STATUS_DLL_NOT_FOUND, proven once by executing the exact intended
+        sandbox invocation from a real built package); the layout that can
+        start is asserted structurally here, and the executable proof is
+        re-run in CI where the pinned runtime bytes are present."""
+        with tempfile.TemporaryDirectory() as temp:
+            builder, package = self._build(Path(temp))
+            for runtime in ("host-runtime", "sandbox-runtime"):
+                for name in builder.RUNTIME_CORE:
+                    self.assertTrue(
+                        (package / runtime / name).is_file(),
+                        "%s/%s missing" % (runtime, name))
 
     def test_manifest_includes_sandbox_members(self):
         with tempfile.TemporaryDirectory() as temp:

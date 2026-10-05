@@ -43,6 +43,90 @@ _ARTIFACT: Path | None = None
 _SIDECAR: Path | None = None
 _DIGEST = ""
 
+# Synthetic runtime payload completing the offline test artifact.
+#
+# The offline test build carries no pinned runtime (the pinned 11 MB archive
+# is a CI/production input, not a unit-test input), so the artifact built in
+# setUpModule is runtime-less. Production verification strictly requires a
+# complete runtime payload, therefore the test artifact is completed here
+# with clearly-labeled synthetic runtime members plus regenerated
+# manifest/release/sidecar digests recomputed over the actual bytes.
+# Production builds always carry the real runtime (STEP6 passes
+# --runtime-artifact); nothing here weakens that contract.
+_SYNTHETIC_RUNTIME = (
+    ("package/host-runtime/python.exe",
+     b"RHB-TEST-FIXTURE-RUNTIME:host-python"),
+    ("package/sandbox-runtime/python.exe",
+     b"RHB-TEST-FIXTURE-RUNTIME:sandbox-python"),
+    ("package/sandbox-runtime/synthetic_process.py",
+     b"RHB-TEST-FIXTURE-RUNTIME:synthetic-payload"),
+)
+
+
+def load_builder():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "devai_package_builder_for_artifact_tests",
+        REPO / "deploy" / "windows" / "build-package.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _complete_runtime(members):
+    """Add the synthetic runtime payload and regenerate identities."""
+    for name, data in _SYNTHETIC_RUNTIME:
+        members[name] = data
+    return _rebuild_identities(members)
+
+
+def _rewrite_artifact(path):
+    """Complete the runtime payload in place; recompute the sidecar.
+
+    Returns the new outer digest. Deterministic: fixed synthetic bytes,
+    sorted members, preserved epoch, normalized tar metadata.
+    """
+    members = _complete_runtime(read_members(path))
+    epoch = json.loads(members["release.json"])["source"]["source_date_epoch"]
+    write_tar(path, list(members.items()), epoch)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    path.with_suffix(path.suffix + ".sha256").write_bytes(
+        rl.sidecar_bytes(digest, path.name))
+    return digest
+
+
+def _rebuild_identities(members):
+    """Recompute manifest.json + release.json over member bytes.
+
+    members: dict tar-name -> bytes, with a (possibly stale)
+    package/manifest.json entry. Manifest files[] mirrors the tar set
+    (minus manifest.json itself); document shape, policy and runtime
+    sections are otherwise preserved. Returns the updated dict.
+    """
+    builder = load_builder()
+    entries = sorted(
+        (name[len("package/"):], data)
+        for name, data in members.items()
+        if name.startswith("package/") and name != "package/manifest.json")
+    manifest = json.loads(members["package/manifest.json"])
+    manifest["files"] = [
+        {"path": rel, "sha256": hashlib.sha256(data).hexdigest(),
+         "size": len(data)}
+        for rel, data in entries]
+    manifest["identity"]["aggregate_sha256"] = hashlib.sha256(
+        builder.serialize_manifest_v2(entries)).hexdigest()
+    manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True)
+                      + "\n").encode("utf-8")
+    members["package/manifest.json"] = manifest_bytes
+    release = json.loads(members["release.json"])
+    release["package"]["manifest_sha256"] = hashlib.sha256(
+        manifest_bytes).hexdigest()
+    release["package"]["manifest_v2_aggregate"] = manifest["identity"][
+        "aggregate_sha256"]
+    members["release.json"] = (json.dumps(release, indent=2, sort_keys=True)
+                               + "\n").encode("utf-8")
+    return members
+
 
 def setUpModule():
     global _BUILD_DIR, _ARTIFACT, _SIDECAR, _DIGEST
@@ -53,10 +137,13 @@ def setUpModule():
         capture_output=True, text=True, cwd=str(REPO), timeout=600)
     if result.returncode != 0:
         raise AssertionError("BUILD_FAILED:%s" % result.stderr)
-    _DIGEST = result.stdout.split()[0]
     tarballs = list(_BUILD_DIR.glob("*.tar"))
     assert len(tarballs) == 1, tarballs
     _ARTIFACT = tarballs[0]
+    # Complete the runtime payload synthetically (see _SYNTHETIC_RUNTIME):
+    # the offline build carries no pinned runtime, while production
+    # verification strictly requires a complete one.
+    _DIGEST = _rewrite_artifact(_ARTIFACT)
     _SIDECAR = _ARTIFACT.with_suffix(_ARTIFACT.suffix + ".sha256")
 
 
@@ -168,6 +255,11 @@ class DeterminismTests(unittest.TestCase):
                 capture_output=True, text=True, cwd=str(REPO), timeout=600)
             self.assertEqual(0, result.returncode, result.stderr)
             other = list(second.glob("*.tar"))[0]
+            # Both artifacts go through the same synthetic runtime
+            # completion, so this still proves builder determinism
+            # end to end (raw builds would differ from _ARTIFACT only by
+            # the completion both receive here).
+            _rewrite_artifact(other)
             self.assertEqual(_ARTIFACT.read_bytes(), other.read_bytes())
             self.assertEqual(_SIDECAR.read_bytes(), other.with_suffix(
                 other.suffix + ".sha256").read_bytes())
@@ -852,6 +944,38 @@ class IncompletePackageRegressionTests(unittest.TestCase):
         path = self.work / "nosvc.tar"
         write_tar(path, list(members.items()), self.epoch)
         expect_failure(self, path, "REQUIRED_PACKAGE_MEMBER_MISSING")
+
+    def test_runtime_less_self_consistent_package_rejected_by_production_cli(self):
+        """A manifest that accurately describes a payload with NO runtime
+        payload at all is self-consistent -- and production verify-release
+        must still refuse it, because no installer/runtime contract can be
+        satisfied. This is the whole-payload variant of the f1210a6
+        dropped-sandbox shape."""
+        members = {k: v for k, v in self.members.items()
+                   if k not in (name for name, _ in _SYNTHETIC_RUNTIME)}
+        self.assertEqual(3, len(self.members) - len(members))
+        members = _rebuild_identities(members)
+        # Self-consistency holds on disk: materialize the package subtree
+        # (manifest entries are package-relative) and run the builder's own
+        # manifest check. This proves the f1210a6 shape.
+        materialized = self.work / "noruntime"
+        materialized.mkdir()
+        for name, data in members.items():
+            if not name.startswith("package/"):
+                continue
+            target = materialized / name[len("package/"):]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        builder = load_builder()
+        self.assertEqual(
+            "DEVAI_PACKAGE_MANIFEST",
+            builder.verify_manifest(
+                materialized,
+                members["package/manifest.json"]))
+        path = self.work / "noruntime.tar"
+        write_tar(path, list(members.items()), self.epoch)
+        combined = expect_failure(self, path, "INCOMPLETE_RUNTIME_PAYLOAD")
+        self.assertNotIn("RELEASE_VERIFIED", combined)
 
 
 if __name__ == "__main__":

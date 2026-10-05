@@ -58,14 +58,20 @@ PAYLOAD = (
 RUNTIME_DIRS = ("host-runtime", "sandbox-runtime")
 RUNTIME_CORE = ("python.exe", "python313.dll", "python3.dll",
                 "vcruntime140.dll", "vcruntime140_1.dll")
-# Sandbox install-payload contract, derived from the frozen consumers
-# (Assert-PartialWorkerInstall requires exactly these members, and the
-# installer records their digests into service.json):
-#   sandbox-runtime/python.exe         <- pinned embeddable runtime archive
-#   sandbox-runtime/synthetic_process.py <- first-party worker_agent source
-# Nothing else is required there; in particular the sandbox is not a second
-# full runtime copy. Keep this list aligned with the installer allowlist.
-SANDBOX_PYTHON = "python.exe"
+# Sandbox install-payload contract.
+#
+# sandbox-runtime carries the pinned interpreter PLUS the first-party sandbox
+# payload (synthetic_process.py). It is a FULL copy of the extracted runtime,
+# not a two-file subset: production executes sandbox-runtime/python.exe
+# directly (WindowsProcessTreeLauncher via CreateProcessW, see
+# worker_agent/windows_service.py), and a lone python.exe cannot even start
+# (STATUS_DLL_NOT_FOUND -- proven by executing the exact intended invocation
+# from a real built package). The transitive closure the interpreter needs
+# (DLLs, Lib/, extension modules) is determined by the interpreter and the
+# payload, not by static consumer mentions, so any hand-picked subset would
+# rot when payload imports change. Same zip bytes in, same directory bytes
+# out: determinism is preserved. Keep the required-member contracts aligned
+# (release_lib, Get-RequiredInstallPayloadMembers).
 SANDBOX_PAYLOAD = "synthetic_process.py"
 SANDBOX_SOURCE = "worker_agent/synthetic_process.py"
 
@@ -153,42 +159,42 @@ def write_package_files(destination, runtime_artifact=None):
 
 
 def _install_runtime(destination, runtime_artifact):
-    """Extract the verified embeddable runtime. Fail closed on gaps."""
+    """Extract the verified embeddable runtime. Fail closed on gaps.
+
+    Both runtime directories receive the full extracted runtime: the sandbox
+    must be executable (see SANDBOX contract above), and only a complete
+    copy is subset-rot-proof. The first-party sandbox payload is added on
+    top of the sandbox copy.
+    """
     with zipfile.ZipFile(artifact := Path(runtime_artifact)) as archive:
         names = sorted(archive.namelist(), key=lambda n: n.encode("utf-8"))
-        runtime = destination / RUNTIME_DIRS[0]
-        runtime.mkdir(parents=True, exist_ok=True)
-        for name in names:
-            if name.endswith("/"):
-                continue
-            target = runtime / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(archive.read(name))
+        for runtime_dir in RUNTIME_DIRS:
+            runtime = destination / runtime_dir
+            runtime.mkdir(parents=True, exist_ok=True)
+            for name in names:
+                if name.endswith("/"):
+                    continue
+                target = runtime / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(archive.read(name))
 
-    # Every expected core component must exist; absence is a hard failure
-    # rather than a silent skip.
-    for name in RUNTIME_CORE:
-        if not (destination / RUNTIME_DIRS[0] / name).is_file():
-            raise BuildError("RUNTIME_COMPONENT_MISSING:%s" % name)
+    # Every expected core component must exist in BOTH runtimes; absence is
+    # a hard failure rather than a silent skip.
+    for runtime_dir in RUNTIME_DIRS:
+        for name in RUNTIME_CORE:
+            if not (destination / runtime_dir / name).is_file():
+                raise BuildError("RUNTIME_COMPONENT_MISSING:%s/%s"
+                                 % (runtime_dir, name))
 
-    # Populate the sandbox directory from deterministic inputs only: the
-    # interpreter bytes come from the verified archive (via the extracted
-    # primary runtime, never from the host), the payload from the first-party
-    # source tree. An absent sandbox member is a hard failure, never an
-    # empty directory: the installer copies this subtree and records its
-    # digests, so a silent gap would ship an uninstallable package.
+    # First-party sandbox payload, from the deterministic source tree only.
     sandbox = destination / RUNTIME_DIRS[1]
-    sandbox.mkdir(parents=True, exist_ok=True)
-    host_python = destination / RUNTIME_DIRS[0] / SANDBOX_PYTHON
-    (sandbox / SANDBOX_PYTHON).write_bytes(host_python.read_bytes())
     payload_src = REPO_ROOT / SANDBOX_SOURCE
     if not payload_src.is_file():
         raise BuildError("PAYLOAD_MISSING:%s" % SANDBOX_SOURCE)
     (sandbox / SANDBOX_PAYLOAD).write_bytes(payload_src.read_bytes())
-    for name in (SANDBOX_PYTHON, SANDBOX_PAYLOAD):
-        if not (sandbox / name).is_file():
-            raise BuildError("RUNTIME_COMPONENT_MISSING:%s/%s"
-                             % (RUNTIME_DIRS[1], name))
+    if not (sandbox / SANDBOX_PAYLOAD).is_file():
+        raise BuildError("RUNTIME_COMPONENT_MISSING:%s/%s"
+                         % (RUNTIME_DIRS[1], SANDBOX_PAYLOAD))
     del artifact
 
 

@@ -51,6 +51,74 @@ def scan_pollution(root: Path) -> list[str]:
     return sorted(found)
 
 
+# Synthetic runtime payload completing an offline-built test artifact.
+# Same fixture discipline as test_release_artifact: the offline build carries
+# no pinned runtime, while production verification strictly requires a
+# complete one. Fixed labeled bytes; digests recomputed over actual bytes.
+_SYNTHETIC_RUNTIME = (
+    ("package/host-runtime/python.exe",
+     b"RHB-TEST-FIXTURE-RUNTIME:host-python"),
+    ("package/sandbox-runtime/python.exe",
+     b"RHB-TEST-FIXTURE-RUNTIME:sandbox-python"),
+    ("package/sandbox-runtime/synthetic_process.py",
+     b"RHB-TEST-FIXTURE-RUNTIME:synthetic-payload"),
+)
+
+
+def _complete_test_artifact_runtime(path: Path) -> None:
+    """Add synthetic runtime members; regenerate manifest/release/sidecar."""
+    import io
+    import json
+    import tarfile
+    sys.dont_write_bytecode = True
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "devai_package_builder_for_pollution_tests",
+        REPO / "deploy" / "windows" / "build-package.py")
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    members = {}
+    with tarfile.open(path, "r:") as archive:
+        for info in archive.getmembers():
+            handle = archive.extractfile(info)
+            members[info.name] = handle.read() if handle else b""
+    for name, data in _SYNTHETIC_RUNTIME:
+        members[name] = data
+    entries = sorted(
+        (name[len("package/"):], data)
+        for name, data in members.items()
+        if name.startswith("package/") and name != "package/manifest.json")
+    manifest = json.loads(members["package/manifest.json"])
+    manifest["files"] = [
+        {"path": rel, "sha256": hashlib.sha256(data).hexdigest(),
+         "size": len(data)}
+        for rel, data in entries]
+    manifest["identity"]["aggregate_sha256"] = hashlib.sha256(
+        builder.serialize_manifest_v2(entries)).hexdigest()
+    manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True)
+                      + "\n").encode("utf-8")
+    members["package/manifest.json"] = manifest_bytes
+    release = json.loads(members["release.json"])
+    release["package"]["manifest_sha256"] = hashlib.sha256(
+        manifest_bytes).hexdigest()
+    release["package"]["manifest_v2_aggregate"] = manifest["identity"][
+        "aggregate_sha256"]
+    members["release.json"] = (json.dumps(release, indent=2, sort_keys=True)
+                               + "\n").encode("utf-8")
+    epoch = release["source"]["source_date_epoch"]
+    with tarfile.open(path, "w", format=tarfile.GNU_FORMAT) as archive:
+        for name, data in sorted(members.items(),
+                                 key=lambda item: item[0].encode("utf-8")):
+            info = tarfile.TarInfo(name)
+            info.mtime = epoch
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            info.mode = 0o644
+            info.type = tarfile.REGTYPE
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+
+
 class ToolingDisablesBytecodeTests(unittest.TestCase):
     """The narrow fix itself: bytecode writing is disabled before local imports."""
 
@@ -129,6 +197,11 @@ class CanonicalBuildPollutionTests(unittest.TestCase):
         tarballs = list(out.glob("*.tar"))
         self.assertTrue(tarballs, "build produced no artifact")
         tar = tarballs[0]
+        # Complete the runtime payload synthetically: production verification
+        # strictly requires a complete runtime, while the offline build
+        # carries no pinned runtime (same fixture discipline as
+        # test_release_artifact). Digests are recomputed over actual bytes.
+        _complete_test_artifact_runtime(tar)
         digest = hashlib.sha256(tar.read_bytes()).hexdigest()
         before = scan_pollution(self.clone)
         self.assertEqual([], before)
