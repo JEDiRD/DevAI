@@ -369,6 +369,80 @@ function Assert-PackageEntryName {
   }
 }
 
+function Initialize-LongPathNative {
+  # Canonicalization support. Windows PowerShell 5.1 runs on .NET Framework 4.x,
+  # which does NOT provide [IO.Path]::GetRelativePath (that API arrived with
+  # .NET Core 2.0 / .NET Standard 2.1). Resolving 8.3 short components therefore
+  # goes through the Win32 API, which is available on every supported runtime.
+  # Add-Type is guarded so repeated dot-sourcing stays idempotent.
+  if ('DevAi.LongPathNative' -as [type]) { return }
+  Add-Type @'
+namespace DevAi {
+  public static class LongPathNative {
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet=System.Runtime.InteropServices.CharSet.Unicode, SetLastError=true)]
+    public static extern uint GetLongPathName(string lpszShortPath, System.Text.StringBuilder lpszLongPath, uint cchBuffer);
+  }
+}
+'@ -ErrorAction Stop
+}
+
+function Get-CanonicalLongPath {
+  # Resolves any 8.3 short component to its long spelling. Fails closed: an
+  # unresolvable path is never silently treated as already-canonical, because a
+  # wrong canonical form would corrupt the containment check downstream.
+  param([Parameter(Mandatory=$true)][string]$Path)
+  Initialize-LongPathNative
+  $buffer = New-Object System.Text.StringBuilder 32768
+  $needed = [DevAi.LongPathNative]::GetLongPathName($Path, $buffer, 32768)
+  if ($needed -eq 0) { throw "PACKAGE_PATH_CANONICALIZATION_FAILED:$Path" }
+  if ($needed -gt 32768) { throw "PACKAGE_PATH_CANONICALIZATION_TRUNCATED:$Path" }
+  return $buffer.ToString()
+}
+
+function Get-CanonicalPackageRelativePath {
+  # SINGLE authoritative derivation of a package member's manifest-relative path.
+  #
+  # It never subtracts a length from the caller-supplied spelling. That previous
+  # behaviour assumed $PackageRoot and the enumerated FullName used the same
+  # lexical form, which is false whenever the root is reached through an 8.3
+  # alias -- hosted Windows runners expose TEMP as an 8.3 alias of the user
+  # profile directory -- and it rejected valid packages as
+  # UNMANIFESTED_PACKAGE_FILE.
+  #
+  # Order of operations, and each step is a hard gate:
+  #   1. canonicalize root and member to the SAME long-form representation
+  #   2. absolute-path normalization of both
+  #   3. directory-BOUNDARY-aware containment (not a bare prefix compare, so a
+  #      sibling such as C:\pkg2\evil cannot pass as C:\pkg)
+  #   4. Windows case-insensitive comparison
+  #   5. relative path derived ONLY after canonicalization
+  #   6. separators normalized to '/' for manifest comparison
+  #   7. empty / '.' / '..' / drive-qualified remnants rejected
+  # Anything that does not resolve strictly inside the root fails closed.
+  param(
+    [Parameter(Mandatory=$true)][string]$PackageRoot,
+    [Parameter(Mandatory=$true)][string]$CandidatePath
+  )
+  $rootFull = [IO.Path]::GetFullPath((Get-CanonicalLongPath -Path $PackageRoot)).TrimEnd('\','/')
+  $candFull = [IO.Path]::GetFullPath((Get-CanonicalLongPath -Path $CandidatePath))
+  if ($candFull.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "PACKAGE_MEMBER_IS_ROOT:$CandidatePath"
+  }
+  if (!$candFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "PACKAGE_MEMBER_OUTSIDE_ROOT:$CandidatePath"
+  }
+  $relative = $candFull.Substring($rootFull.Length + 1)
+  if ([string]::IsNullOrWhiteSpace($relative)) { throw "PACKAGE_MEMBER_RELATIVE_EMPTY:$CandidatePath" }
+  $relative = $relative.Replace('\','/')
+  if ($relative.Contains(':')) { throw "PACKAGE_MEMBER_RELATIVE_DRIVE_QUALIFIED:$relative" }
+  foreach ($segment in $relative.Split('/')) {
+    if ($segment -eq '' -or $segment -eq '.' -or $segment -eq '..') {
+      throw "PACKAGE_MEMBER_RELATIVE_UNSAFE:$relative"
+    }
+  }
+  return $relative
+}
+
 function Assert-ManifestPathSafe {
   # Containment: the resolved member must stay inside the release root.
   param([string]$PackageRoot,[string]$Relative)
@@ -399,7 +473,7 @@ function Assert-ManifestPayload {
     $verified[$relative]=$digest
   }
   foreach ($item in (Get-ChildItem -LiteralPath $PackageRoot -Recurse -Force -File)) {
-    $relative=$item.FullName.Substring($PackageRoot.Length+1).Replace('\','/')
+    $relative=Get-CanonicalPackageRelativePath -PackageRoot $PackageRoot -CandidatePath $item.FullName
     if ($relative -eq 'manifest.json') { continue }
     if (!$verified.ContainsKey($relative)) { throw "UNMANIFESTED_PACKAGE_FILE:$relative" }
   }

@@ -188,7 +188,7 @@ if (!(Test-TargetCredentialPresent $credential)) { throw 'CREDENTIAL_PROVISIONIN
 # manifest.json contract and is deliberately named apart from it.
 $installedTreeManifest=@{}
 Get-ChildItem -LiteralPath $installRoot -Recurse -File | ForEach-Object {
-  $relative=$_.FullName.Substring($installRoot.Length+1).Replace('\','/')
+  $relative=Get-CanonicalPackageRelativePath -PackageRoot $installRoot -CandidatePath $_.FullName
   $installedTreeManifest[$relative]=(Get-FileHash -LiteralPath $_.FullName).Hash.ToLowerInvariant()
 }
 $manifestFile=Join-Path $installRoot 'manifest.json'
