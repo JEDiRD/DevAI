@@ -69,14 +69,23 @@ class ToolingDisablesBytecodeTests(unittest.TestCase):
                         source.index("\nfrom release_lib import"))
 
     def test_release_lib_does_not_write_bytecode_on_import(self):
-        """Importing the shared helper alone must be side-effect free."""
+        """Importing the shared helper alone must be side-effect free.
+
+        PYTHONDONTWRITEBYTECODE is set to "1", not to an empty string. An empty
+        value is present but not truthy, so CPython still writes bytecode; that
+        left tools/__pycache__/release_lib.cpython-*.pyc in the source checkout
+        and made the source-pollution gate reject the tree it had just polluted.
+        """
+        env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
         result = subprocess.run(
             [sys.executable, "-c",
              "import sys; sys.path.insert(0, r'%s'); import release_lib; "
              "print('ok')" % TOOLS],
-            capture_output=True, text=True, timeout=120,
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": ""})
+            capture_output=True, text=True, timeout=120, env=env)
         self.assertEqual(0, result.returncode, result.stderr)
+        self.assertNotIn("__pycache__", "\n".join(
+            str(p) for p in TOOLS.rglob("__pycache__")),
+            "importing release_lib must not create bytecode in tools/")
 
 
 class CanonicalBuildPollutionTests(unittest.TestCase):
