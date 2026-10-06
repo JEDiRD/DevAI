@@ -165,6 +165,28 @@ class InstallerTests(unittest.TestCase):
                        'FAILURE:ATOMIC_NO_SERVICE_NO_CREDENTIAL'):
             self.assertIn(marker,report['cases'])
 
+    def test_credential_provisioning_stdin_writer_closed_no_property_assignment(self):
+        """RH-D: the provisioner assigned $null to the read-only
+        Process.StandardInput property, killing every fresh install after
+        the token prompt. The fix writes/flushes/closes through a local
+        writer reference. Proved here with a disposable token and a
+        controlled fixture child (no DPAPI, no network, no secrets);
+        plus the old shape failing with the reproduced ReadOnly error."""
+        script=Path(__file__).parent/'windows'/'test_credential_provisioning.ps1'
+        env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}
+        result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+            '-File',str(script)],capture_output=True,text=True,timeout=600,env=env)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('CREDENTIAL_PROVISIONING_CASES_PASSED',result.stdout)
+        report=json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(report['passed'])
+        for marker in ('SUCCESS:EXACT_STDIN_CLEAN_ARGV_CLEAN_ENV_REPEATABLE',
+                       'FAILURE:PROPAGATED_NO_CREDENTIAL',
+                       'NEGATIVE:OLD_SHAPE_REJECTED_WITH_READONLY',
+                       'CLEANUP:INTACT_NO_PROPERTY_ASSIGNMENT',
+                       'SECRECY:NO_TOKEN_IN_FILES_OR_OUTPUT'):
+            self.assertIn(marker,report['cases'])
+
     def test_service_access_update_restores_both_files_and_manifest_on_integrity_failure(self):
         script=Path(__file__).parent/'windows'/'test_access_update_rollback.ps1'
         env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}

@@ -769,9 +769,14 @@ function Invoke-TargetCredentialProvisioning {
   $process=[Diagnostics.Process]::Start($psi)
   try {
     # Written to the child's stdin and immediately dropped from this buffer.
-    $process.StandardInput.Write($Token)
-    $process.StandardInput.Close()
-    $process.StandardInput=$null
+    # StandardInput is a read-only property: take the writer it returns into
+    # a local, flush and close it explicitly, then drop the local reference.
+    # Assigning to the property itself throws PropertyAssignmentException.
+    $stdinWriter=$process.StandardInput
+    $stdinWriter.Write($Token)
+    $stdinWriter.Flush()
+    $stdinWriter.Close()
+    $stdinWriter=$null
     $Token=$null
     $process.WaitForExit()
   } finally {

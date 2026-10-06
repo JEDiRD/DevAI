@@ -313,8 +313,15 @@ class SecretContainmentTests(unittest.TestCase):
         source = SUPPORT.read_text(encoding="utf-8")
         body = source[source.index("function Invoke-TargetCredentialProvisioning"):]
         self.assertIn("RedirectStandardInput=$true", body)
-        self.assertIn("StandardInput.Write($Token)", body)
-        self.assertIn("StandardInput.Close()", body)
+        # The writer is taken into a local because Process.StandardInput is
+        # read-only: assigning to the property throws PropertyAssignmentException
+        # and killed every fresh install (RH-D). The local must write, flush
+        # and close; the property itself must never be assigned.
+        self.assertIn("$stdinWriter=$process.StandardInput", body)
+        self.assertIn("$stdinWriter.Write($Token)", body)
+        self.assertIn("$stdinWriter.Flush()", body)
+        self.assertIn("$stdinWriter.Close()", body)
+        self.assertNotIn("$process.StandardInput=", body)
 
     def test_bstr_is_freed(self):
         source = INSTALLER.read_text(encoding="utf-8")
