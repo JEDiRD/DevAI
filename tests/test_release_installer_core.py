@@ -443,6 +443,25 @@ class LegacyFormatTests(unittest.TestCase):
         self.assertIn("Read-WorkerTokenSecureString -FromStdin:$WorkerTokenFromStdin", source)
         self.assertIsNone(re.search(r"\[string\]\$WorkerToken", source))
 
+    def test_workspace_volume_guid_is_recorded_only_once_settled(self):
+        """RH-D: the mount manager settles a new mount asynchronously. The
+        first GUID read can name a transient pre-filesystem volume; the
+        installer recorded it, and the first boot died in workspace_recovery
+        with FileNotFoundError on the dangling mount while the settled volume
+        was healthy. New-PrivateWorkspaceVolume must resolve the mount on
+        consecutive reads and verify before recording, failing closed on
+        timeout instead of recording a transient identity."""
+        source = SUPPORT.read_text(encoding="utf-8")
+        body = source[source.index("function New-PrivateWorkspaceVolume"):]
+        body = body[:body.index("\n}")]
+        self.assertIn("Add-PartitionAccessPath", body)
+        anchor = body.index("Add-PartitionAccessPath")
+        settle = body.index("WORKSPACE_MOUNT_NOT_STABLE")
+        self.assertLess(anchor, settle)
+        self.assertIn("$first=Get-WorkspaceMountGuid $Mount", body)
+        self.assertIn("$second=Get-WorkspaceMountGuid $Mount", body)
+        self.assertIn("Get-VerifiedWorkspaceVolume $VhdPath $Mount $first", body)
+
     def test_fresh_credential_is_stamped_before_service_creation(self):
         """RH-D: the provision child leaves worker.dpapi with an inherited
         (unprotected) DACL, but the service verify_install gate requires the

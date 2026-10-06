@@ -314,7 +314,27 @@ function New-PrivateWorkspaceVolume([string]$VhdPath,[string]$Mount) {
   $formatted=Format-Volume -Partition $partition -FileSystem NTFS -NewFileSystemLabel DevAIWorkspace -Confirm:$false
   if ($formatted.FileSystemType -ne 'NTFS') { throw 'WORKSPACE_FORMAT_NOT_VERIFIED' }
   Add-PartitionAccessPath -InputObject $partition -AccessPath ($Mount+'\') -Confirm:$false
-  $guid=Get-WorkspaceMountGuid $Mount
+  # The mount manager settles the new mount asynchronously: the first GUID
+  # read can name a transient pre-filesystem volume that later gives way to
+  # the formatted NTFS volume (RH-D: the recorded GUID no longer existed at
+  # first boot, the mount dangled, and the worker died in workspace_recovery
+  # with FileNotFoundError while the settled volume was healthy and empty).
+  # Do not record until the mount resolves to the same GUID on consecutive
+  # reads AND the full verified volume check passes on that GUID. Fail
+  # closed on timeout; never record a transient identity.
+  $guid=$null
+  $deadline=[DateTime]::UtcNow.AddSeconds(90)
+  while ($true) {
+    $first=Get-WorkspaceMountGuid $Mount
+    Start-Sleep -Seconds 5
+    $second=Get-WorkspaceMountGuid $Mount
+    if ($first -ceq $second) {
+      Get-VerifiedWorkspaceVolume $VhdPath $Mount $first | Out-Null
+      $guid=$first
+      break
+    }
+    if ([DateTime]::UtcNow -ge $deadline) { throw 'WORKSPACE_MOUNT_NOT_STABLE' }
+  }
   Get-VerifiedWorkspaceVolume $VhdPath $Mount $guid | Out-Null
   # A freshly formatted NTFS root does not reliably carry a trusted owner
   # (observed: NT AUTHORITY\NETWORK SERVICE with an unprotected DACL on a

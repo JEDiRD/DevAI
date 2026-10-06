@@ -24,6 +24,12 @@ if (-not $admin.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $serviceSid = 'S-1-5-80-1-2-3-4-5'
 $report = [ordered]@{ cases = @(); passed = $false }
 
+# Baseline for the atomicity case below: the harness must create no
+# service/credential state itself. Pre-existing state (e.g. a real install
+# under test on the same machine) is recorded, not mistaken for harness
+# output; on a clean machine this is identical to asserting absence.
+$svcBefore = [bool](Get-Service -Name DevAIWorker -ErrorAction Ignore)
+$credBefore = Test-Path -LiteralPath (Join-Path $env:ProgramData 'DevAIWorker\credentials\worker.dpapi')
 $probeRoot = Join-Path ([IO.Path]::GetTempPath()) ('rhb-vol-probe-' + [Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($probeRoot) | Out-Null
 $vhd1 = Join-Path $probeRoot 'workspace.vhdx'
@@ -44,6 +50,19 @@ try {
   # 3. Read-back validation is unblocked by the normalization.
   $null = Get-WorkspaceRootPolicy $vhd1 $mount1 $guid1 $serviceSid
   $report.cases += 'READBACK:UNBLOCKED'
+
+  # 3b. The returned GUID is settled, not transient: the mount manager
+  # resolves the new mount asynchronously, and the first read can name a
+  # pre-filesystem volume that later gives way to the formatted volume
+  # (RH-D: recorded GUID gone at first boot, worker died in
+  # workspace_recovery with FileNotFoundError on the dangling mount).
+  # New-PrivateWorkspaceVolume must not return until consecutive reads
+  # agree, so a delayed re-read matches and still verifies.
+  Start-Sleep -Seconds 10
+  $guid1b = Get-WorkspaceMountGuid $mount1
+  if ($guid1b -cne $guid1) { throw ('VOLUME_GUID_NOT_SETTLED:' + $guid1b) }
+  $null = Get-VerifiedWorkspaceVolume $vhd1 $mount1 $guid1b
+  $report.cases += 'SETTLED:RECORDED_GUID_STABLE_AND_VERIFIED'
 
   # 4. Full canonical policy: exact owner, exact ACE set, worker rights.
   $summary = Set-WorkspaceRootPolicy $vhd1 $mount1 $guid1 $serviceSid
@@ -100,8 +119,8 @@ try {
   } catch {
     if ($_.Exception.Message -ne 'WORKSPACE_ROOT_SECURITY_TARGET_INVALID') { throw ('MALFORMED_WRONG_CODE:' + $_.Exception.Message) }
   }
-  if (Get-Service -Name DevAIWorker -ErrorAction Ignore) { throw 'FAILURE_CREATED_SERVICE' }
-  if (Test-Path -LiteralPath (Join-Path $env:ProgramData 'DevAIWorker\credentials\worker.dpapi')) { throw 'FAILURE_CREATED_CREDENTIAL' }
+  if ([bool](Get-Service -Name DevAIWorker -ErrorAction Ignore) -ne $svcBefore) { throw 'FAILURE_CREATED_SERVICE' }
+  if ((Test-Path -LiteralPath (Join-Path $env:ProgramData 'DevAIWorker\credentials\worker.dpapi')) -ne $credBefore) { throw 'FAILURE_CREATED_CREDENTIAL' }
   $report.cases += 'FAILURE:ATOMIC_NO_SERVICE_NO_CREDENTIAL'
 
   Write-Output 'WORKSPACE_VOLUME_PROVISIONING_PASSED'
