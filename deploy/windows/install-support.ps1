@@ -21,9 +21,26 @@ function Assert-ManagedPrivateAcl([string]$Path,[string]$ServiceSid,[switch]$All
   }
 }
 
+function Get-IsolatedModuleArguments {
+  # Canonical invocation of a packaged module on the isolated embedded
+  # interpreter (python313._pth honors neither cwd nor PYTHONPATH, and site
+  # is skipped, so -m resolution from any working directory fails). The
+  # package parent is established explicitly through sys.path; -I -S -B
+  # stay with the caller, which owns isolation flags. Shared by credential
+  # provisioning and service startup so the two invocation shapes cannot
+  # drift apart again. Forward slashes avoid escape ambiguity in the child.
+  param([Parameter(Mandatory=$true)][string]$ControlDir,
+        [Parameter(Mandatory=$true)][string]$Module,
+        [string]$RestArgs='')
+  $fwd=$ControlDir.Replace('\','/')
+  $prelude='-c "import sys,runpy;sys.path.insert(0,''' + $fwd + ''');runpy.run_module(''' + $Module + ''',run_name=''__main__'')"'
+  if ([string]::IsNullOrWhiteSpace($RestArgs)) { return $prelude }
+  return ($prelude + ' ' + $RestArgs)
+}
+
 function Get-WorkerServiceCommand([string]$InstallRoot,[string]$ConfigFile) {
   $python=Join-Path $InstallRoot 'host-runtime/python.exe'
-  return ('"'+$python+'" -I -S -B -m worker_agent.windows_service --config "'+$ConfigFile+'"')
+  return ('"'+$python+'" -I -S -B ' + (Get-IsolatedModuleArguments -ControlDir (Join-Path $InstallRoot 'control') -Module 'worker_agent.windows_service' -RestArgs ('--config "'+$ConfigFile+'"')))
 }
 
 function New-WorkerService([string]$BinaryPath) {
@@ -760,13 +777,11 @@ function Invoke-TargetCredentialProvisioning {
   $psi=New-Object Diagnostics.ProcessStartInfo
   $psi.FileName=$python
   # No token in argv. Only non-secret identity and destination. The package
-  # is resolved through an explicit sys.path insert because the isolated
-  # embedded interpreter (python313._pth) honors neither the working
-  # directory nor PYTHONPATH for -m resolution (RH-D: ModuleNotFoundError
-  # made provisioning fail closed on every install). Only sys.path is
-  # always honored. Forward slashes avoid escape ambiguity in the child.
-  $controlFwd=(Join-Path $InstallRoot 'control').Replace('\','/')
-  $psi.Arguments='-c "import sys,runpy;sys.path.insert(0,''' + $controlFwd + ''');runpy.run_module(''worker_agent.provision'',run_name=''__main__'')" --worker-id ' + $WorkerId + ' --store-path "' + $CredentialPath + '"'
+  # is resolved through the shared isolated-module helper (the isolated
+  # embedded interpreter honors neither cwd nor PYTHONPATH for -m
+  # resolution; RH-D ModuleNotFoundError made provisioning fail closed on
+  # every install). Forward slashes avoid escape ambiguity in the child.
+  $psi.Arguments=(Get-IsolatedModuleArguments -ControlDir (Join-Path $InstallRoot 'control') -Module 'worker_agent.provision' -RestArgs ('--worker-id ' + $WorkerId + ' --store-path "' + $CredentialPath + '"'))
   $psi.WorkingDirectory=$InstallRoot
   $psi.UseShellExecute=$false
   $psi.RedirectStandardInput=$true

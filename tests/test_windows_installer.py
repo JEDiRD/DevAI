@@ -213,6 +213,31 @@ class InstallerTests(unittest.TestCase):
             self.assertNotEqual(bad.returncode, 0)
             self.assertIn("ModuleNotFoundError", bad.stderr)
 
+    def test_service_command_resolves_package_outside_the_package_dir(self):
+        """RH-D mechanism proof for the service entry point.
+
+        SCM starts DevAIWorker with cwd=System32, and the pinned interpreter
+        honors neither cwd nor PYTHONPATH, so the legacy
+        `-m worker_agent.windows_service` shape could not import the package on
+        any install. The harness runs the EXACT generated service command
+        against a real interpreter and the real worker_agent package in the
+        production control/ layout from System32, and pins the legacy shape as
+        a negative control so the pass cannot come from the environment."""
+        script=Path(__file__).parent/'windows'/'test_service_command_resolution.ps1'
+        env={k: v for k, v in os.environ.items() if k != 'PYTHONPATH'}
+        env['PSModulePath']=str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')
+        result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+            '-File',str(script)],capture_output=True,text=True,timeout=1800,env=env)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('SERVICE_COMMAND_RESOLUTION_CASES_PASSED',result.stdout)
+        report=json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(report['passed'])
+        for marker in ('RESOLVES_FROM_SYSTEM32:EXACT_GENERATED_COMMAND',
+                       'VOLUME_HELPER:FLAG_PRESERVED_AND_RESOLVES',
+                       'NEGATIVE_CONTROL:LEGACY_DASH_M_REPRODUCES_MODULE_NOT_FOUND',
+                       'NO_BYPASS:ISOLATION_FLAGS_AND_NO_ENV_DEPENDENCY'):
+            self.assertIn(marker,report['cases'])
+
     def test_service_access_update_restores_both_files_and_manifest_on_integrity_failure(self):
         script=Path(__file__).parent/'windows'/'test_access_update_rollback.ps1'
         env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}

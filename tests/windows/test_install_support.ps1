@@ -18,8 +18,33 @@ function Get-CimInstance {param($ClassName,$Filter)
   return [pscustomobject]@{PathName=$script:recorded.PathName;StartName=$(if($script:wrongIdentity){'LocalSystem'}else{'NT SERVICE\DevAIWorker'});StartMode='Auto'}
 }
 $command=Get-WorkerServiceCommand 'C:\Program Files\DevAIWorker' 'C:\ProgramData\DevAIWorker\service.json'
-$expected='"C:\Program Files\DevAIWorker\host-runtime\python.exe" -I -S -B -m worker_agent.windows_service --config "C:\ProgramData\DevAIWorker\service.json"'
+$expected='"C:\Program Files\DevAIWorker\host-runtime\python.exe" -I -S -B -c "import sys,runpy;sys.path.insert(0,''C:/Program Files/DevAIWorker/control'');runpy.run_module(''worker_agent.windows_service'',run_name=''__main__'')" --config "C:\ProgramData\DevAIWorker\service.json"'
 if ($command -cne $expected) {throw 'BINARY_PATH_QUOTING_TEST_FAILED'}
+# RH-D: SCM launches the service with cwd=System32 and the isolated embedded
+# interpreter (python313._pth) honors neither cwd nor PYTHONPATH, so the legacy
+# "-m worker_agent.windows_service" shape died with ModuleNotFoundError on every
+# install. The command must resolve the package explicitly and keep the
+# isolation flags and the exact service argument tail.
+if ($command.Contains('-m worker_agent')) {throw 'SERVICE_COMMAND_STILL_USES_DASH_M'}
+if ($command -notmatch ' -I -S -B ') {throw 'ISOLATION_FLAGS_MISSING'}
+if (-not $command.Contains("--config `"C:\ProgramData\DevAIWorker\service.json`"")) {throw 'SERVICE_CONFIG_ARG_CHANGED'}
+if (-not $command.Contains("sys.path.insert(0,'C:/Program Files/DevAIWorker/control')")) {throw 'CONTROL_PATH_NOT_ESTABLISHED'}
+if (-not $command.Contains("runpy.run_module('worker_agent.windows_service',run_name='__main__')")) {throw 'SERVICE_MODULE_NOT_RUN_VIA_RUNPY'}
+# The volume-host helper service is the same command plus one flag; nothing else.
+$helperCommand=$command+' --volume-host'
+if ($helperCommand -cne ($expected+' --volume-host')) {throw 'VOLUME_HELPER_COMMAND_DRIFT'}
+# No drift: credential provisioning and service startup must build their module
+# invocation through the one canonical helper.
+$supportText=[IO.File]::ReadAllText((Resolve-Path -LiteralPath $Support).Path)
+$canonicalUses=[regex]::Matches($supportText,'Get-IsolatedModuleArguments\s+-ControlDir').Count
+if ($canonicalUses -ne 2) {throw ("CANONICAL_HELPER_USES:"+$canonicalUses)}
+foreach($stale in @('-m worker_agent.provision','-m worker_agent.windows_service')){
+  if ($supportText.Contains($stale)) {throw ('STALE_DASH_M_INVOCATION:'+$stale)}
+}
+$codeLines=@($supportText -split "`r?`n" | Where-Object {$_ -notmatch '^\s*#'})
+foreach($forbidden in @('PYTHONPATH','import site')){
+  if (($codeLines -join "`n").Contains($forbidden)) {throw ('ISOLATION_BYPASS_INTRODUCED:'+$forbidden)}
+}
 New-WorkerService $command
 if ($script:recorded.PathName -cne $expected -or $script:recorded.StartName -ne 'NT SERVICE\DevAIWorker' -or
     $null -ne $script:recorded.StartPassword -or $script:recorded.ServiceType -ne 16 -or

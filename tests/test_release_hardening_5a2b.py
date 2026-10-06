@@ -322,11 +322,12 @@ class SecretContainmentTests(unittest.TestCase):
         self.assertIn("$stdinWriter.Flush()", body)
         self.assertIn("$stdinWriter.Close()", body)
         self.assertNotIn("$process.StandardInput=", body)
-        # The provision child resolves worker_agent through an explicit
-        # sys.path insert (the isolated embedded interpreter honors neither
-        # cwd nor PYTHONPATH for -m resolution).
-        self.assertIn("runpy.run_module", body)
-        self.assertIn("worker_agent.provision", body)
+        # The provision child resolves worker_agent through the one canonical
+        # isolated-module helper (the embedded interpreter honors neither cwd
+        # nor PYTHONPATH for -m resolution, proven on RH-D).
+        self.assertIn("Get-IsolatedModuleArguments", body)
+        self.assertIn("'worker_agent.provision'", body)
+        self.assertNotIn("-m worker_agent", body)
 
     def test_bstr_is_freed(self):
         source = INSTALLER.read_text(encoding="utf-8")
@@ -366,6 +367,61 @@ class SecretContainmentTests(unittest.TestCase):
             blob = json.dumps(doc)
             self.assertNotIn("worker.dpapi", blob)
             self.assertNotIn("token", blob)
+
+
+@unittest.skipUnless(ENABLED, "Windows PowerShell required")
+class ServiceCommandResolutionTests(unittest.TestCase):
+    """The service BinaryPathName must resolve the package without cwd help.
+
+    RH-D: `-m worker_agent.windows_service` could never import the package,
+    because SCM starts the service with cwd=System32 and the pinned embedded
+    interpreter honors neither cwd nor PYTHONPATH (python313._pth) nor site.
+    Resolution must go through the one canonical helper shared with credential
+    provisioning, with the isolation flags and argument tail untouched."""
+
+    def test_service_command_does_not_depend_on_dash_m_resolution(self):
+        source = SUPPORT.read_text(encoding="utf-8")
+        body = source[source.index("function Get-WorkerServiceCommand"):]
+        body = body[:body.index("\n}")]
+        code = "\n".join(line for line in body.splitlines()
+                         if not line.lstrip().startswith("#"))
+        self.assertNotIn("-m worker_agent", code)
+        self.assertIn("Get-IsolatedModuleArguments", code)
+        self.assertIn(" -I -S -B ", code)
+
+    def test_provisioning_and_service_share_one_canonical_invocation(self):
+        source = SUPPORT.read_text(encoding="utf-8")
+        # Exactly two consumers: provisioning and the service command. Any
+        # third inline invocation shape would be drift.
+        self.assertEqual(
+            len(re.findall(r"Get-IsolatedModuleArguments\s+-ControlDir", source)), 2)
+        for stale in ("-m worker_agent.provision", "-m worker_agent.windows_service"):
+            self.assertNotIn(stale, source)
+        helper = source[source.index("function Get-IsolatedModuleArguments"):]
+        helper = helper[:helper.index("\n}")]
+        code = "\n".join(line for line in helper.splitlines()
+                         if not line.lstrip().startswith("#"))
+        self.assertIn("sys.path.insert", code)
+        self.assertIn("runpy.run_module", code)
+        # Isolation flags stay with the caller, which owns them.
+        self.assertNotIn("-I -S -B", code)
+
+    def test_no_isolation_bypass_is_introduced(self):
+        source = SUPPORT.read_text(encoding="utf-8")
+        code = "\n".join(line for line in source.splitlines()
+                         if not line.lstrip().startswith("#"))
+        self.assertNotIn("PYTHONPATH", code)
+        self.assertNotIn("import site", code)
+
+    def test_resume_and_diagnostics_compare_the_generated_command(self):
+        # The resume/partial-install comparison must derive from the same
+        # helper, never from a hardcoded legacy command line.
+        source = SUPPORT.read_text(encoding="utf-8")
+        self.assertNotIn("-m worker_agent", source)
+        body = source[source.index("function Assert-PartialWorkerInstall"):]
+        self.assertIn("Get-WorkerServiceCommand", body)
+        self.assertIn("$worker.PathName -cne $base", body)
+        self.assertIn("$base+' --volume-host'", body)
 
 
 class TrustDomainSeparationTests(unittest.TestCase):
