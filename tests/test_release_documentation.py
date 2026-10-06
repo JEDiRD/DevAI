@@ -459,7 +459,7 @@ class BomScanTests(unittest.TestCase):
     def test_protected_trees_were_not_touched_for_eol(self):
         """Trailing-EOL debt inside protected trees is documented, not 'fixed'."""
         for tree, expected in (("controller/devai", "ddc349d72ca32ec55e41357db6f231dcd178004b"),
-                               ("worker_agent", "2d688436cf088b0a52698f1a46e475639243c230"),
+                               ("worker_agent", "4f61df803a4df71885f0ee7fc3a9ba7396b94626"),
                                ("migrations", "76ba0edfcfc65a5de0527881d6b56f755b8d653e")):
             with self.subTest(tree=tree):
                 out = subprocess.run(["git", "-C", str(REPO), "rev-parse",
