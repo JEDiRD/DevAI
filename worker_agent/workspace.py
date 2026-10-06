@@ -247,7 +247,18 @@ class WorkspaceManager:
             if result not in (0, -2147024894, -2147023728):
                 raise AdapterError('APPCONTAINER_PROFILE_CLEANUP_FAILED')
             marker.unlink()
-        if any(self.root.iterdir()):
+        has_unknown = False
+        try:
+            for entry in self.root.iterdir():
+                if entry.name == 'System Volume Information':
+                    continue
+                has_unknown = True
+                break
+        except FileNotFoundError as e:
+            if getattr(e, 'winerror', None) != 2:
+                raise
+
+        if has_unknown:
             raise AdapterError('UNKNOWN_WORKSPACE_QUARANTINED')
 
     def verify_root(self):
