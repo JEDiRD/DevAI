@@ -261,6 +261,31 @@ class InstallerTests(unittest.TestCase):
                        'SECRECY:NO_PLAINTEXT_CHANNEL_CONVERGENCE_INTACT'):
             self.assertIn(marker,report['cases'])
 
+    def test_provisioned_credential_acl_meets_service_model(self):
+        """RH-D: the first boot died in install_verification (SERVICE_ACL_UNSAFE)
+        because the freshly provisioned worker.dpapi kept its inherited
+        DACL. The harness stamps a probe file with the REAL installer
+        function and proves the REAL managed assertion accepts it, the
+        unstamped state fails, and the stamp precedes service creation.
+        Elevation-gated: without it the harness reports the standard blocked
+        marker instead of failing."""
+        script=Path(__file__).parent/'windows'/'test_provisioned_credential_acl.ps1'
+        env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}
+        result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+            '-File',str(script)],capture_output=True,text=True,timeout=600,env=env)
+        self.assertEqual(result.returncode,0,result.stderr)
+        if 'BLOCKED_PENDING_ELEVATED_EXECUTION' in result.stdout:
+            self.assertIn('credential ACL stamping requires elevation',result.stdout)
+            return
+        self.assertIn('PROVISIONED_CREDENTIAL_ACL_CASES_PASSED',result.stdout)
+        report=json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(report['passed'])
+        for marker in ('NEGATIVE:UNSTAMPED_CREDENTIAL_FAILS_MANAGED_ASSERT',
+                       'STAMP:SET_MANAGED_ACL_MEETS_MANAGED_ASSERT',
+                       'VERIFY_MODEL:PROTECTED_OWNER_AND_ALLOW_LIST',
+                       'ORDER:STAMP_AND_ASSERT_AFTER_PROVISION_BEFORE_SERVICE'):
+            self.assertIn(marker,report['cases'])
+
     def test_service_access_update_restores_both_files_and_manifest_on_integrity_failure(self):
         script=Path(__file__).parent/'windows'/'test_access_update_rollback.ps1'
         env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}

@@ -195,6 +195,13 @@ if (Test-TargetCredentialPresent $credential) {
     $plain=$null
     if ($bstr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
   }
+  # The provision child creates worker.dpapi with an inherited (unprotected)
+  # DACL, but the service refuses to start unless every state path carries the
+  # managed model (RH-D: install_verification failed with SERVICE_ACL_UNSAFE,
+  # exit 12, on the first boot). Stamp exactly the service.json model, then
+  # prove the stamp meets the managed assertion before any service is created.
+  Set-ManagedAcl $credential $serviceSid 'Read' $false
+  Assert-ManagedPrivateAcl $credential $serviceSid
 }
 # Fail closed: the service must never start without a credential on disk.
 if (!(Test-TargetCredentialPresent $credential)) { throw 'CREDENTIAL_PROVISIONING_FAILED' }

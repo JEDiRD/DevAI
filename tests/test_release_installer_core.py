@@ -443,6 +443,21 @@ class LegacyFormatTests(unittest.TestCase):
         self.assertIn("Read-WorkerTokenSecureString -FromStdin:$WorkerTokenFromStdin", source)
         self.assertIsNone(re.search(r"\[string\]\$WorkerToken", source))
 
+    def test_fresh_credential_is_stamped_before_service_creation(self):
+        """RH-D: the provision child leaves worker.dpapi with an inherited
+        (unprotected) DACL, but the service verify_install gate requires the
+        managed model on every state path. The installer must stamp the
+        service.json model on the freshly provisioned credential and assert
+        the stamp after provisioning and before any service is created."""
+        source = INSTALLER.read_text(encoding="utf-8")
+        provision = source.index("Invoke-TargetCredentialProvisioning -InstallRoot")
+        stamp = source.index("Set-ManagedAcl $credential $serviceSid", provision)
+        assert_ = source.index("Assert-ManagedPrivateAcl $credential $serviceSid", stamp)
+        service = source.index("New-Service -Name DevAIWorkerVolumes")
+        self.assertLess(provision, stamp)
+        self.assertLess(stamp, assert_)
+        self.assertLess(assert_, service)
+
     def test_worker_token_stdin_helper_guards_its_modes(self):
         """The shared token reader fails closed on ambiguous/empty input."""
         source = SUPPORT.read_text(encoding="utf-8")
