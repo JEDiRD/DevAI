@@ -2,6 +2,7 @@
 import json
 import importlib.util
 import os
+import ctypes
 from pathlib import Path
 import re
 import subprocess
@@ -9,6 +10,16 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+
+
+def _is_elevated():
+    """True only under a genuine elevated Windows token. Never faked."""
+    if sys.platform != "win32":
+        return False
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
 
 def check_installer_canary(stdout):
     """Enforce the privilege-aware canary branch (RH-D hardening).
@@ -126,6 +137,32 @@ class InstallerTests(unittest.TestCase):
                        'NEGATIVE_DIR:FAIL_CLOSED_PRE_MUTATION',
                        'NEGATIVE_MEMBER:FAIL_CLOSED_PRE_MUTATION',
                        'MANIFEST_GATE:INTACT'):
+            self.assertIn(marker,report['cases'])
+
+    def test_workspace_volume_provisioning_normalizes_fresh_roots(self):
+        """RH-D: fresh NTFS workspace volumes came out owned by NETWORK
+        SERVICE, which the installer assumed trusted instead of
+        establishing. New-PrivateWorkspaceVolume now stamps the trusted
+        owner explicitly (new volumes only) before policy verification.
+        Non-elevated hosts get the standard blocked marker (exit 0, no
+        verdict); elevated hosts run the full normalization, read-back,
+        exact-policy, pre-existing-rejection and failure-atomicity proofs."""
+        script=Path(__file__).parent/'windows'/'test_workspace_volume_provisioning.ps1'
+        env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}
+        result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+            '-File',str(script)],capture_output=True,text=True,timeout=600,env=env)
+        self.assertEqual(result.returncode,0,result.stderr)
+        if not _is_elevated():
+            self.assertIn('BLOCKED_PENDING_ELEVATED_EXECUTION',result.stdout)
+            return
+        self.assertIn('WORKSPACE_VOLUME_PROVISIONING_PASSED',result.stdout)
+        report=json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(report['passed'])
+        for marker in ('FRESH_ROOT:NORMALIZED_AND_READ_BACK',
+                       'READBACK:UNBLOCKED',
+                       'POLICY:EXACT_OWNER_GROUP_DACL_PROTECTION',
+                       'PREEXISTING:REJECTED_NOT_SEIZED',
+                       'FAILURE:ATOMIC_NO_SERVICE_NO_CREDENTIAL'):
             self.assertIn(marker,report['cases'])
 
     def test_service_access_update_restores_both_files_and_manifest_on_integrity_failure(self):

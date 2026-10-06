@@ -299,6 +299,22 @@ function New-PrivateWorkspaceVolume([string]$VhdPath,[string]$Mount) {
   Add-PartitionAccessPath -InputObject $partition -AccessPath ($Mount+'\') -Confirm:$false
   $guid=Get-WorkspaceMountGuid $Mount
   Get-VerifiedWorkspaceVolume $VhdPath $Mount $guid | Out-Null
+  # A freshly formatted NTFS root does not reliably carry a trusted owner
+  # (observed: NT AUTHORITY\NETWORK SERVICE with an unprotected DACL on a
+  # clean, newly formatted volume). THIS volume was created, initialized
+  # and formatted by THIS transaction -- every pre-existing state throws
+  # above -- so establish the trusted owner explicitly here. ACEs are NOT
+  # set here: Set-WorkspaceRootPolicy stamps the full canonical policy and
+  # re-verifies immediately after. Never seize or repair any other volume.
+  $volAcl=Get-Acl -LiteralPath $guid
+  $volAcl.SetOwner([Security.Principal.SecurityIdentifier]'S-1-5-32-544')
+  $volAcl.SetAccessRuleProtection($true,$true)
+  Set-Acl -LiteralPath $guid -AclObject $volAcl
+  $volCheck=Get-Acl -LiteralPath $guid
+  $volOwnerRaw=[string]$volCheck.Owner
+  $volOwnerSid=if ($volOwnerRaw -match '^S-1-5-') { $volOwnerRaw } else { ([Security.Principal.NTAccount]$volOwnerRaw).Translate([Security.Principal.SecurityIdentifier]).Value }
+  if ($volOwnerSid -ne 'S-1-5-32-544') { throw 'WORKSPACE_ROOT_OWNER_NOT_ESTABLISHED' }
+  if (!$volCheck.AreAccessRulesProtected) { throw 'WORKSPACE_ROOT_PROTECTION_NOT_ESTABLISHED' }
   Remove-Item -LiteralPath $createFile
   return $guid
 }
