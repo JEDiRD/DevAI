@@ -74,9 +74,9 @@ main()
     param([string]$WorkerId, [string]$Cred, [string]$Tok)
     Push-Location $installRoot
     try {
-      Remove-Item -LiteralPath (Join-Path $controlRoot 'provision-argv.json') -Force -ErrorAction SilentlyContinue
-      Remove-Item -LiteralPath (Join-Path $controlRoot 'provision-stdin.bin') -Force -ErrorAction SilentlyContinue
-      Remove-Item -LiteralPath (Join-Path $controlRoot 'provision-env.json') -Force -ErrorAction SilentlyContinue
+      Remove-Item -LiteralPath (Join-Path $installRoot 'provision-argv.json') -Force -ErrorAction SilentlyContinue
+      Remove-Item -LiteralPath (Join-Path $installRoot 'provision-stdin.bin') -Force -ErrorAction SilentlyContinue
+      Remove-Item -LiteralPath (Join-Path $installRoot 'provision-env.json') -Force -ErrorAction SilentlyContinue
       return Invoke-TargetCredentialProvisioning -InstallRoot $installRoot -RuntimeRoot $rt -WorkerId $WorkerId -CredentialPath $Cred -Token $Tok
     } finally { Pop-Location }
   }
@@ -90,16 +90,18 @@ main()
   $r = & $InvokeProvision $workerId $cred1 $token1
   if ($r -ne $true) { throw 'PROVISION_SUCCESS_NOT_TRUE' }
   # 2. child received exactly the stdin payload.
-  $got = [IO.File]::ReadAllBytes((Join-Path $controlRoot 'provision-stdin.bin'))
+  $got = [IO.File]::ReadAllBytes((Join-Path $installRoot 'provision-stdin.bin'))
   if (([BitConverter]::ToString($got)) -ne ([BitConverter]::ToString($tokBytes1))) { throw 'STDIN_PAYLOAD_MISMATCH' }
-  # 3. token nowhere in argv; exact expected argv otherwise.
-  $argv = Get-Content -LiteralPath (Join-Path $controlRoot 'provision-argv.json') -Raw | ConvertFrom-Json
+  # 3. token nowhere in argv; exact expected argv otherwise. (The fixture
+  # dumps sys.argv[1:], so no further skipping: argv[0] there is already
+  # past the interpreter's -c slot.)
+  $argv = Get-Content -LiteralPath (Join-Path $installRoot 'provision-argv.json') -Raw | ConvertFrom-Json
   $joinedArgv = ($argv -join ' ')
   if ($joinedArgv.Contains($token1)) { throw 'TOKEN_IN_ARGV' }
   $expectArgv = @('--worker-id', $workerId, '--store-path', $cred1)
   if ((@($argv) -join "`0") -ne ($expectArgv -join "`0")) { throw ('ARGV_UNEXPECTED:' + $joinedArgv) }
   # 4. token nowhere in the child environment.
-  $envDoc = Get-Content -LiteralPath (Join-Path $controlRoot 'provision-env.json') -Raw | ConvertFrom-Json
+  $envDoc = Get-Content -LiteralPath (Join-Path $installRoot 'provision-env.json') -Raw | ConvertFrom-Json
   foreach ($prop in $envDoc.PSObject.Properties) {
     if ([string]$prop.Value -like ('*' + $token1 + '*')) { throw ('TOKEN_IN_ENV:' + $prop.Name) }
   }
@@ -107,7 +109,7 @@ main()
   $cred2 = Join-Path $probe 'cred2.dpapi'
   $r2 = & $InvokeProvision $workerId $cred2 ($token1 + '-second')
   if ($r2 -ne $true) { throw 'SECOND_PROVISION_FAILED' }
-  $got2 = [IO.File]::ReadAllBytes((Join-Path $controlRoot 'provision-stdin.bin'))
+  $got2 = [IO.File]::ReadAllBytes((Join-Path $installRoot 'provision-stdin.bin'))
   if (([BitConverter]::ToString($got2)) -ne ([BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes($token1 + '-second')))) { throw 'SECOND_STDIN_MISMATCH' }
   $report.cases += 'SUCCESS:EXACT_STDIN_CLEAN_ARGV_CLEAN_ENV_REPEATABLE'
   # 6+10 implicit: both credential markers exist (post-condition held).
@@ -171,7 +173,7 @@ main()
   # in scope. Stdout carries only fixed markers ($token is never
   # Write-Output here).
   foreach ($name in @('provision-argv.json', 'provision-env.json')) {
-    $text = [IO.File]::ReadAllText((Join-Path $controlRoot $name))
+    $text = [IO.File]::ReadAllText((Join-Path $installRoot $name))
     foreach ($needle in @($token1, ($token1 + '-second'))) {
       if ($text.Contains($needle)) { throw ('TOKEN_LEAKED_INTO_FILE:' + $name) }
     }

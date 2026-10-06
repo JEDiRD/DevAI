@@ -759,13 +759,15 @@ function Invoke-TargetCredentialProvisioning {
   if (!(Test-Path -LiteralPath $python -PathType Leaf)) { throw 'PROVISION_RUNTIME_MISSING' }
   $psi=New-Object Diagnostics.ProcessStartInfo
   $psi.FileName=$python
-  # No token in argv. Only non-secret identity and destination.
-  $psi.Arguments='-m worker_agent.provision --worker-id ' + $WorkerId + ' --store-path "' + $CredentialPath + '"'
-  # The package lives under control/worker_agent: -m resolution needs the
-  # package PARENT on sys.path, which for -m is the working directory.
-  # $InstallRoot itself does not contain top-level worker_agent (RH-D:
-  # ModuleNotFoundError made provisioning fail closed on every install).
-  $psi.WorkingDirectory=Join-Path $InstallRoot 'control'
+  # No token in argv. Only non-secret identity and destination. The package
+  # is resolved through an explicit sys.path insert because the isolated
+  # embedded interpreter (python313._pth) honors neither the working
+  # directory nor PYTHONPATH for -m resolution (RH-D: ModuleNotFoundError
+  # made provisioning fail closed on every install). Only sys.path is
+  # always honored. Forward slashes avoid escape ambiguity in the child.
+  $controlFwd=(Join-Path $InstallRoot 'control').Replace('\','/')
+  $psi.Arguments='-c "import sys,runpy;sys.path.insert(0,''' + $controlFwd + ''');runpy.run_module(''worker_agent.provision'',run_name=''__main__'')" --worker-id ' + $WorkerId + ' --store-path "' + $CredentialPath + '"'
+  $psi.WorkingDirectory=$InstallRoot
   $psi.UseShellExecute=$false
   $psi.RedirectStandardInput=$true
   $psi.RedirectStandardOutput=$true

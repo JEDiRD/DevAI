@@ -188,13 +188,13 @@ class InstallerTests(unittest.TestCase):
             self.assertIn(marker,report['cases'])
 
     def test_provision_child_resolves_package_from_control_dir(self):
-        """RH-D: the provision child ran with cwd=InstallRoot, where no
-        top-level worker_agent exists, so -m worker_agent.provision died
-        with ModuleNotFoundError on every install. The fixed function
-        targets control/. Proved behaviorally with the real module
-        (--help needs only stdlib at import; no DPAPI, no network). In the
-        source tree the package lives at the repo root, which is the
-        equivalent resolution root."""
+        """RH-D mechanism proof: -m worker_agent.provision resolves only
+        from a directory containing top-level worker_agent (an empty dir
+        yields ModuleNotFoundError). The isolated embedded interpreter
+        additionally ignores cwd and PYTHONPATH (python313._pth), which is
+        why the product inserts the control dir into sys.path explicitly;
+        this test pins the underlying resolution rule with the real module
+        (--help needs only stdlib at import; no DPAPI, no network)."""
         repo = Path(__file__).resolve().parent.parent
         # Scrub PYTHONPATH: the child must resolve the package from its
         # working directory alone, exactly like the provision child.
