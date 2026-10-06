@@ -187,6 +187,32 @@ class InstallerTests(unittest.TestCase):
                        'SECRECY:NO_TOKEN_IN_FILES_OR_OUTPUT'):
             self.assertIn(marker,report['cases'])
 
+    def test_provision_child_resolves_package_from_control_dir(self):
+        """RH-D: the provision child ran with cwd=InstallRoot, where no
+        top-level worker_agent exists, so -m worker_agent.provision died
+        with ModuleNotFoundError on every install. The fixed function
+        targets control/. Proved behaviorally with the real module
+        (--help needs only stdlib at import; no DPAPI, no network). In the
+        source tree the package lives at the repo root, which is the
+        equivalent resolution root."""
+        repo = Path(__file__).resolve().parent.parent
+        # Scrub PYTHONPATH: the child must resolve the package from its
+        # working directory alone, exactly like the provision child.
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        ok = subprocess.run(
+            [sys.executable, "-m", "worker_agent.provision", "--help"],
+            capture_output=True, text=True, timeout=120, cwd=str(repo),
+            env=env)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertIn("usage", ok.stdout.lower())
+        with tempfile.TemporaryDirectory() as temp:
+            bad = subprocess.run(
+                [sys.executable, "-m", "worker_agent.provision", "--help"],
+                capture_output=True, text=True, timeout=120, cwd=temp,
+                env=env)
+            self.assertNotEqual(bad.returncode, 0)
+            self.assertIn("ModuleNotFoundError", bad.stderr)
+
     def test_service_access_update_restores_both_files_and_manifest_on_integrity_failure(self):
         script=Path(__file__).parent/'windows'/'test_access_update_rollback.ps1'
         env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}

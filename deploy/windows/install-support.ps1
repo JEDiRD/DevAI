@@ -761,7 +761,11 @@ function Invoke-TargetCredentialProvisioning {
   $psi.FileName=$python
   # No token in argv. Only non-secret identity and destination.
   $psi.Arguments='-m worker_agent.provision --worker-id ' + $WorkerId + ' --store-path "' + $CredentialPath + '"'
-  $psi.WorkingDirectory=$InstallRoot
+  # The package lives under control/worker_agent: -m resolution needs the
+  # package PARENT on sys.path, which for -m is the working directory.
+  # $InstallRoot itself does not contain top-level worker_agent (RH-D:
+  # ModuleNotFoundError made provisioning fail closed on every install).
+  $psi.WorkingDirectory=Join-Path $InstallRoot 'control'
   $psi.UseShellExecute=$false
   $psi.RedirectStandardInput=$true
   $psi.RedirectStandardOutput=$true

@@ -322,6 +322,10 @@ class SecretContainmentTests(unittest.TestCase):
         self.assertIn("$stdinWriter.Flush()", body)
         self.assertIn("$stdinWriter.Close()", body)
         self.assertNotIn("$process.StandardInput=", body)
+        # The provision child resolves worker_agent from the control dir:
+        # InstallRoot itself has no top-level worker_agent package, so the
+        # old working directory made -m fail with ModuleNotFoundError.
+        self.assertIn("$psi.WorkingDirectory=Join-Path $InstallRoot 'control'", body)
 
     def test_bstr_is_freed(self):
         source = INSTALLER.read_text(encoding="utf-8")
