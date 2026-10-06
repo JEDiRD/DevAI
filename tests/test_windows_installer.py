@@ -238,6 +238,29 @@ class InstallerTests(unittest.TestCase):
                        'NO_BYPASS:ISOLATION_FLAGS_AND_NO_ENV_DEPENDENCY'):
             self.assertIn(marker,report['cases'])
 
+    def test_worker_token_stdin_automation_path(self):
+        """The installer supports a non-interactive token path for automation.
+
+        -WorkerTokenFromStdin reads exactly one token line from redirected
+        stdin into the same SecureString shape the interactive Read-Host path
+        produces; empty/ambiguous/non-redirected input fails closed; no
+        plaintext CLI parameter, env var or log exposure exists. The harness
+        drives the REAL helper in child processes with controlled stdin."""
+        script=Path(__file__).parent/'windows'/'test_worker_token_stdin.ps1'
+        env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}
+        result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+            '-File',str(script)],capture_output=True,text=True,timeout=1800,env=env)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('WORKER_TOKEN_STDIN_CASES_PASSED',result.stdout)
+        report=json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(report['passed'])
+        for marker in ('SUCCESS:EXACT_STDIN_DELIVERY_CLEAN_OUTPUT',
+                       'FAILURE:EMPTY_STDIN_REJECTED',
+                       'FAILURE:AMBIGUOUS_STDIN_REJECTED',
+                       'INTERACTIVE:DEFAULT_PROMPT_PRESERVED_AND_CONVERGED',
+                       'SECRECY:NO_PLAINTEXT_CHANNEL_CONVERGENCE_INTACT'):
+            self.assertIn(marker,report['cases'])
+
     def test_service_access_update_restores_both_files_and_manifest_on_integrity_failure(self):
         script=Path(__file__).parent/'windows'/'test_access_update_rollback.ps1'
         env={**os.environ,'PSModulePath':str(Path(os.environ['SystemRoot'])/'System32'/'WindowsPowerShell'/'v1.0'/'Modules')}

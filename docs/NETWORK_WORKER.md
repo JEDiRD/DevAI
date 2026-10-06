@@ -86,9 +86,13 @@ configuration):
 - `ApiBaseUrl` (an endpoint URL)
 - filesystem paths, hashes, expected release digests
 
-**Secret** — the worker token. It is supplied **only** through the interactive
-`Read-Host -AsSecureString` prompt, converted narrowly to feed the child's
-**redirected stdin**, and released in a `finally` block that frees the BSTR.
+**Secret** — the worker token. It is supplied **only** through one of two
+supported channels, both converging into `Read-WorkerTokenSecureString`:
+the interactive `Read-Host -AsSecureString` prompt (default), or exactly one
+token line on redirected stdin with `-WorkerTokenFromStdin` (automation).
+Either way the SecureString is converted narrowly to feed the provision
+child's **redirected stdin**, and released in a `finally` block that frees
+the BSTR. There is deliberately no plaintext token parameter.
 
 Never place the token:
 

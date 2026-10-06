@@ -373,9 +373,18 @@ class UnsafeRecommendationTests(unittest.TestCase):
     def test_worker_doc_does_not_show_token_in_argv_or_env(self):
         text = doc_text(WORKER_DOC)
         # A code fence must never contain a token assignment to argv or env.
-        for bad in ("$env:DEVAI", "-WorkerToken", "--worker-token",
+        for bad in ("$env:DEVAI", "--worker-token",
                     "-Token '", "echo $token"):
             self.assertNotIn(bad, text)
+        # The only CLI-spelled -WorkerToken* surface the docs may name is the
+        # value-less -WorkerTokenFromStdin automation switch (it carries no
+        # secret; the token travels on redirected stdin). Any other CLI
+        # spelling would be a plaintext argv channel. The lookbehind keeps
+        # function names such as Read-WorkerTokenSecureString out of scope:
+        # only dash-led switch spellings are argv.
+        self.assertIn("-WorkerTokenFromStdin", text)
+        for match in re.finditer(r"(?<![A-Za-z])-WorkerToken\w*", text):
+            self.assertEqual(match.group(0), "-WorkerTokenFromStdin")
 
     def test_release_doc_has_no_secret_in_examples(self):
         text = doc_text(RELEASE_DOC)

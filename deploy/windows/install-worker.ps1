@@ -5,7 +5,8 @@ param([Parameter(Mandatory=$true)][string]$PackageRoot,
       [string]$WorkerId='',
       [string]$ApiBaseUrl='',
       [string]$ExistingConfig='',
-      [switch]$ReusePersonalFixture)
+      [switch]$ReusePersonalFixture,
+      [switch]$WorkerTokenFromStdin)
 $ErrorActionPreference='Stop'
 # Helpers are loaded BEFORE any validation so the authoritative manifest and
 # target-state implementations are used instead of a forked copy here.
@@ -177,7 +178,12 @@ if (Test-TargetCredentialPresent $credential) {
   Assert-ManagedPrivateAcl $credential $serviceSid
   Write-Output 'DEVAI_EXISTING_CREDENTIAL_PRESERVED'
 } else {
-  $secure=Read-Host -Prompt 'Worker token' -AsSecureString
+  # Both token modes converge here into the same SecureString and the same
+  # BSTR/stdin provisioning below. -WorkerTokenFromStdin reads exactly one
+  # token line from redirected stdin (automation); without it the operator is
+  # prompted interactively. There is deliberately NO plaintext token
+  # parameter: the secret must never appear in argv, the environment or logs.
+  $secure=Read-WorkerTokenSecureString -FromStdin:$WorkerTokenFromStdin
   $bstr=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
   try {
     $plain=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)

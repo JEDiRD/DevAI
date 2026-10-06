@@ -309,6 +309,19 @@ class SecretContainmentTests(unittest.TestCase):
         self.assertNotIn("--token", argv)
         self.assertNotIn("$env:", body.replace("$env:SystemRoot", ""))
 
+    def test_worker_token_stdin_switch_carries_no_secret(self):
+        # The automation switch is value-less: the token travels on redirected
+        # stdin, never as a parameter value, env var, or log line.
+        installer = INSTALLER.read_text(encoding="utf-8")
+        self.assertIn("[switch]$WorkerTokenFromStdin", installer)
+        self.assertIsNone(re.search(r"\[string\]\$WorkerToken", installer))
+        self.assertNotIn("--token", installer)
+        support = SUPPORT.read_text(encoding="utf-8")
+        reader = support[support.index("function Read-WorkerTokenSecureString"):]
+        reader = reader[:reader.index("\n}")]
+        self.assertIn("IsInputRedirected", reader)
+        self.assertIn("WORKER_TOKEN_STDIN_AMBIGUOUS", reader)
+
     def test_token_is_delivered_only_over_redirected_stdin(self):
         source = SUPPORT.read_text(encoding="utf-8")
         body = source[source.index("function Invoke-TargetCredentialProvisioning"):]

@@ -761,6 +761,39 @@ function Test-TargetCredentialPresent {
   return (Test-Path -LiteralPath $CredentialPath -PathType Leaf)
 }
 
+function Read-WorkerTokenSecureString {
+  # Single SecureString entry point for the Worker token. Two supported modes:
+  # interactive default (Read-Host -AsSecureString) and non-interactive
+  # (-FromStdin: exactly one token line on redirected stdin, for automation).
+  # Both converge here so provisioning sees the same SecureString shape either
+  # way. The token never appears in argv, the environment, logs or any file:
+  # only the caller holds the SecureString, and its narrow BSTR conversion
+  # feeds the provision child over that child's stdin. Managed copies are NOT
+  # claimed to be cryptographically erasable; the guarantee is no durable,
+  # loggable or process-metadata exposure.
+  param([switch]$FromStdin)
+  if ($FromStdin) {
+    # Fail closed: without a redirected pipe there is no token to read, and
+    # falling back to an interactive prompt inside automation would hang.
+    if (![Console]::IsInputRedirected) { throw 'WORKER_TOKEN_STDIN_NOT_REDIRECTED' }
+    $raw=[Console]::In.ReadToEnd()
+    if ($null -eq $raw) { $raw='' }
+    $lines=@($raw -split "`r?`n" | Where-Object { $_ -ne '' })
+    $raw=$null
+    if ($lines.Count -eq 0) { throw 'WORKER_TOKEN_STDIN_EMPTY' }
+    if ($lines.Count -gt 1) { throw 'WORKER_TOKEN_STDIN_AMBIGUOUS' }
+    $line=$lines[0]
+    $lines=$null
+    if ([string]::IsNullOrWhiteSpace($line)) { throw 'WORKER_TOKEN_STDIN_EMPTY' }
+    $secure=New-Object Security.SecureString
+    foreach ($char in $line.ToCharArray()) { $secure.AppendChar($char) }
+    $line=$null
+    $secure.MakeReadOnly()
+    return $secure
+  }
+  return (Read-Host -Prompt 'Worker token' -AsSecureString)
+}
+
 function Invoke-TargetCredentialProvisioning {
   # Calls the packaged pinned runtime with the EXISTING, byte-identical
   # worker_agent.provision primitive. --worker-id and --store-path are

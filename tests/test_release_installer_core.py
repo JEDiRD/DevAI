@@ -12,6 +12,7 @@ Trust model under test:
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -428,11 +429,32 @@ class LegacyFormatTests(unittest.TestCase):
     def test_install_worker_provisions_credential_via_stdin_helper(self):
         source = INSTALLER.read_text(encoding="utf-8")
         self.assertIn("Invoke-TargetCredentialProvisioning", source)
-        self.assertIn("Read-Host", source)
+        # The interactive prompt lives in the shared token reader both modes
+        # converge into; the installer reaches it only through that entry point.
+        self.assertIn("Read-WorkerTokenSecureString -FromStdin:$WorkerTokenFromStdin", source)
+        self.assertIn("Read-Host -Prompt 'Worker token' -AsSecureString",
+                      SUPPORT.read_text(encoding="utf-8"))
         self.assertIn("ZeroFreeBSTR", source)
         # The secret must not reach argv, the environment, or a config file.
         self.assertNotIn("--token", source)
         self.assertNotIn("$env:DEVAI", source)
+        # Automation uses an explicit stdin switch, never a plaintext parameter.
+        self.assertIn("[switch]$WorkerTokenFromStdin", source)
+        self.assertIn("Read-WorkerTokenSecureString -FromStdin:$WorkerTokenFromStdin", source)
+        self.assertIsNone(re.search(r"\[string\]\$WorkerToken", source))
+
+    def test_worker_token_stdin_helper_guards_its_modes(self):
+        """The shared token reader fails closed on ambiguous/empty input."""
+        source = SUPPORT.read_text(encoding="utf-8")
+        body = source[source.index("function Read-WorkerTokenSecureString"):]
+        body = body[:body.index("\n}")]
+        self.assertIn("[Console]::IsInputRedirected", body)
+        self.assertIn("WORKER_TOKEN_STDIN_NOT_REDIRECTED", body)
+        self.assertIn("WORKER_TOKEN_STDIN_EMPTY", body)
+        self.assertIn("WORKER_TOKEN_STDIN_AMBIGUOUS", body)
+        self.assertIn("Read-Host -Prompt 'Worker token' -AsSecureString", body)
+        self.assertNotIn("--token", body)
+        self.assertNotIn("$env:DEVAI", body)
 
     def test_manifest_contains_no_credential_artifact(self):
         """The release contract must not describe or carry the DPAPI store."""
